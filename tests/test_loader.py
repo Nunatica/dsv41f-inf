@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import struct
+import json
 import tempfile
 import unittest
 
@@ -53,6 +54,38 @@ class LoaderTest(unittest.TestCase):
             p.write_bytes(b'GGUF')
             with self.assertRaisesRegex(ValueError, 'Truncated'):
                 loader.inspect(p)
+
+
+class MtpLoaderTest(unittest.TestCase):
+    def test_text_only_and_manifest_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder)/'dspark-xs2.bin'
+            manifest = binary.with_suffix('.json')
+            names = ['mtp.0.main_proj.weight', 'mtp.0.main_norm.weight', 'mtp.2.norm.weight',
+                     'mtp.2.markov_head.embed.weight', 'mtp.2.markov_head.head.weight',
+                     'mtp.2.confidence_head.proj.weight']
+            tensors = [[name, 'BF16', i*64, 64, [1, 32]] for i, name in enumerate(names)]
+            # Invalid and missing payloads in excluded vision sections are ignored.
+            tensors += [['vision.skip', 'UNSUPPORTED', 1<<40, 1<<30, [1]],
+                        ['mtp.0.ffn.gate.bias_vl', 'F32', 1<<40, 512, [128]]]
+            binary.write_bytes(bytes(6*64))
+            def save(): manifest.write_text(json.dumps({'tensors': tensors}))
+            save()
+            info = loader.inspect_mtp(binary)
+            self.assertEqual(info['model_bytes'], 6*128)  # BF16 promoted to F32
+            self.assertEqual(info['mtp_tensors'], 6)
+            self.assertEqual(info['vision_tensors_loaded'], 0)
+            tensors[0][3] -= 1; save()
+            with self.assertRaisesRegex(ValueError, 'byte size'): loader.inspect_mtp(binary)
+            tensors[0][3] += 1
+            tensors[0][2] = 1<<32; save()
+            with self.assertRaisesRegex(ValueError, 'Truncated'): loader.inspect_mtp(binary)
+            tensors[0][2] = 0
+            tensors[1][2] = 0; save()
+            with self.assertRaisesRegex(ValueError, 'Overlapping'): loader.inspect_mtp(binary)
+            tensors[1][2] = 64
+            tensors.append(tensors[0]); save()
+            with self.assertRaisesRegex(ValueError, 'Duplicate'): loader.inspect_mtp(binary)
 
 
 if __name__ == '__main__':

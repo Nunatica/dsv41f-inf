@@ -12,7 +12,7 @@ import threading
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
-from model_info import inspect, swap_protected
+from model_info import inspect, inspect_mtp, swap_protected
 
 
 def proc_memory(pid):
@@ -32,11 +32,14 @@ def main():
     opts = p.parse_args()
     cmd = opts.command[1:] if opts.command[:1] == ['--'] else opts.command
     info = inspect(os.environ['MODEL'])
+    if os.environ.get('DSV4F_MTP', '0') == '1':
+        info['mtp'] = inspect_mtp(os.environ['MTP_MODEL'], os.environ.get('MTP_CONFIG'))
     if not swap_protected():
         raise RuntimeError('Swap protection is absent; refusing to start')
     mem = {k: int(v.split()[0])*1024 for k, v in (s.split(':', 1) for s in Path('/proc/meminfo').read_text().splitlines())}
-    if mem['MemAvailable'] < info['model_bytes'] + 2*(1<<30):
-        raise RuntimeError(f"Need at least {(info['model_bytes']/(1<<30)+2):.1f} GiB available RAM for resident loading")
+    resident_bytes = info['model_bytes'] + info.get('mtp', {}).get('model_bytes', 0)
+    if mem['MemAvailable'] < resident_bytes + 2*(1<<30):
+        raise RuntimeError(f"Need at least {(resident_bytes/(1<<30)+2):.1f} GiB available RAM for resident loading")
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     logfile = opts.log_dir/f'server-{stamp}.log'
     manifest = opts.state_dir/'server.json'
@@ -89,7 +92,7 @@ def main():
                                  'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_VRAM_GUARD_MIB', 'DSV4F_EXPERT_CACHE_MIB',
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',
-                                 'DSV4F_KV_RESIDENT', 'DSV4F_MTP', 'MTP_MODEL', 'DSV4F_DRAFT_N_MAX', 'DSV4F_DRAFT_P_MIN',
+                                 'DSV4F_KV_RESIDENT', 'DSV4F_MTP', 'MTP_MODEL', 'MTP_CONFIG', 'DSV4F_DRAFT_N_MAX', 'DSV4F_DRAFT_P_MIN',
                                  'DSV4F_GPU_SERVICE', 'DSV4F_GPU_WAIT', 'DSV4F_SERVICE_WAIT', 'DSV4F_SERVICE_CALLBACK_SPIN_US', 'DSV4F_SERVICE_IDLE_SPINS', 'DSV4F_SERVICE_PROFILE', 'DSV4F_CPU_SPIN_US', 'DSV4F_HC_WARP', 'DSV4F_HC_FULL', 'DSV4F_MXFP4_FUSED',
                                  'DSV4F_CPU_FAST_SYNC', 'DSV4F_CPU_PROFILE', 'DSV4F_CPU_PROFILE_TRACE', 'DSV4F_CPU_PROFILE_TRACE_TYPE', 'DSV4F_CPU_WORKER_PROFILE',
                                  'DSV4F_CPU_AFFINITY', 'DSV4F_CPU_SCHEDULE', 'DSV4F_CPU_ROW_CHUNK', 'DSV4F_CPU_MXFP4_ROWS',
@@ -97,7 +100,7 @@ def main():
                                  'DSV4F_HC_POST_FULL',
                                  'DSV4F_PREFILL_STREAM', 'DSV4F_PREFILL_GROUP', 'DSV4F_PREFILL_CACHE', 'DSV4F_PREFILL_CACHE_MIN_TOKENS', 'DSV4F_PREFILL_PROFILE',
                                  'DSV4F_PHASE_WORKSPACE', 'DSV4F_DECODE_BATCH', 'DSV4F_DECODE_UBATCH',
-                                 'DSV4F_CACHE_POLICY', 'DSV4F_CACHE_DECAY_TOKENS', 'DSV4F_CACHE_REPLACE_RATIO', 'DSV4F_CACHE_TRACE',
+                                 'DSV4F_EXPERT_LOOKAHEAD', 'DSV4F_EXPERT_LOOKAHEAD_DEPTH', 'DSV4F_EXPERT_LOOKAHEAD_READ', 'DSV4F_EXPERT_LOOKAHEAD_SCORE', 'DSV4F_CACHE_POLICY', 'DSV4F_CACHE_DECAY_TOKENS', 'DSV4F_CACHE_REPLACE_RATIO', 'DSV4F_CACHE_TRACE',
                                  'DSV4F_PROFILE', 'DSV4F_SCHED_SUMMARY', 'DSV4F_STATIC_EXPERT_MAPS', 'DSV4F_INPUT_PROFILE', 'DSV4F_TIMELINE', 'DSV4F_TIMELINE_CONTROL',
                                  'DSV4F_V41_FQ_STORE_FUSED', 'DSV4F_V41_HC_MAT_SPLIT', 'DSV4F_V41_DIRECT_KV', 'DSV4F_V41_HISTORY_GPU', 'DSV4F_V41_COMPACT_KV', 'DSV4F_V41_MOE_OVERLAP',
                                  'DSV4F_V41_MOE_PIPELINE', 'DSV4F_V41_PTQ_DOT',

@@ -121,6 +121,7 @@ GGML_BACKEND_API ggml_dsv4f_cpu_fn ggml_dsv4f_cpu_experts;
 #define GGML_DSV4F_ENGRAM_TAG 0x44535637
 #define GGML_DSV4F_ROUTER_TAG 0x44535638
 #define GGML_DSV4F_PREPARE_TAG 0x44535639
+#define GGML_DSV4F_PREFETCH_TAG 0x4453563a
 struct ggml_dsv4f_engram_transfer {
     void (*wait)(void *);
     void * userdata;

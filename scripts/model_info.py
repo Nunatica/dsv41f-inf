@@ -87,6 +87,44 @@ def inspect(path):
             'context_limit': meta.get('deepseek41.max_position_embeddings') if arch == 'deepseek41' else meta.get('deepseek4.context_length')}
 
 
+def inspect_mtp(path, manifest=None):
+    """Inspect a DSpark raw binary + JSON index without reading weight data."""
+    manifest = Path(manifest) if manifest else Path(path).with_suffix('.json')
+    path = Path(path).resolve()
+    index = json.loads(manifest.read_text())
+    size = path.stat().st_size
+    geometry = {'F32': (1, 4), 'BF16': (1, 2), 'Q8_0': (32, 34), 'IQ2_XXS': (256, 66)}
+    names, spans, total = set(), [], 0
+    for name, typ, offset, length, shape in index['tensors']:
+        if not name.startswith('mtp.') or name.endswith('.bias_vl'):
+            continue
+        if name in names:
+            raise ValueError('Duplicate MTP tensor: ' + name)
+        names.add(name)
+        if typ not in geometry or not 1 <= len(shape) <= 4 or any(type(d) is not int or d <= 0 for d in shape):
+            raise ValueError('Invalid MTP type/shape: ' + name)
+        block, byte_count = geometry[typ]
+        elements = 1
+        for d in shape:
+            elements *= d
+        if shape[-1] % block or length != elements // block * byte_count:
+            raise ValueError('MTP byte size mismatch: ' + name)
+        if type(offset) is not int or type(length) is not int or offset < 0 or length <= 0 or offset + length > size:
+            raise ValueError('Truncated or invalid MTP tensor: ' + name)
+        spans.append((offset, offset+length))
+        total += length * (2 if typ == 'BF16' else 1)
+    spans.sort()
+    if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
+        raise ValueError('Overlapping MTP tensors')
+    for name in ['mtp.0.main_proj.weight', 'mtp.0.main_norm.weight',
+                 'mtp.2.norm.weight', 'mtp.2.markov_head.embed.weight',
+                 'mtp.2.markov_head.head.weight', 'mtp.2.confidence_head.proj.weight']:
+        if name not in names:
+            raise ValueError('MTP sidecar missing ' + name)
+    return {'model': str(path), 'manifest': str(manifest.resolve()), 'model_bytes': total,
+            'mtp_tensors': len(names), 'vision_tensors_loaded': 0}
+
+
 def swap_protected():
     if len(Path('/proc/swaps').read_text().splitlines()) <= 1:
         return True
@@ -108,7 +146,7 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--swap-check']:
         sys.exit(0 if swap_protected() else 1)
     try:
-        print(json.dumps(inspect(sys.argv[1]), indent=2))
-    except (OSError, ValueError, KeyError) as e:
+        print(json.dumps(inspect_mtp(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None) if sys.argv[1] == "--mtp" else inspect(sys.argv[1]), indent=2))
+    except (OSError, ValueError, KeyError, TypeError) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)

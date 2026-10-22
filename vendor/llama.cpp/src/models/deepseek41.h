@@ -22,6 +22,8 @@ struct llama_model_deepseek41 : public llama_model_base {
     float eps=1e-20f, hc_eps=1e-6f, clamp=10, scaling=1, rope_base=10000, compress_base=1000000;
     float rope_factor=1, beta_fast=32, beta_slow=1; int orig_ctx=4096;
     bool norm_topk=true;
+    int dspark_block=0, dspark_noise=0, dspark_experts=0, dspark_used=0, dspark_rank=0;
+    std::vector<int32_t> dspark_layers;
     std::shared_ptr<dsv4f_engram> engram;
     ggml_tensor * W(int layer,const std::string & role) const;
     struct graph : public llm_graph_context {

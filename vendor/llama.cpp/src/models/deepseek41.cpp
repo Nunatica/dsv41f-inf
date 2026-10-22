@@ -53,6 +53,9 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     if(ratios.size()!=hparams.n_layer())throw std::runtime_error("V4.1 compress_ratios length mismatch");
     for(auto r:ratios)if(r<0||r>2)throw std::runtime_error("unsupported V4.1 compression ratio");
     std::string cfg;u("config",cfg);auto root=json::parse(cfg);auto c=root.contains("text_config")?root.at("text_config"):root;
+    dspark_block=c.value("dspark_block_size",0);dspark_noise=c.value("dspark_noise_token_id",0);
+    dspark_experts=c.value("dspark_n_routed_experts",0);dspark_used=c.value("dspark_num_experts_per_tok",0);
+    dspark_rank=c.value("dspark_markov_rank",0);dspark_layers=c.value("dspark_target_layer_ids",std::vector<int32_t>{});
     engram_heads=c.at("engram_n_heads");engram_dim=c.at("engram_head_dim");engram_ngram=c.at("engram_max_ngram_size");
     u("engram.pad_id",engram_pad);ml.get_arr("deepseek41.engram.layer_ids",engram_layers);
     ml.get_arr("deepseek41.engram.rows",engram_rows);ml.get_arr("deepseek41.engram.token_map",token_map);
@@ -251,6 +254,12 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
     std::map<int,ggml_tensor*> comps,indices;
     ggml_tensor * scratch=nullptr;
     for(int l=0;l<n_layer;++l) {
+        if((size_t)l<cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[l]) {
+            // DSpark is trained on the uniform HC mean ENTERING each tapped layer.
+            auto * mean=ggml_mean(ctx0,ggml_cont(ctx0,ggml_permute(ctx0,x,1,0,2,3)));
+            res->t_layer_inp[l]=ggml_reshape_2d(ctx0,mean,D,N);
+            cb(res->t_layer_inp[l],"layer_inp",l);ggml_build_forward_expand(gf,res->t_layer_inp[l]);
+        }
         const int r=m.ratios[l];auto & cache=mem->layers41[l];
         // Match the existing HIP sparse path's packed KV layout and tile size.
         // CPU and dense attention have different FP16 reduction partitions;
@@ -394,6 +403,29 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
         auto * att=ggml_mul_mat(ctx0,m.W(l,"attn_output_b.weight"),flat(oa,m.ol*m.og,N));
         x=ggml_dsv4_hc_post(ctx0,att,x,ao,ac);
         ggml_tensor * fp,*fo,*fc;mixes(x,l,"ffn",&fp,&fo,&fc);auto * fn=norm(ggml_dsv4_hc_pre(ctx0,x,ap),m.W(l,"ffn_norm.weight"));
+        // OpenBMB LES predictor: current post-attention normalized state times
+        // the NEXT layer's router, expanded before the current routed FFN.
+        // Raw logits reproduce its ranking rule; native applies DeepSeek's
+        // sqrt-softplus + selection bias. Neither changes the actual router.
+        const char * lookahead=std::getenv("DSV4F_EXPERT_LOOKAHEAD");
+        if(N==1 && l+1<n_layer && kv_dev && lookahead &&
+           (!std::strcmp(lookahead,"3") || !std::strcmp(lookahead,"4") || !std::strcmp(lookahead,"5")) &&
+           !std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(kv_dev)),"ROCm")) {
+            int depth=8;if(const char * value=std::getenv("DSV4F_EXPERT_LOOKAHEAD_DEPTH"))depth=std::atoi(value);
+            GGML_ASSERT(depth>=1 && depth<=16);depth=std::min(depth,int(hparams.n_expert));
+            auto * logits=ggml_mul_mat(ctx0,m.W(l+1,"ffn_gate_inp.weight"),fn);ggml_mul_mat_set_prec(logits,GGML_PREC_F32);
+            ggml_set_name(logits,"v41_early_router_logits");
+            ggml_tensor * predicted=nullptr;
+            const char * score=std::getenv("DSV4F_EXPERT_LOOKAHEAD_SCORE");
+            if(score && !std::strcmp(score,"native")) {
+                ggml_tensor * unused;dsv4f_router(ctx0,logits,m.W(l+1,"exp_probs_b.bias"),depth,false,1.f,&predicted,&unused);
+            } else predicted=ggml_cont(ctx0,ggml_top_k(ctx0,logits,depth));
+            for(auto & e:m.tiers[l+1]) {
+                auto * mapping=e.mapping;
+                if(!mapping){mapping=input(GGML_TYPE_I32,1,hparams.n_expert,"v41_early_expert_ids");in->maps.push_back({mapping,&e.local});}
+                ggml_build_forward_expand(gf,dsv4f_expert_prefetch(ctx0,fn,predicted,mapping,e.gate,e.up,e.down,l+1));
+            }
+        }
         auto * router=ggml_mul_mat(ctx0,m.W(l,"ffn_gate_inp.weight"),fn);ggml_mul_mat_set_prec(router,GGML_PREC_F32);
         ggml_tensor * ids,*probs;
         const char * router_fused=std::getenv("DSV4F_V41_ROUTER_FUSED");

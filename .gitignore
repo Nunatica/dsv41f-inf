@@ -25,3 +25,5 @@ logs
 docs
 vendor/dsv4f-inf-SOURCE.txt
 vendor/Xolotl-SOURCE.txt
+models/dspark-xs2.bin
+models/dspark-xs2.json

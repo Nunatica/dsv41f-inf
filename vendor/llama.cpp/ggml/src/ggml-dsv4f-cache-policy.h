@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -23,6 +24,7 @@ public:
     void clear() {
         slots.clear();legacy_counts.clear();std::fill(counts.begin(),counts.end(),0);
         std::fill(location.begin(),location.end(),-1);cursor=clock=0;
+        std::fill(pin_refs.begin(),pin_refs.end(),0);pinned_keys=0;pin_scan_skips=pin_no_victim=0;
     }
     void observe(const int * keys,int n) {
         if(kind==mode::aged && ++clock%period==0)for(auto & c:counts)c>>=1;
@@ -38,6 +40,20 @@ public:
         const auto it=legacy_counts.find(key);return it==legacy_counts.end()?0:it->second;
     }
     bool contains(int key) const {return location[key]>=0 && slots[location[key]].ready;}
+    bool protected_key(int key) const {return key>=0 && pinned_keys && pin_refs[key]!=0;}
+    bool has_protection() const {return pinned_keys!=0;}
+    size_t protection_count() const {return pinned_keys;}
+    size_t protected_residents() const {
+        size_t n=0;if(pinned_keys)for(const auto & s:slots)n+=protected_key(s.key);return n;
+    }
+    void protect(int key) {assert(key>=0 && key<key_count && pin_refs[key]<255);if(!pin_refs[key]++)++pinned_keys;}
+    void unprotect(int key) {assert(key>=0 && key<key_count && pin_refs[key]>0);if(!--pin_refs[key])--pinned_keys;}
+    // Called after exclusive GPU ownership invalidates the old lookup.
+    void unpublish(int index) {
+        if(slots[index].key>=0)location[slots[index].key]=-1;
+        slots[index]={-1,false};
+    }
+    uint64_t pin_scan_skips=0,pin_no_victim=0;
     void rebuild() {
         std::fill(location.begin(),location.end(),-1);cursor=0;
         for(size_t i=0;i<slots.size();++i)if(slots[i].key>=0) {
@@ -82,16 +98,52 @@ private:
     std::unordered_map<int,uint64_t> legacy_counts;
     std::vector<uint64_t> counts=std::vector<uint64_t>(key_count,0);
     std::vector<int> location=std::vector<int>(key_count,-1);
+    std::vector<uint8_t> pin_refs=std::vector<uint8_t>(key_count,0);
+    size_t pinned_keys=0;
     int victim() {
         int best=-1;uint64_t low=std::numeric_limits<uint64_t>::max();
+        bool saw_pin=false;
         // Dense scores make an exact minimum inexpensive. The legacy hash-map
         // path retains its original bounded 128-slot scan for comparison.
         const size_t count=kind==mode::legacy?std::min<size_t>(128,slots.size()):slots.size();
         for(size_t i=0;i<count;++i) {
             const int index=int(cursor++%slots.size());const auto & s=slots[index];if(!s.ready)continue;
+            if(protected_key(s.key)){++pin_scan_skips;saw_pin=true;continue;}
             if(s.key<0)return index;
             const auto count=score(s.key);if(count<low){low=count;best=index;}
         }
+        if(best<0 && saw_pin)++pin_no_victim;
         return best;
     }
+};
+
+// Each prediction is held through the next token's same-layer route. The
+// previous and current forecasts overlap until that route has acquired GPU
+// readers; reference counts preserve experts predicted in both generations.
+class ggml_dsv4f_lookahead_guard {
+    struct lease {std::vector<int> current,carry,resident_current,resident_carry;};
+    std::array<lease,256> layers;
+    ggml_dsv4f_cache_policy & policy;
+    void release(std::vector<int> & keys){for(int key:keys)policy.unprotect(key);keys.clear();}
+public:
+    uint64_t predictions=0,resident_leases=0,retained_next=0,lost_next=0;
+    explicit ggml_dsv4f_lookahead_guard(ggml_dsv4f_cache_policy & p):policy(p){}
+    void begin(int layer) {auto & l=layers[layer];release(l.current);l.resident_current.clear();}
+    void add(int layer,int key) {
+        auto & l=layers[layer];++predictions;
+        if(policy.contains(key)){l.resident_current.push_back(key);++resident_leases;}
+        policy.protect(key);l.current.push_back(key);
+    }
+    void consume(int layer) {
+        auto & l=layers[layer];
+        for(int key:l.resident_carry){if(policy.contains(key))++retained_next;else ++lost_next;}
+        release(l.carry);l.resident_carry.clear();
+        l.carry.swap(l.current);l.resident_carry.swap(l.resident_current);
+    }
+    void clear_layer(int layer) {
+        auto & l=layers[layer];release(l.current);release(l.carry);
+        l.resident_current.clear();l.resident_carry.clear();
+    }
+    void clear(){for(int layer=0;layer<256;++layer)clear_layer(layer);}
+    void reset(){clear();predictions=resident_leases=retained_next=lost_next=0;}
 };

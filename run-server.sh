@@ -139,6 +139,19 @@ fi
 export DSV4F_PHASE_WORKSPACE=${DSV4F_PHASE_WORKSPACE:-1}
 export DSV4F_DECODE_BATCH=${DSV4F_DECODE_BATCH:-512}
 export DSV4F_DECODE_UBATCH=${DSV4F_DECODE_UBATCH:-256}
+# Expert lookahead: 0 off, 1/2 temporal, 3/4 early-router shadow/copy, 5 cache protection.
+export DSV4F_EXPERT_LOOKAHEAD=${DSV4F_EXPERT_LOOKAHEAD:-0}
+case "$DSV4F_EXPERT_LOOKAHEAD" in 0|1|2|3|4|5) ;; *) echo 'DSV4F_EXPERT_LOOKAHEAD must be 0..5.' >&2; exit 1;; esac
+export DSV4F_EXPERT_LOOKAHEAD_DEPTH=${DSV4F_EXPERT_LOOKAHEAD_DEPTH:-8}
+export DSV4F_EXPERT_LOOKAHEAD_SCORE=${DSV4F_EXPERT_LOOKAHEAD_SCORE:-raw}
+case "$DSV4F_EXPERT_LOOKAHEAD_SCORE" in raw|native) ;; *) echo 'DSV4F_EXPERT_LOOKAHEAD_SCORE must be raw or native.' >&2; exit 1;; esac
+if [[ ! $DSV4F_EXPERT_LOOKAHEAD_DEPTH =~ ^([1-9]|1[0-6])$ ]]; then
+    echo 'DSV4F_EXPERT_LOOKAHEAD_DEPTH must be 1..16.' >&2; exit 1
+fi
+export DSV4F_EXPERT_LOOKAHEAD_READ=${DSV4F_EXPERT_LOOKAHEAD_READ:-$DSV4F_EXPERT_LOOKAHEAD_DEPTH}
+if [[ ! $DSV4F_EXPERT_LOOKAHEAD_READ =~ ^([1-9]|1[0-6])$ ]] || ((DSV4F_EXPERT_LOOKAHEAD_READ > DSV4F_EXPERT_LOOKAHEAD_DEPTH)); then
+    echo 'DSV4F_EXPERT_LOOKAHEAD_READ must be 1..DSV4F_EXPERT_LOOKAHEAD_DEPTH.' >&2; exit 1
+fi
 export DSV4F_CACHE_POLICY=${DSV4F_CACHE_POLICY:-aged}
 case "$DSV4F_CACHE_POLICY" in legacy|scored|aged) ;; *) echo 'DSV4F_CACHE_POLICY must be legacy, scored or aged.' >&2; exit 1;; esac
 export DSV4F_MXFP4_FUSED=${DSV4F_MXFP4_FUSED:-1}
@@ -152,9 +165,27 @@ unset GGML_CUDA_NO_PINNED
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$DSV4F_CPU_THREADS}
 export HOST=${HOST:-0.0.0.0} PORT=${PORT:-8080}
 export API_KEY=${API_KEY:-dummykey}
+# Disabled by default, MTP makes it slower for vram limited system.
 export DSV4F_MTP=${DSV4F_MTP:-0}
-if [[ $DSV4F_MTP != 0 ]]; then
-    echo 'DeepSeek V4.1 MTP/DSpark is not integrated; use DSV4F_MTP=0.' >&2; exit 1
+case "$DSV4F_MTP" in 0|1) ;; *) echo 'DSV4F_MTP must be 0 or 1.' >&2; exit 1;; esac
+if [[ $DSV4F_MTP == 1 ]]; then
+    export MTP_MODEL="${MTP_MODEL:-$ROOT/models/dspark-xs2.bin}"
+    export MTP_CONFIG="${MTP_CONFIG:-${MTP_MODEL%.bin}.json}"
+    export DSV4F_DRAFT_N_MAX=${DSV4F_DRAFT_N_MAX:-1}
+    export DSV4F_DRAFT_P_MIN=${DSV4F_DRAFT_P_MIN:-0.25}
+    if [[ ! $DSV4F_DRAFT_N_MAX =~ ^[1-5]$ ]]; then
+        echo 'DSV4F_DRAFT_N_MAX must be 1..5.' >&2; exit 1
+    fi
+    if ! python3 - "$DSV4F_DRAFT_P_MIN" <<'CHECK_MTP_THRESHOLD'
+import math, sys
+try:
+    value = float(sys.argv[1])
+    assert math.isfinite(value) and 0 <= value <= 1
+except (ValueError, AssertionError):
+    sys.exit(1)
+CHECK_MTP_THRESHOLD
+    then echo 'DSV4F_DRAFT_P_MIN must be a finite probability in 0..1.' >&2; exit 1; fi
+    python3 "$ROOT/scripts/model_info.py" --mtp "$MTP_MODEL" "$MTP_CONFIG"
 fi
 BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 
@@ -166,6 +197,10 @@ args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v
       --flash-attn on --parallel 1 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
       --jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning on --reasoning-budget 4096 --no-context-shift
       --alias dsv4f --ui --path "$ROOT/web")
+if [[ $DSV4F_MTP == 1 ]]; then
+    args+=(--spec-type draft-mtp --spec-draft-n-max "$DSV4F_DRAFT_N_MAX"
+           --spec-draft-n-min 0 --spec-draft-p-min "$DSV4F_DRAFT_P_MIN")
+fi
 if [[ $DSV4F_PINNED_WEIGHTS == 0 ]]; then args+=(--no-host); fi
 if [[ -n ${MMPROJ:-} ]]; then
     echo 'DeepSeek V4.1 vision is not integrated in this engine.' >&2; exit 1

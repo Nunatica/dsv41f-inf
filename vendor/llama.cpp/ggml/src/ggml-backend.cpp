@@ -1116,7 +1116,7 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
     }
     // operations with weights are preferably run on the same backend as the weights
-    if (tensor->op == GGML_OP_CUSTOM && (tensor->op_params[9] == GGML_DSV4F_MOE_TAG || tensor->op_params[9] == GGML_DSV4F_PREPARE_TAG) &&
+    if (tensor->op == GGML_OP_CUSTOM && (tensor->op_params[9] == GGML_DSV4F_MOE_TAG || tensor->op_params[9] == GGML_DSV4F_PREPARE_TAG || tensor->op_params[9] == GGML_DSV4F_PREFETCH_TAG) &&
         ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(tensor)) {
         for (int b = 0; b < sched->n_backends - 1; ++b)
             if (ggml_backend_supports_op(sched->backends[b], tensor)) return b;
@@ -1503,7 +1503,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (node->op == GGML_OP_CUSTOM && (node->op_params[9] == GGML_DSV4F_MOE_TAG || node->op_params[9] == GGML_DSV4F_PREPARE_TAG) &&
+                    if (node->op == GGML_OP_CUSTOM && (node->op_params[9] == GGML_DSV4F_MOE_TAG || node->op_params[9] == GGML_DSV4F_PREPARE_TAG || node->op_params[9] == GGML_DSV4F_PREFETCH_TAG) &&
                         node_backend_id != sched->n_backends - 1 && j >= 3 && j <= 5) continue;
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
@@ -1544,7 +1544,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                 size_t src_id = hash_id(src);
                 // CPU weight descriptors: the custom GPU op owns all admission.
-                if (node->op == GGML_OP_CUSTOM && (node->op_params[9] == GGML_DSV4F_MOE_TAG || node->op_params[9] == GGML_DSV4F_PREPARE_TAG) &&
+                if (node->op == GGML_OP_CUSTOM && (node->op_params[9] == GGML_DSV4F_MOE_TAG || node->op_params[9] == GGML_DSV4F_PREPARE_TAG || node->op_params[9] == GGML_DSV4F_PREFETCH_TAG) &&
                     cur_backend_id != sched->n_backends - 1 && j >= 3 && j <= 5) continue;
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now

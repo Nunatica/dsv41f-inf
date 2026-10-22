@@ -146,3 +146,19 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Native V4.1 DSpark raw binary + JSON tensor manifest. Uses the target's embedding/output weights and
+// layer-input extraction API; it has no second llama_context or tokenizer.
+struct llama_dsv41_mtp;
+LLAMA_API bool llama_dsv41_mtp_supported(const llama_model * model);
+LLAMA_API llama_dsv41_mtp * llama_dsv41_mtp_init(llama_context * target, const char * path, const char * manifest);
+LLAMA_API void llama_dsv41_mtp_free(llama_dsv41_mtp * mtp);
+LLAMA_API void llama_dsv41_mtp_reset(llama_dsv41_mtp * mtp);
+LLAMA_API int llama_dsv41_mtp_block_size(const llama_dsv41_mtp * mtp);
+LLAMA_API int llama_dsv41_mtp_window_size(const llama_dsv41_mtp * mtp);
+LLAMA_API const int32_t * llama_dsv41_mtp_layers(const llama_dsv41_mtp * mtp);
+// Feed accepted tap rows (three concatenated HC means per position), at most
+// one SWA window at a time. draft() predicts positions anchor_pos+1 onward.
+LLAMA_API bool llama_dsv41_mtp_append(llama_dsv41_mtp * mtp, const float * taps, const int32_t * positions, int n);
+LLAMA_API bool llama_dsv41_mtp_draft(llama_dsv41_mtp * mtp, int32_t anchor_pos, llama_token anchor,
+                                    llama_token * ids, float * confidence);

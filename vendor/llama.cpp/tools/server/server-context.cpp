@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1282,7 +1283,7 @@ private:
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (ctx_dft == nullptr && !(spec_mtp && llama_dsv41_mtp_supported(model_tgt))) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
@@ -1398,6 +1399,12 @@ private:
 
         slots.clear();
 
+        // Native DSpark weights/workspace must precede the probe decode,
+        // which lazily sizes the hybrid expert cache from remaining VRAM.
+        if(spec_mtp && llama_dsv41_mtp_supported(model_tgt)) {
+            try {spec.reset(common_speculative_init(params_base.speculative,params_base.n_parallel));}
+            catch(const std::exception & e){SRV_ERR("failed to initialize V4.1 MTP: %s\n",e.what());return false;}
+        }
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
@@ -1417,12 +1424,12 @@ private:
         }
 
         // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        if (!spec && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-                if (params_base.speculative.has_synth()) {
+                if (params_base.speculative.has_synth() || (spec_mtp && llama_dsv41_mtp_supported(model_tgt))) {
                     return false;
                 }
             }

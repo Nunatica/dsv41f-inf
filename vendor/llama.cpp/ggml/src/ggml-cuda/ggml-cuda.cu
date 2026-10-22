@@ -2212,6 +2212,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 else ggml_cuda_dsv4f_kv_attn(ctx, dst);
                 break;
             }
+            if (dst->op_params[9] == GGML_DSV4F_PREFETCH_TAG) {
+                ggml_dsv4f_service_prefetch(&ctx, dst);
+                break;
+            }
             if (dst->op_params[9] == GGML_DSV4F_PREPARE_TAG) {
                 ggml_dsv4f_service_prepare(&ctx, dst);
                 break;
@@ -5593,7 +5597,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (resolve_views) while (src && !src->buffer && src->view_src) src = src->view_src;
             return src->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) == dev;
         }
-        return dev_ctx->device == 0 && (op->op_params[9] == GGML_DSV4F_MOE_TAG || op->op_params[9] == GGML_DSV4F_JOIN_TAG || op->op_params[9] == GGML_DSV4F_PREPARE_TAG) &&
+        return dev_ctx->device == 0 && (op->op_params[9] == GGML_DSV4F_MOE_TAG || op->op_params[9] == GGML_DSV4F_JOIN_TAG || op->op_params[9] == GGML_DSV4F_PREPARE_TAG || op->op_params[9] == GGML_DSV4F_PREFETCH_TAG) &&
                ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(op);
     }
 

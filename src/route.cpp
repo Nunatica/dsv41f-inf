@@ -6,6 +6,20 @@
 #include <limits>
 #include <vector>
 
+static void prefetch_cpu(ggml_tensor * dst,int ith,int,void *) {
+    if(!ith)std::memset(dst->data,0,ggml_nbytes(dst));
+}
+ggml_tensor * dsv4f_expert_prefetch(ggml_context * ctx,ggml_tensor * anchor,
+    ggml_tensor * ids,ggml_tensor * mapping,ggml_tensor * gate,
+    ggml_tensor * up,ggml_tensor * down,int target_layer) {
+    GGML_ASSERT(anchor->ne[1]==1 && ids->type==GGML_TYPE_I32 && ids->ne[1]==1 &&
+        ids->ne[0]>0 && ids->ne[0]<=16 && mapping->type==GGML_TYPE_I32 && mapping->ne[0]==1);
+    ggml_tensor * args[]={anchor,ids,mapping,gate,up,down};
+    auto * node=ggml_custom_4d(ctx,GGML_TYPE_F32,1,1,1,1,args,6,prefetch_cpu,1,nullptr);
+    node->op_params[9]=GGML_DSV4F_PREFETCH_TAG;node->op_params[12]=target_layer;
+    ggml_set_name(node,"v41_expert_lookahead");return node;
+}
+
 static void route_plan_cpu(ggml_tensor * dst,int ith,int,void *) {
     if(ith)return;
     const auto * mapping=dst->src[0],*ids=dst->src[1],*prob=dst->src[2];

@@ -14,6 +14,7 @@ lib.ggml_quantize_chunk.restype=C.c_size_t
 rng=np.random.default_rng(41)
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output',nargs='?',type=Path,default=Path('/tmp/dsv4f-v41-fixture.gguf'))
+parser.add_argument('--mtp',action='store_true',help='also create a small DSpark raw binary/JSON sidecar')
 parser.add_argument('--indexer-heads',type=int,choices=[2,4,32,64],default=2)
 parser.add_argument('--indexer-topk',type=int,default=8)
 args=parser.parse_args()
@@ -23,6 +24,13 @@ meta={'general.architecture':'deepseek41','general.name':'dsv4f-v41-test-fixture
 'deepseek41.hidden_size':D,'deepseek41.num_hidden_layers':3,'deepseek41.num_attention_heads':NH,'deepseek41.head_dim':DH,'deepseek41.qk_rope_head_dim':64,'deepseek41.q_lora_rank':RQ,'deepseek41.o_lora_rank':OL,'deepseek41.o_groups':OG,'deepseek41.sliding_window':8,'deepseek41.n_routed_experts':NE,'deepseek41.num_experts_per_tok':3,'deepseek41.moe_intermediate_size':FF,'deepseek41.n_shared_experts':1,'deepseek41.hc_mult':4,'deepseek41.hc_sinkhorn_iters':4,'deepseek41.index_n_heads':IH,'deepseek41.index_head_dim':ID,'deepseek41.index_topk':args.indexer_topk,'deepseek41.candidate_source_layer_id':1,'deepseek41.candidate_topk_blocks':8,'deepseek41.candidate_block_size':8,'deepseek41.vocab_size':V,'deepseek41.max_position_embeddings':128,'deepseek41.routed_scaling_factor':.1,'deepseek41.hc_eps':1e-6,'deepseek41.rms_norm_eps':1e-6,'deepseek41.rope_theta':10000,'deepseek41.compress_rope_theta':1000000,'deepseek41.rope_scaling.factor':1.,'deepseek41.rope_scaling.beta_fast':32.,'deepseek41.rope_scaling.beta_slow':1.,'deepseek41.rope_scaling.original_max_position_embeddings':128.,'deepseek41.swiglu_limit':1.25,'deepseek41.norm_topk_prob':True,'deepseek41.scoring_func':'sqrtsoftplus','deepseek41.compress_ratios':[0,1,2],'deepseek41.kv_source_layer_ids':[1,2],'deepseek41.index_source_layer_ids':[1,2],
 'deepseek41.config':json.dumps({'engram_n_heads':2,'engram_head_dim':32,'engram_max_ngram_size':2}),'deepseek41.engram.pad_id':2,'deepseek41.engram.compressed_vocab_size':V,'deepseek41.engram.layer_ids':[1],'deepseek41.engram.rows':[18],'deepseek41.engram.token_map':[0xffffffff if i==10 else i for i in range(V)],'deepseek41.engram.primes':[7,11],'deepseek41.engram.multipliers':[11,13],
  'tokenizer.ggml.model':'gpt2','tokenizer.ggml.pre':'joyai-llm','tokenizer.ggml.tokens':['<bos>','<eos>']+[f'tok{i}' for i in range(2,V)],'tokenizer.ggml.token_type':[3,3]+[1]*(V-2),'tokenizer.ggml.merges':[],'tokenizer.ggml.bos_token_id':0,'tokenizer.ggml.eos_token_id':1,'tokenizer.ggml.add_bos_token':False}
+if args.mtp:
+ # Remove routed activation-quantization noise from the target parity fixture.
+ meta['deepseek41.routed_scaling_factor']=0.0
+ config=json.loads(meta['deepseek41.config'])
+ config.update(dspark_block_size=5,dspark_noise_token_id=3,dspark_target_layer_ids=[0,1,2],
+               dspark_n_routed_experts=4,dspark_num_experts_per_tok=2,dspark_markov_rank=32)
+ meta['deepseek41.config']=json.dumps(config)
 tensors=[]
 geom={0:(1,4),1:(1,2),8:(32,34),11:(256,110),42:(64,18),143:(128,28),26:(1,4)}
 def add(name,shape,ty=0,fill=None):
@@ -75,3 +83,39 @@ w=(np.arange(18*32,dtype=np.uint16)%110).astype(np.uint8).tobytes();sc=bytes([12
 h=json.dumps({'layers.1.engram.embed.weight':{'dtype':'F8_E4M3','shape':[18,32],'data_offsets':[0,len(w)]},'layers.1.engram.embed.scale':{'dtype':'F8_E8M0','shape':[18,1],'data_offsets':[len(w),len(w)+len(sc)]}}).encode()
 (engram_dir/'fixture.safetensors').write_bytes(struct.pack('<Q',len(h))+h+w+sc)
 print('DSV4F_ENGRAM_DIR='+str(engram_dir))
+
+if args.mtp:
+ # Mirror the real manifest: PyTorch shapes, separate experts, BF16 and Q8_0.
+ index=[];payload=bytearray()
+ def mtp_add(name,shape,typ='Q8_0',fill=None):
+  n=int(np.prod(shape));a=(rng.normal(0,.02,n) if fill is None else np.broadcast_to(fill,(n,))).astype(np.float32)
+  if typ=='F32':data=a.astype('<f4').tobytes()
+  elif typ=='BF16':data=(a.view(np.uint32)>>16).astype('<u2').tobytes()
+  else:
+   ty,bs,bb={'Q8_0':(8,32,34),'IQ2_XXS':(16,256,66)}[typ]
+   buf=C.create_string_buffer(n//bs*bb);importance=np.ones(shape[0],dtype=np.float32)
+   wrote=lib.ggml_quantize_chunk(ty,a.ctypes.data,C.addressof(buf),0,n//shape[0],shape[0],importance.ctypes.data)
+   assert wrote==len(buf);data=buf.raw
+  index.append([name,typ,len(payload),len(data),list(reversed(shape))])
+  payload.extend(data);payload.extend(bytes(-len(payload)%256))
+ for b in range(3):
+  prefix=f'mtp.{b}.'
+  for name,shape in [('attn.wkv.weight',[D,DH]),('attn.wo_a.weight',[NH*DH//OG,OG*OL]),('attn.wo_b.weight',[OG*OL,D]),
+                     ('attn.wq_a.weight',[D,RQ]),('attn.wq_b.weight',[RQ,NH*DH]),
+                     ('ffn.shared_experts.w1.weight',[D,FF]),('ffn.shared_experts.w3.weight',[D,FF]),('ffn.shared_experts.w2.weight',[FF,D])]:mtp_add(prefix+name,shape)
+  for name,shape in [('attn.kv_norm.weight',[DH]),('attn.q_norm.weight',[RQ]),('attn_norm.weight',[D]),('ffn_norm.weight',[D])]:mtp_add(prefix+name,shape,'BF16',1)
+  mtp_add(prefix+'attn.attn_sink',[NH],'F32',0)
+  mtp_add(prefix+'ffn.gate.bias',[4],'F32',0);mtp_add(prefix+'ffn.gate.bias_vl',[4],'F32',0)
+  mtp_add(prefix+'ffn.gate.weight',[D,4],'BF16')
+  for site in ['attn','ffn']:
+   mtp_add(prefix+f'hc_{site}_base',[24],'F32',0);mtp_add(prefix+f'hc_{site}_scale',[3],'F32',1);mtp_add(prefix+f'hc_{site}_fn',[4*D,24],'F32')
+  for e in range(4):
+   for w,shape in [('w1',[D,FF]),('w3',[D,FF]),('w2',[FF,D])]:mtp_add(prefix+f'ffn.experts.{e}.{w}.weight',shape,'IQ2_XXS')
+ mtp_add('mtp.0.main_proj.weight',[D*3,D]);mtp_add('mtp.0.main_norm.weight',[D],'BF16',1);mtp_add('mtp.2.norm.weight',[D],'BF16',1)
+ mtp_add('mtp.2.markov_head.embed.weight',[32,V],'BF16');mtp_add('mtp.2.markov_head.head.weight',[32,V],'BF16')
+ mtp_add('mtp.2.confidence_head.proj.weight',[D+32,1],'BF16')
+ # A deliberately impossible vision payload proves it is never read/allocated.
+ index.append(['vision.do_not_load.weight','F32',1<<40,1<<30,[16384,16384]])
+ binary=path.with_suffix('.mtp.bin');manifest=path.with_suffix('.mtp.json')
+ binary.write_bytes(payload);manifest.write_text(json.dumps({'tensors':index}))
+ print(binary,manifest)

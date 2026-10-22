@@ -36,8 +36,8 @@ constexpr int RING=32, MAX_LAYERS=256, MAX_EXPERTS=512, MAX_USED=64, MAX_EMBD=51
 std::mutex cpu_lane_mutex;
 struct alignas(64) request {
     volatile unsigned long long seq,done,consumed;
-    int layer,nk;
-    uint64_t hits;
+    int layer,nk,single,kind,bank;
+    uint64_t hits,prefetch_hits;
     float limit;
     int32_t ids[MAX_USED];
     float weights[MAX_USED],x[MAX_EMBD],answer[MAX_EMBD];
@@ -51,7 +51,8 @@ __device__ bool acquire(int * state,int slot) {
 }
 __global__ void route(request * ring,unsigned long long * sequence,int * table,int * readers,
                       const float * x,const int32_t * ids,const float * weights,int weight_stride,
-                      int layer,int ne,int nk,float limit,int32_t * plan,float * plan_w,unsigned long long * issued) {
+                      int layer,int ne,int nk,float limit,int32_t * plan,float * plan_w,unsigned long long * issued,
+                      int * speculative,bool single) {
     __shared__ unsigned long long seq;
     __shared__ uint64_t mask;
     if(threadIdx.x==0) {
@@ -59,7 +60,7 @@ __global__ void route(request * ring,unsigned long long * sequence,int * table,i
         request * r=ring+(seq%RING);
         const unsigned long long previous=seq>RING?seq-RING:0;
         while(r->consumed!=previous) { /* GPU queue cannot overwrite an unconsumed request. */ }
-        r->layer=layer;r->nk=nk;r->limit=limit;
+        r->layer=layer;r->nk=nk;r->limit=limit;r->single=single;r->kind=0;r->prefetch_hits=0;
         for(int i=0;i<nk;++i) {
             const int eid=ids[i];
             const int key=layer*MAX_EXPERTS+eid;
@@ -68,6 +69,7 @@ __global__ void route(request * ring,unsigned long long * sequence,int * table,i
                 if(!acquire(readers,slot))slot=-1;
                 else if(atomicAdd(table+key,0)!=slot){atomicSub(readers+slot,1);slot=-1;}
             }
+            if(slot>=0 && speculative && atomicExch(speculative+key,0))r->prefetch_hits|=uint64_t(1)<<i;
             plan[i]=slot;plan_w[i]=weights[i*weight_stride];
             r->ids[i]=eid;r->weights[i]=plan_w[i];
             if(slot>=0 || plan_w[i]==0)mask|=uint64_t(1)<<i;
@@ -79,6 +81,21 @@ __global__ void route(request * ring,unsigned long long * sequence,int * table,i
     if(mask!=((uint64_t(1)<<nk)-1))for(int i=threadIdx.x;i<ne;i+=blockDim.x)r->x[i]=x[i];
     __threadfence_system();__syncthreads();
     if(threadIdx.x==0){r->seq=seq;__threadfence_system();}
+}
+// Publish current-token predictions without synchronously reading IDs back.
+// These records share sequence ownership with real CPU requests but never
+// overwrite their issued[] join handles or activation/answer buffers.
+__global__ void prefetch_request(request * ring,unsigned long long * sequence,
+    const int32_t * ids,const char * mapping,size_t map_stride,int global_count,
+    int layer,int nk,int bank,float * output) {
+    if(threadIdx.x)return;
+    const unsigned long long seq=atomicAdd(sequence,1ull)+1ull;
+    request * r=ring+(seq%RING);
+    const unsigned long long previous=seq>RING?seq-RING:0;
+    while(r->consumed!=previous) {}
+    r->layer=layer;r->nk=nk;r->kind=1;r->bank=bank;
+    for(int k=0;k<nk;++k){const int id=ids[k];r->ids[k]=id>=0 && id<global_count?*(const int32_t *)(mapping+id*map_stride):-1;}
+    *output=0;__threadfence_system();r->seq=seq;__threadfence_system();
 }
 __global__ void release_reduce(const float * down,const float * weights,const int32_t * plan,
                                int * readers,int ne,int nk,float * output) {
@@ -102,8 +119,10 @@ __global__ void reserve_slot(int * readers,int * table,int slot,int old_key,int 
     if(*claimed && old_key>=0)atomicCAS(table+old_key,slot,-1);
     __threadfence_system();
 }
-__global__ void publish_slot(int * readers,int * table,int slot,int key) {
-    if(threadIdx.x)return;__threadfence();atomicExch(readers+slot,0);atomicExch(table+key,slot);
+__global__ void publish_slot(int * readers,int * table,int slot,int key,int * speculative,bool predicted) {
+    if(threadIdx.x)return;
+    if(speculative)atomicExch(speculative+key,int(predicted));
+    __threadfence();atomicExch(readers+slot,0);atomicExch(table+key,slot);
 }
 __global__ void prefill_lease(int * readers, int * table, const int * updates, int count, bool publish) {
     const int i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -152,7 +171,7 @@ __global__ void mxfp4_down_sum(const char * const * cache,size_t down_offset,con
 }
 
 struct descriptor {ggml_tensor g,u,d;};
-struct job {int slot,key,old_key;};
+struct job {int slot,key,old_key;bool predicted=false;};
 // Host clocks only: callback entry proves the request is visible, but is NOT
 // the GPU publication timestamp. In particular, callback wait overlaps experts.
 using service_clock = std::chrono::steady_clock;
@@ -186,18 +205,42 @@ struct service_metric {
 class service {
     std::mutex mutex,answer_mutex,wake_mutex;
     std::condition_variable copies,answered,ready;
-    std::thread worker,loader;
+    std::thread worker,loader,lookahead_loader;
     std::atomic<bool> stop{false};
     std::deque<descriptor> layers;
     std::unordered_map<const void*,int> layer_ids;
     ggml_dsv4f_cache_policy policy;
+    ggml_dsv4f_lookahead_guard guard{policy};
+    uint64_t guard_hits=0,guard_cancelled=0,guard_reclaim_denied=0,guard_compacted=0;
     std::unordered_set<int> pending;
-    std::deque<job> queue;
+    std::deque<job> queue,lookahead_queue;
     std::vector<ggml_dsv4f_cache_policy::slot> & slots=policy.slots;
     FILE * trace=nullptr;
     request * host=nullptr,*device=nullptr;
     unsigned long long * seq=nullptr,*issued=nullptr;
     int * table=nullptr,*readers=nullptr,*claim_h=nullptr,*claim_d=nullptr;
+    int * speculative=nullptr;
+    int * lookahead_claim_h=nullptr,*lookahead_claim_d=nullptr;
+    // 1/2: Q3 temporal; 3/4: early-router shadow/copy; 5: no-copy cache guard.
+    // Predictions never add frequency to the actual-demand cache policy.
+    int lookahead=0;
+    int early_depth=8,early_read=8;
+    int temporary_slots=0,prefetch_cursor=0;
+    bool prefetch_pending=false;
+    std::array<bool,32> temporary_busy{};
+    std::array<std::vector<int>,MAX_LAYERS> early_ids;
+    std::array<std::vector<int>,MAX_LAYERS> early_read_ids;
+    std::array<bool,MAX_LAYERS> early_valid{};
+    uint64_t early_batches=0,early_candidates=0,early_matches=0,early_actual=0;
+    uint64_t early_ready=0,early_matched_ready=0,early_actual_miss=0,early_matched_miss=0;
+    uint64_t early_new_candidates=0,early_cached_candidates=0;
+    uint64_t early_armed_batches=0,early_skipped_batches=0;
+    uint64_t early_read_candidates=0,early_read_matches=0,early_read_ready=0,early_read_miss=0;
+    std::array<std::vector<int>,MAX_LAYERS> last_routes;
+    std::array<int,MAX_LAYERS> forecast;
+    uint64_t predictions=0,forecast_used=0,forecast_missed=0,forecast_consumed=0;
+    uint64_t prefetch_copies=0,prefetch_hits=0,prefetch_timely=0,prefetch_rejected=0,prefetch_failed=0;
+    double prefetch_copy_us=0;
     int * prefill_updates=nullptr;
     std::vector<int> prefill_changes;
     bool prefill_leased=false;
@@ -214,7 +257,7 @@ class service {
     float * gate=nullptr,*down=nullptr,*weights=nullptr;
     int32_t * plan=nullptr;
     void * aq=nullptr,*hq=nullptr;
-    cudaStream_t copy=nullptr;
+    cudaStream_t copy=nullptr,lookahead_copy=nullptr;
     int ne=0,nf=0;
     size_t gs=0,us=0,ds=0,uo=0,doff=0,stride=0;
     ggml_type gt{},ut{},dt{};
@@ -245,13 +288,140 @@ class service {
     bool fused_mxfp4=false,block_cache=false,v41=false;
     uint64_t routes=0,hits=0,admissions=0,admit_bytes=0,requests=0;
     double cpu_ms=0;
-    void admit(const int * misses,int n) {
-        if(queue.size()>=8)return;
-        const auto chosen=policy.select(misses,n,pending);if(chosen.index<0)return;
+    // Reserve temporary slots INSIDE the existing format budget. Host ready=false
+    // excludes them from demand-policy victims; GPU table/readers still decide
+    // whether a completed temporary entry can be consumed safely.
+    void reserve_temporary() {
+        for(int i=0;i<temporary_slots && i<int(slots.size());++i)slots[i].ready=true;
+        temporary_slots=lookahead==4?std::min(2*early_depth,int(slots.size())):
+            lookahead==2 && !slots.empty()?std::min(4,std::max(1,int(slots.size())/8)):0;
+        for(int i=0;i<temporary_slots;++i)slots[i].ready=false;
+        prefetch_cursor=0;
+    }
+    bool temporary_contains(int key) const {
+        for(int i=0;i<temporary_slots;++i)if(slots[i].key==key)return true;
+        return false;
+    }
+    bool admit(const int * misses,int n,bool predicted=false,int preferred=-1) {
+        auto & jobs=predicted && lookahead==4?lookahead_queue:queue;
+        if(jobs.size()>=size_t(predicted && lookahead==4?early_read:8))return false;
+        ggml_dsv4f_cache_policy::decision chosen;
+        if(predicted) {
+            if(n!=1 || !temporary_slots || (lookahead==2 && prefetch_pending) || pending.count(misses[0]) ||
+                policy.contains(misses[0]) || temporary_contains(misses[0]))return false;
+            int index=preferred;
+            if(index<0){index=prefetch_cursor;prefetch_cursor=(prefetch_cursor+1)%temporary_slots;}
+            if(index>=temporary_slots || temporary_busy[index])return false;
+            chosen={misses[0],index};temporary_busy[index]=true;prefetch_pending=true;
+        } else chosen=policy.select(misses,n,pending);
+        if(chosen.index<0)return false;
         const int key=chosen.key,victim=chosen.index;
-        pending.insert(key);slots[victim].ready=false;queue.push_back({victim,key,slots[victim].key});
+        pending.insert(key);slots[victim].ready=false;jobs.push_back({victim,key,slots[victim].key,predicted});
         if(trace)std::fprintf(trace,"Q %d %d %d\n",key,slots[victim].key,victim);
-        copies.notify_one();
+        copies.notify_all();return true;
+    }
+    // mutex held; submit before current CPU experts so the loader can overlap
+    // them and the following attention. No blocking GPU readback is introduced.
+    void predict(const request & r) {
+        if(!lookahead)return;
+        prefetch_hits+=__builtin_popcountll(r.prefetch_hits);
+        if(lookahead>=3) {
+            if(r.single && early_valid[r.layer]) {
+                const auto & predicted=early_ids[r.layer];
+                for(int k=0;k<r.nk;++k)if(r.weights[k]!=0) {
+                    ++early_actual;const bool hit=(r.hits>>k)&1;early_ready+=hit;early_actual_miss+=!hit;
+                    const int key=r.layer*MAX_EXPERTS+r.ids[k];
+                    if(lookahead==5 && hit && policy.protected_key(key))++guard_hits;
+                    const auto & selected=early_read_ids[r.layer];
+                    if(std::find(selected.begin(),selected.end(),key)!=selected.end()) {
+                        ++early_read_matches;early_read_ready+=hit;early_read_miss+=!hit;
+                    }
+                    if(std::find(predicted.begin(),predicted.end(),key)!=predicted.end()) {
+                        ++early_matches;early_matched_ready+=hit;early_matched_miss+=!hit;
+                    }
+                }
+            }
+            if(lookahead==5){if(r.single)guard.consume(r.layer);else guard.clear_layer(r.layer);}
+            early_valid[r.layer]=false;return;
+        }
+        if(!r.single){forecast[r.layer]=-1;last_routes[r.layer].clear();return;}
+        const int expected=forecast[r.layer];
+        if(expected>=0) {
+            ++forecast_consumed;
+            for(int i=0;i<r.nk;++i)if(r.weights[i]!=0 && r.layer*MAX_EXPERTS+r.ids[i]==expected) {
+                ++forecast_used;if(!(r.hits&(uint64_t(1)<<i)))++forecast_missed;
+                if(r.prefetch_hits&(uint64_t(1)<<i))++prefetch_timely;break;
+            }
+        }
+        forecast[r.layer]=-1;
+        auto & previous=last_routes[r.layer];previous.clear();
+        for(int i=0;i<r.nk;++i)if(r.weights[i]!=0)previous.push_back(r.layer*MAX_EXPERTS+r.ids[i]);
+        const int target=r.layer+1;
+        if(target>=int(layers.size()) || slots.empty())return;
+        int best=-1;
+        for(int key:last_routes[target])if(!policy.contains(key) && !temporary_contains(key) && !pending.count(key) &&
+            (best<0 || policy.score(key)>policy.score(best)))best=key;
+        if(best<0)return;
+        forecast[target]=best;++predictions;
+        if(lookahead==2 && !admit(&best,1,true))++prefetch_rejected;
+    }
+    void print_lookahead() const {
+        if(!lookahead)return;
+        if(lookahead==5)std::fprintf(stderr,"[dsv4f-protect] format=%s predictions=%llu resident_leases=%llu retained_next=%llu lost_next=%llu protected_hits=%llu held_keys=%zu scan_skips=%llu no_victim=%llu queued_cancelled=%llu reclaim_denied=%llu compacted=%llu routes=%llu hits=%llu admissions=%llu demand_copy_mib=%.3f\n",
+            ggml_type_name(gt),(unsigned long long)guard.predictions,(unsigned long long)guard.resident_leases,
+            (unsigned long long)guard.retained_next,(unsigned long long)guard.lost_next,(unsigned long long)guard_hits,
+            policy.protection_count(),(unsigned long long)policy.pin_scan_skips,(unsigned long long)policy.pin_no_victim,
+            (unsigned long long)guard_cancelled,(unsigned long long)guard_reclaim_denied,(unsigned long long)guard_compacted,
+            (unsigned long long)routes,(unsigned long long)hits,(unsigned long long)admissions,double(admit_bytes)/1048576.);
+        if(lookahead>=3) {
+            std::fprintf(stderr,"[dsv4f-early] mode=%d format=%s depth=%d read=%d read_candidates=%llu read_matches=%llu read_ready=%llu read_miss=%llu batches=%llu armed_batches=%llu skipped_batches=%llu candidates=%llu matches=%llu actual=%llu actual_ready=%llu matched_ready=%llu actual_miss=%llu matched_miss=%llu new_candidates=%llu cached_candidates=%llu copies=%llu first_hits=%llu rejected=%llu failed=%llu copy_mib=%.3f copy_mean_us=%.3f\n",
+                lookahead,ggml_type_name(gt),early_depth,early_read,(unsigned long long)early_read_candidates,
+                (unsigned long long)early_read_matches,(unsigned long long)early_read_ready,(unsigned long long)early_read_miss,
+                (unsigned long long)early_batches,(unsigned long long)early_armed_batches,
+                (unsigned long long)early_skipped_batches,(unsigned long long)early_candidates,
+                (unsigned long long)early_matches,(unsigned long long)early_actual,(unsigned long long)early_ready,
+                (unsigned long long)early_matched_ready,(unsigned long long)early_actual_miss,(unsigned long long)early_matched_miss,
+                (unsigned long long)early_new_candidates,(unsigned long long)early_cached_candidates,
+                (unsigned long long)prefetch_copies,(unsigned long long)prefetch_hits,(unsigned long long)prefetch_rejected,
+                (unsigned long long)prefetch_failed,double(prefetch_copies)*(gs+us+ds)/1048576.,prefetch_copies?prefetch_copy_us/prefetch_copies:0.);
+            return;
+        }
+        std::fprintf(stderr,"[dsv4f-lookahead] mode=%d format=%s requests=%llu predictions=%llu consumed=%llu selected=%llu selected_miss=%llu copies=%llu first_hits=%llu timely=%llu rejected=%llu failed=%llu copy_mib=%.3f copy_mean_us=%.3f\n",
+            lookahead,ggml_type_name(gt),(unsigned long long)requests,(unsigned long long)predictions,
+            (unsigned long long)forecast_consumed,(unsigned long long)forecast_used,(unsigned long long)forecast_missed,
+            (unsigned long long)prefetch_copies,(unsigned long long)prefetch_hits,(unsigned long long)prefetch_timely,(unsigned long long)prefetch_rejected,
+            (unsigned long long)prefetch_failed,double(prefetch_copies)*(gs+us+ds)/1048576.,prefetch_copies?prefetch_copy_us/prefetch_copies:0.);
+    }
+    // mutex held. Keep the complete top-k for recall/precision, including hot
+    // cache hits. Only missing experts require a physical weight transfer.
+    void early_predict(const request & r) {
+        if(lookahead<3)return;
+        ++early_batches;auto & ids=early_ids[r.layer];ids.clear();early_valid[r.layer]=true;
+        auto & selected=early_read_ids[r.layer];selected.clear();
+        if(lookahead==5)guard.begin(r.layer);
+        // Match OpenBMB arm(): one batch in flight; if it has not completed,
+        // skip the new batch rather than accumulating stale layer predictions.
+        const bool busy=std::any_of(temporary_busy.begin(),temporary_busy.end(),[](bool b){return b;});
+        bool has_new=false,armed=false;
+        int next_slot=0;
+        const int bank_begin=r.bank*early_depth,bank_end=std::min(bank_begin+early_depth,temporary_slots);
+        for(int k=0;k<r.nk;++k)if(r.ids[k]>=0 && r.ids[k]<layers[r.layer].g.ne[2]) {
+            const int key=r.layer*MAX_EXPERTS+r.ids[k];ids.push_back(key);++early_candidates;
+            if(lookahead==5)guard.add(r.layer,key);
+            // Rank is global, BEFORE format/cache filtering. A resident top-1
+            // never causes a lower-ranked expert to be copied as a replacement.
+            if(k>=early_read)continue;
+            selected.push_back(key);++early_read_candidates;
+            if(policy.contains(key) || temporary_contains(key)){++early_cached_candidates;continue;}
+            ++early_new_candidates;has_new=true;
+            if(lookahead!=4)continue;
+            if(busy){++prefetch_rejected;continue;}
+            int slot=-1;
+            for(int i=bank_begin+next_slot;i<bank_end;++i)if(!temporary_busy[i]){slot=i;next_slot=i-bank_begin+1;break;}
+            if(slot<0 || !admit(&key,1,true,slot))++prefetch_rejected;
+            else armed=true;
+        }
+        early_armed_batches+=armed;early_skipped_batches+=lookahead==4 && busy && has_new;
     }
     void serve() {
         unsigned long long next=1;unsigned idle=0;uint64_t last_sleep_start=0;
@@ -284,8 +454,14 @@ class service {
             if(profile)idle_cpu.add(service_cpu_ns()-idle_cpu_start);
             if(profile){timing[next%RING].seen.store(seen,std::memory_order_relaxed);if(last_sleep_start)detect_bound.add(seen-last_sleep_start);}
             last_sleep_start=0;
+            if(r->kind==1) {
+                {std::lock_guard<std::mutex> lock(mutex);early_predict(*r);}
+                std::atomic_thread_fence(std::memory_order_release);r->consumed=next;++next;
+                if(profile)idle_cpu_start=service_cpu_ns();
+                continue;
+            }
             descriptor layer;
-            {std::lock_guard<std::mutex> lock(mutex);layer=layers[r->layer];}
+            {std::lock_guard<std::mutex> lock(mutex);layer=layers[r->layer];predict(*r);}
             if(profile)descriptor_time.add(service_ns()-seen);
             const uint64_t all=(uint64_t(1)<<r->nk)-1;
             std::unique_lock<std::mutex> cpu_lane(cpu_lane_mutex,std::defer_lock);
@@ -327,6 +503,7 @@ class service {
                 policy.observe(active,nactive);
                 if(trace){std::fprintf(trace,"R %llu",(unsigned long long)r->hits);for(int i=0;i<r->nk;++i)std::fprintf(trace," %d",keys[i]);std::fprintf(trace,"\n");}
                 admit(misses,nmiss);
+                if(lookahead && requests%4300==0)print_lookahead();
                 if(requests%4300==0)std::fprintf(stderr,"[dsv4f-service] routes=%llu hit=%.2f%% cpu_ms/token=%.3f admissions=%llu copy_mib=%.2f queued=%zu format=%s\n",(unsigned long long)routes,100.*hits/std::max<uint64_t>(routes,1),(v41?double(layers.size()):43.)*cpu_ms/requests,(unsigned long long)admissions,double(admit_bytes)/(1<<20),queue.size(),ggml_type_name(gt));
             }
             std::atomic_thread_fence(std::memory_order_release);r->consumed=next;++next;
@@ -335,22 +512,39 @@ class service {
         }
         if(profile)print_worker_profile("final");
     }
-    void load() {
+    void load(bool predicted_lane=false) {
         ggml_cuda_set_device(0);
+        auto & jobs=predicted_lane?lookahead_queue:queue;
+        const auto work_stream=predicted_lane?lookahead_copy:copy;
+        auto * claimed_host=predicted_lane?lookahead_claim_h:claim_h;
+        auto * claimed_device=predicted_lane?lookahead_claim_d:claim_d;
         std::unique_lock<std::mutex> lock(mutex);
         while(true) {
-            copies.wait(lock,[&]{return stop.load()||!queue.empty();});if(stop.load())return;
-            job j=queue.front();queue.pop_front();descriptor l=layers[j.key/MAX_EXPERTS];lock.unlock();
-            reserve_slot<<<1,32,0,copy>>>(readers,table,j.slot,j.old_key,claim_d);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
-            const bool success=*claim_h!=0;
+            copies.wait(lock,[&]{return stop.load()||!jobs.empty();});if(stop.load())return;
+            job j=jobs.front();jobs.pop_front();descriptor l=layers[j.key/MAX_EXPERTS];
+            const bool guarded=lookahead==5;
+            if(guarded && policy.protected_key(j.old_key)) {
+                slots[j.slot].ready=true;pending.erase(j.key);++guard_cancelled;copies.notify_all();continue;
+            }
+            // Linearize lease grants with GPU invalidation. In guard mode the
+            // mutex covers only reservation; bulk weight DMA stays outside it.
+            if(!guarded)lock.unlock();
+            const auto copy_start=j.predicted?service_clock::now():service_clock::time_point{};
+            reserve_slot<<<1,32,0,work_stream>>>(readers,table,j.slot,j.old_key,claimed_device);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(work_stream));
+            const bool success=*claimed_host!=0;
+            if(guarded){if(success)policy.unpublish(j.slot);lock.unlock();}
             if(success){const int eid=j.key%MAX_EXPERTS;
                 char * dest=block_cache?cache_ptrs[j.slot]:slab+j.slot*stride;
-                CUDA_CHECK(cudaMemcpyAsync(dest,(const char*)l.g.data+eid*gs,gs,cudaMemcpyHostToDevice,copy));
-                CUDA_CHECK(cudaMemcpyAsync(dest+uo,(const char*)l.u.data+eid*us,us,cudaMemcpyHostToDevice,copy));
-                CUDA_CHECK(cudaMemcpyAsync(dest+doff,(const char*)l.d.data+eid*ds,ds,cudaMemcpyHostToDevice,copy));
-                publish_slot<<<1,32,0,copy>>>(readers,table,j.slot,j.key);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
+                CUDA_CHECK(cudaMemcpyAsync(dest,(const char*)l.g.data+eid*gs,gs,cudaMemcpyHostToDevice,work_stream));
+                CUDA_CHECK(cudaMemcpyAsync(dest+uo,(const char*)l.u.data+eid*us,us,cudaMemcpyHostToDevice,work_stream));
+                CUDA_CHECK(cudaMemcpyAsync(dest+doff,(const char*)l.d.data+eid*ds,ds,cudaMemcpyHostToDevice,work_stream));
+                publish_slot<<<1,32,0,work_stream>>>(readers,table,j.slot,j.key,speculative,j.predicted);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(work_stream));
             }
-            lock.lock();if(success){policy.publish(j.slot,j.key);++admissions;admit_bytes+=gs+us+ds;}slots[j.slot].ready=true;pending.erase(j.key);copies.notify_all();
+            lock.lock();if(j.predicted){if(success){++prefetch_copies;prefetch_copy_us+=std::chrono::duration<double,std::micro>(service_clock::now()-copy_start).count();}else ++prefetch_failed;}
+            if(success){policy.publish(j.slot,j.key);++admissions;admit_bytes+=gs+us+ds;}
+            slots[j.slot].ready=j.slot>=temporary_slots;
+            if(j.predicted){prefetch_pending=false;temporary_busy[j.slot]=false;}
+            pending.erase(j.key);copies.notify_all();
             if(trace)std::fprintf(trace,"A %d %d\n",j.key,int(success));
         }
     }
@@ -441,7 +635,15 @@ class service {
         const char * fusion=std::getenv("DSV4F_MXFP4_FUSED");fused_mxfp4=nk<=8 && gt==GGML_TYPE_MXFP4 && dt==GGML_TYPE_MXFP4 && ne%128==0 && nf%32==0 && (!fusion || atoi(fusion)!=0);
         v41=gt==GGML_TYPE_Q3_K || gt==GGML_TYPE_Q2_0 || gt==GGML_TYPE_PTQ1_0;
         block_cache=fused_mxfp4 || v41;
-        const size_t scratch=5*sizeof(unsigned long long)+MAX_LAYERS*MAX_EXPERTS*sizeof(int)+
+        int requested_lookahead=0;
+        if(const char * value=std::getenv("DSV4F_EXPERT_LOOKAHEAD")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1") && std::strcmp(value,"2") && std::strcmp(value,"3") && std::strcmp(value,"4") && std::strcmp(value,"5"))throw std::runtime_error("DSV4F_EXPERT_LOOKAHEAD must be 0..5");
+            requested_lookahead=std::atoi(value);
+        }
+        lookahead=((requested_lookahead>=3 && v41) || gt==GGML_TYPE_Q3_K)?requested_lookahead:0;forecast.fill(-1);
+        early_depth=setting("DSV4F_EXPERT_LOOKAHEAD_DEPTH",8,16);
+        early_read=setting("DSV4F_EXPERT_LOOKAHEAD_READ",early_depth,early_depth);
+        const size_t scratch=5*sizeof(unsigned long long)+MAX_LAYERS*MAX_EXPERTS*sizeof(int)*(1+(lookahead==2 || lookahead==4))+
             MAX_USED*(size_t(nf+ne+1)*sizeof(float)+sizeof(int32_t))+
             (GGML_PAD(ne,MATRIX_ROW_PADDING)+MAX_USED*GGML_PAD(nf,MATRIX_ROW_PADDING))/QK8_1*sizeof(block_q8_1)+
             43*g->ne[2]*(sizeof(char *)+4*sizeof(int));
@@ -450,6 +652,7 @@ class service {
         CUDA_CHECK(cudaMalloc((void**)&issued,4*sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc((void**)&seq,sizeof(unsigned long long)));CUDA_CHECK(cudaMemset(seq,0,sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc((void**)&table,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));CUDA_CHECK(cudaMemset(table,0xff,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));
+        if(lookahead==2 || lookahead==4){CUDA_CHECK(cudaMalloc((void**)&speculative,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));CUDA_CHECK(cudaMemset(speculative,0,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));}
         CUDA_CHECK(cudaMalloc((void**)&gate,MAX_USED*nf*sizeof(float)));CUDA_CHECK(cudaMalloc((void**)&down,MAX_USED*ne*sizeof(float)));
         CUDA_CHECK(cudaMalloc((void**)&weights,MAX_USED*sizeof(float)));CUDA_CHECK(cudaMalloc((void**)&plan,MAX_USED*sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&aq,GGML_PAD(ne,MATRIX_ROW_PADDING)/QK8_1*sizeof(block_q8_1)));
@@ -478,7 +681,15 @@ class service {
         slots.resize(count);
         if(trace)std::fprintf(trace,"S %d %d\n",base_slots,count);
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy,cudaStreamNonBlocking));
+        if(lookahead==4) {
+            CUDA_CHECK(cudaHostAlloc((void**)&lookahead_claim_h,sizeof(int),cudaHostAllocMapped));
+            CUDA_CHECK(cudaHostGetDevicePointer((void**)&lookahead_claim_d,lookahead_claim_h,0));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&lookahead_copy,cudaStreamNonBlocking));
+        }
+        if(lookahead)std::fprintf(stderr,"[dsv4f-lookahead] enabled mode=%d predictor=%s depth=%d read=%d temporary_slots=%d format=%s\n",
+            lookahead,lookahead>=3?"current-hidden-next-router":"previous-token-next-layer",lookahead>=3?early_depth:1,early_read,temporary_slots,ggml_type_name(gt));
         stop=false;worker=std::thread([this]{serve();});loader=std::thread([this]{load();});
+        if(lookahead==4)lookahead_loader=std::thread([this]{load(true);});
         std::fprintf(stderr,"[dsv4f-service] GPU routing + CPU service: %d slots %.2f GiB, wait=%s\n",count,double(count*stride)/(1ULL<<30),poll?"poll":"callback");
         if(profile || notify_wait || callback_spin_us || idle_spins!=200000)std::fprintf(stderr,"[dsv4f-service] host_wait=%s callback_spin_us=%u idle_spins=%u profile=%d format=%s\n",notify_wait?"notify":"legacy",callback_spin_us,idle_spins,int(profile),ggml_type_name(gt));
     }
@@ -510,6 +721,7 @@ public:
         }
         if(!cache_ptrs.empty())CUDA_CHECK(cudaMemcpy(extra,cache_ptrs.data(),cache_ptrs.size()*sizeof(char *),cudaMemcpyHostToDevice));
         slots.resize(cache_ptrs.size());
+        reserve_temporary();
     }
     void drain() {
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -518,15 +730,19 @@ public:
     // mutex held, service/loader drained; keep is a block boundary.
     void shrink_cache(size_t keep) {
         if(keep>=slots.size())return;
+        GGML_ASSERT(policy.protected_residents()<=keep);
         if(block_cache && keep) {
             std::vector<int> base(keep),tail(slots.size()-keep);
             std::iota(base.begin(),base.end(),0);std::iota(tail.begin(),tail.end(),keep);
-            auto score=[&](int i){return policy.score(slots[i].key);};
+            // Protected tail entries must move into the retained prefix before
+            // freeing blocks. Key-based leases survive that D2D compaction.
+            auto score=[&](int i){return std::make_pair(policy.protected_key(slots[i].key),policy.score(slots[i].key));};
             std::sort(base.begin(),base.end(),[&](int a,int b){return score(a)<score(b);});
             std::sort(tail.begin(),tail.end(),[&](int a,int b){return score(a)>score(b);});
             for(size_t i=0;i<std::min(base.size(),tail.size());++i) {
                 const int dst=base[i],src=tail[i];
                 if(slots[src].key<0 || (slots[dst].key>=0 && score(src)<=score(dst)))break;
+                if(policy.protected_key(slots[src].key))++guard_compacted;
                 CUDA_CHECK(cudaMemcpyAsync(cache_ptrs[dst],cache_ptrs[src],stride,cudaMemcpyDeviceToDevice,copy));
                 slots[dst].key=slots[src].key;
             }
@@ -550,7 +766,7 @@ public:
             GGML_ASSERT(keep==0);ggml_dsv4f_free_cache(slab,slots.size()*stride);slab=nullptr;
         }
         base_slots=std::min<size_t>(base_slots,keep);
-        slots.resize(keep);policy.rebuild();
+        slots.resize(keep);policy.rebuild();reserve_temporary();
         if(trace){std::fprintf(trace,"S %d %zu\n",base_slots,slots.size());std::fflush(trace);}
     }
     size_t reclaim(size_t bytes) {
@@ -562,12 +778,15 @@ public:
         std::unique_lock<std::mutex> lock(mutex);
         copies.wait(lock,[&]{return pending.empty();});
         CUDA_CHECK(cudaStreamSynchronize(copy));
+        const size_t minimum=policy.protected_residents();
         size_t keep=slots.size(),released=0;
         if(block_cache) {
             for(auto it=cache_blocks.rbegin();it!=cache_blocks.rend() && released<bytes;++it) {
+                if(keep-it->count<minimum)break;
                 keep-=it->count;released+=it->count*stride;
             }
-        } else { released=keep*stride;keep=0; }
+        } else if(!minimum){released=keep*stride;keep=0;}
+        if(!released){if(lookahead==5 && minimum)++guard_reclaim_denied;return 0;}
         shrink_cache(keep);
         std::fprintf(stderr,"[dsv4f-service] reclaimed=%.2f MiB remaining_slots=%zu initial_slots=%d\n",released/1048576.,keep,base_slots);
         return released;
@@ -579,6 +798,10 @@ public:
             std::unique_lock<std::mutex> lock(mutex);
             copies.wait(lock,[&]{return pending.empty();});
             CUDA_CHECK(cudaStreamSynchronize(copy));
+            guard.clear();
+            forecast.fill(-1);for(auto & history:last_routes)history.clear();
+            early_valid.fill(false);for(auto & ids:early_ids)ids.clear();
+            for(auto & ids:early_read_ids)ids.clear();
             if(!decode) {
                 // Capture both counters BEFORE freeing cache blocks. HIP sees
                 // cudaFree immediately, while AMDGPU's physical counter lags.
@@ -616,14 +839,24 @@ public:
     }
     void clear() {
         if(!host){configured=false;selected_source=nullptr;return;}ggml_cuda_set_device(0);CUDA_CHECK(cudaDeviceSynchronize());
-        {std::lock_guard<std::mutex> lock(wake_mutex);stop.store(true,std::memory_order_release);}copies.notify_all();answered.notify_all();ready.notify_all();worker.join();loader.join();
+        {std::lock_guard<std::mutex> lock(wake_mutex);stop.store(true,std::memory_order_release);}copies.notify_all();answered.notify_all();ready.notify_all();worker.join();loader.join();if(lookahead_loader.joinable())lookahead_loader.join();
+        print_lookahead();
+        guard.reset();guard_hits=guard_cancelled=guard_reclaim_denied=guard_compacted=0;
         if(profile)print_callback_profile();
         for(auto block:cache_blocks)ggml_dsv4f_free_cache(block.data,block.count*stride);cache_blocks.clear();cache_ptrs.clear();
         CUDA_CHECK(cudaFree(prefill_updates));prefill_updates=nullptr;
         prefill_changes.clear();prefill_leased=false;
-        cudaFree(extra);ggml_dsv4f_free_cache(slab,block_cache?0:slots.size()*stride);cudaFree(seq);cudaFree(issued);cudaFree(table);cudaFree(readers);cudaFree(gate);cudaFree(down);cudaFree(weights);cudaFree(plan);cudaFree(aq);cudaFree(hq);cudaFreeHost(host);cudaFreeHost(claim_h);cudaStreamDestroy(copy);
+        cudaFree(extra);ggml_dsv4f_free_cache(slab,block_cache?0:slots.size()*stride);cudaFree(seq);cudaFree(issued);cudaFree(table);cudaFree(readers);cudaFree(speculative);speculative=nullptr;cudaFree(gate);cudaFree(down);cudaFree(weights);cudaFree(plan);cudaFree(aq);cudaFree(hq);cudaFreeHost(host);cudaFreeHost(claim_h);cudaStreamDestroy(copy);
+        if(lookahead_claim_h){cudaFreeHost(lookahead_claim_h);lookahead_claim_h=lookahead_claim_d=nullptr;}
+        if(lookahead_copy){cudaStreamDestroy(lookahead_copy);lookahead_copy=nullptr;}
         if(trace){std::fclose(trace);trace=nullptr;}
-        configured=false;selected_source=nullptr;host=device=nullptr;slab=nullptr;extra=nullptr;base_slots=max_slots=0;format_ceiling=SIZE_MAX;layers.clear();layer_ids.clear();policy.clear();pending.clear();queue.clear();routes=hits=admissions=admit_bytes=requests=0;cpu_ms=0;
+        configured=false;selected_source=nullptr;host=device=nullptr;slab=nullptr;extra=nullptr;base_slots=max_slots=0;format_ceiling=SIZE_MAX;layers.clear();layer_ids.clear();policy.clear();pending.clear();queue.clear();lookahead_queue.clear();routes=hits=admissions=admit_bytes=requests=0;cpu_ms=0;
+        lookahead=temporary_slots=prefetch_cursor=0;prefetch_pending=false;temporary_busy.fill(false);
+        early_valid.fill(false);for(auto & ids:early_ids)ids.clear();
+        for(auto & ids:early_read_ids)ids.clear();
+        early_read_candidates=early_read_matches=early_read_ready=early_read_miss=0;
+        early_armed_batches=early_skipped_batches=early_batches=early_candidates=early_matches=early_actual=early_ready=early_matched_ready=early_actual_miss=early_matched_miss=early_new_candidates=early_cached_candidates=0;forecast.fill(-1);for(auto & history:last_routes)history.clear();
+        predictions=forecast_used=forecast_missed=forecast_consumed=prefetch_copies=prefetch_hits=prefetch_timely=prefetch_rejected=prefetch_failed=0;prefetch_copy_us=0;
         completed=0;descriptor_time={};expert_time={};publish_time={};post_time={};sleep_time={};detect_bound={};idle_cpu={};callback_time={};callback_detect={};callback_tail={};callbacks=callbacks_pending=callbacks_unseen=0;
         for(auto & t:timing){t.seen=0;t.done=0;}
     }
@@ -708,12 +941,25 @@ public:
         CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
         prefill_changes.clear();prefill_leased=false;
     }
-    void route_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,int32_t * route_plan,float * route_weights) {
+    int descriptor_id(const ggml_tensor * g,const ggml_tensor * u,const ggml_tensor * d) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it=layer_ids.find(g->data);if(it!=layer_ids.end())return it->second;
+        const int layer=layers.size();GGML_ASSERT(layer<MAX_LAYERS);
+        layers.push_back({*g,*u,*d});layer_ids[g->data]=layer;return layer;
+    }
+    void prefetch(ggml_backend_cuda_context & ctx,ggml_tensor * node) {
+        const auto * g=node->src[3],*u=node->src[4],*d=node->src[5];init(g,u,d,1);
+        const int layer=descriptor_id(g,u,d);
+        prefetch_request<<<1,32,0,ctx.stream()>>>(device,seq,(const int32_t *)node->src[1]->data,
+            (const char *)node->src[2]->data,node->src[2]->nb[1],node->src[2]->ne[1],
+            layer,node->src[1]->ne[0],node->op_params[12]&1,(float *)node->data);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    void route_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,int32_t * route_plan,float * route_weights,bool single) {
         const auto * g=dst->src[3],*u=dst->src[4],*d=dst->src[5];init(g,u,d,dst->src[1]->ne[0]);
-        int layer;
-        {std::lock_guard<std::mutex> lock(mutex);auto it=layer_ids.find(g->data);if(it==layer_ids.end()){layer=layers.size();GGML_ASSERT(layer<MAX_LAYERS);layers.push_back({*g,*u,*d});layer_ids[g->data]=layer;}else layer=it->second;}
+        const int layer=descriptor_id(g,u,d);
         float limit;std::memcpy(&limit,&dst->op_params[8],sizeof(limit));const int nk=dst->src[1]->ne[0];auto stream=ctx.stream();
-        route<<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index);
+        route<<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single);
     }
     void prepare(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
         const int nk=dst->src[1]->ne[0];
@@ -724,17 +970,17 @@ public:
             w.data=(char*)w.data+t*w.nb[2];w.ne[2]=1;
             token.ne[1]=1;token.src[0]=&x;token.src[1]=&ids;token.src[2]=&w;
             auto * plan=(int32_t *)((char *)dst->data+t*dst->nb[1]);
-            route_one(ctx,&token,t,plan,(float *)(plan+nk));
+            route_one(ctx,&token,t,plan,(float *)(plan+nk),dst->ne[1]==1);
         }
     }
-    void enqueue_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index) {
+    void enqueue_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,bool single) {
         const auto * g=dst->src[3],*u=dst->src[4],*d=dst->src[5];init(g,u,d,dst->src[1]->ne[0]);
         const int nk=dst->src[1]->ne[0];float limit;std::memcpy(&limit,&dst->op_params[8],sizeof(limit));
         auto stream=ctx.stream();auto * plan=this->plan;auto * weights=this->weights;
         if(dst->src[6] && dst->src[6]->op_params[9]==GGML_DSV4F_PREPARE_TAG) {
             plan=(int32_t *)((char *)dst->src[6]->data+token_index*dst->src[6]->nb[1]);
             weights=(float *)(plan+nk);
-        } else route_one(ctx,dst,token_index,plan,weights);
+        } else route_one(ctx,dst,token_index,plan,weights,single);
         if(slots.empty() && !fused_mxfp4){
             // No space for a complete expert: keep the GPU service/routing and
             // compute all routed experts on the CPU, without a fatal assertion.
@@ -773,7 +1019,7 @@ public:
             w.data=(char*)w.data+t*w.nb[2]; w.ne[2]=1;
             token.data=(char*)dst->data+t*dst->nb[1]; token.ne[1]=1;
             token.src[0]=&x; token.src[1]=&ids; token.src[2]=&w;
-            enqueue_one(ctx,&token,t);
+            enqueue_one(ctx,&token,t,dst->ne[1]==1);
         }
         if(!dst->op_params[10])finish(ctx,dst);
     }
@@ -816,17 +1062,18 @@ bool ggml_dsv4f_service_supported(const ggml_tensor * n) {
     const char * enabled=std::getenv("DSV4F_GPU_SERVICE");
     if(!enabled||atoi(enabled)==0||!ggml_dsv4f_cpu_experts||n->op!=GGML_OP_CUSTOM)return false;
     if(n->op_params[9]==GGML_DSV4F_JOIN_TAG)return true;
-    if(n->op_params[9]!=GGML_DSV4F_MOE_TAG && n->op_params[9]!=GGML_DSV4F_PREPARE_TAG)return false;
+    if(n->op_params[9]!=GGML_DSV4F_MOE_TAG && n->op_params[9]!=GGML_DSV4F_PREPARE_TAG && n->op_params[9]!=GGML_DSV4F_PREFETCH_TAG)return false;
     const auto * g=n->src[3],*u=n->src[4],*d=n->src[5];
     return g&&u&&d&&g->type==u->type&&(g->type==GGML_TYPE_MXFP4 || g->type==GGML_TYPE_Q4_K || g->type==GGML_TYPE_Q6_K || g->type==GGML_TYPE_Q3_K || g->type==GGML_TYPE_Q2_0 || g->type==GGML_TYPE_PTQ1_0)&&(d->type==g->type || d->type==GGML_TYPE_MXFP4 || d->type==GGML_TYPE_Q4_K || d->type==GGML_TYPE_Q6_K)&&!g->extra&&!u->extra&&!d->extra&&
         g->ne[0]<=MAX_EMBD && n->src[0]->ne[1]>=1 && n->src[0]->ne[1]<=4 && n->src[1]->ne[0]<MAX_USED && g->ne[2]<=MAX_EXPERTS &&
-        g->buffer&&u->buffer&&d->buffer&&ggml_backend_buffer_is_host(g->buffer)&&ggml_backend_buffer_is_host(u->buffer)&&ggml_backend_buffer_is_host(d->buffer) && instance(g->type).compatible(g,u,d,n->src[1]->ne[0]);
+        g->buffer&&u->buffer&&d->buffer&&ggml_backend_buffer_is_host(g->buffer)&&ggml_backend_buffer_is_host(u->buffer)&&ggml_backend_buffer_is_host(d->buffer) && instance(g->type).compatible(g,u,d,n->op_params[9]==GGML_DSV4F_PREFETCH_TAG?1:n->src[1]->ne[0]);
 }
 void ggml_dsv4f_service_compute(void * ctx,ggml_tensor * node){
     auto & cuda_ctx = *static_cast<ggml_backend_cuda_context*>(ctx);
     if (node->op_params[11] == 1) ggml_cuda_dsv4f_prefill(cuda_ctx, node);
     else for_node(node).enqueue(cuda_ctx,node);
 }
+void ggml_dsv4f_service_prefetch(void * ctx,ggml_tensor * node){instance(node->src[3]->type).prefetch(*static_cast<ggml_backend_cuda_context*>(ctx),node);}
 void ggml_dsv4f_service_prepare(void * ctx,ggml_tensor * node){for_node(node).prepare(*static_cast<ggml_backend_cuda_context*>(ctx),node);}
 void ggml_dsv4f_service_finalize(void * ctx,ggml_tensor * node){for_node(node).finish(*static_cast<ggml_backend_cuda_context*>(ctx),node);}
 void ggml_dsv4f_service_invalidate(const void * base,size_t bytes){for(auto & s:all_services())s.invalidate(base,bytes);}

@@ -30,3 +30,4 @@ void ggml_dsv4f_trim_workspace(ggml_backend_t backend);
 void ggml_cuda_op_dsv4f_router(ggml_backend_cuda_context & ctx, ggml_tensor * node);
 
 void ggml_dsv4f_service_prepare(void * ctx, ggml_tensor * node);
+void ggml_dsv4f_service_prefetch(void * ctx, ggml_tensor * node);

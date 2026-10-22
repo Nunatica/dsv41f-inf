@@ -74,7 +74,23 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf`
 
 The launcher requires swap protection: either system swap must already be disabled, or a working systemd user session with cgroup v2 memory control must allow `systemd-run --user --scope -p MemorySwapMax=0` (the launcher applies this automatically). It refuses to start if neither is available. The initial memory check requires available RAM of at least the total GGUF file size plus 2 GiB; allow additional memory for runtime buffers and Engram caching.
 
-DeepSeek V4.1 MTP/DSpark and vision are not integrated. Keep `DSV4F_MTP=0` (the default); no MTP model is needed.
+Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
+
+```bash
+DSV4F_MTP=1 ./run-server.sh
+```
+
+`MTP_MODEL` overrides the binary path; `MTP_CONFIG` overrides the JSON manifest
+(default: the same basename with `.json`). The engine loads text MTP tensors
+only and excludes vision, aligner, image, and vision router biases. The target
+embedding/output head are shared. The additional weights use about 4.09 GiB
+of VRAM, reducing the space available for the target expert cache.
+MTP defaults to off (`DSV4F_MTP=0`); keep it off for benchmarks unrelated to MTP.
+
+`DSV4F_DRAFT_N_MAX=1..5` limits proposals (default 1), and
+`DSV4F_DRAFT_P_MIN=0..1` truncates them at the confidence threshold (default 0.25).
+
+MTP is disabled by default because it does not improve any speed for target system.
 
 ## Build and run
 

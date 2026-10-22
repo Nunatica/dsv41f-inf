@@ -1387,6 +1387,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// V4.1 DSpark is a block drafter attached to the target, with its own small
+// accepted-position KV window. It does not need a second llama_context.
+struct common_speculative_impl_dsv41_mtp : public common_speculative_impl {
+    common_params_speculative_draft params;
+    llama_dsv41_mtp * mtp=nullptr;
+    int width=0,block=0,window=0,next_append=0;
+    std::map<int32_t,std::vector<float>> pending;
+    llama_tokens token_history;
+
+    common_speculative_impl_dsv41_mtp(const common_params_speculative & config,uint32_t n_seq):
+        common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,n_seq,config.draft.n_max),params(config.draft) {
+        if(n_seq!=1)throw std::runtime_error("V4.1 DSpark requires --parallel 1");
+        const char * path=std::getenv("MTP_MODEL");
+        const std::string binary=path?path:"models/dspark-xs2.bin";
+        const char * manifest=std::getenv("MTP_CONFIG");
+        const auto inferred=binary.substr(0,binary.find_last_of('.'))+".json";
+        mtp=llama_dsv41_mtp_init(params.ctx_tgt,binary.c_str(),manifest?manifest:inferred.c_str());
+        if(!mtp)throw std::runtime_error("failed to initialize V4.1 MTP sidecar (MTP_MODEL)");
+        width=llama_model_n_embd(llama_get_model(params.ctx_tgt));
+        block=llama_dsv41_mtp_block_size(mtp);window=llama_dsv41_mtp_window_size(mtp);
+        n_max=std::min(n_max,block);
+        const auto * layers=llama_dsv41_mtp_layers(mtp);
+        for(int i=0;i<3;++i)llama_set_embeddings_layer_inp(params.ctx_tgt,layers[i],true);
+    }
+    ~common_speculative_impl_dsv41_mtp() override {llama_dsv41_mtp_free(mtp);}
+    void begin(llama_seq_id,const llama_tokens & prompt) override {
+        // llama-server calls begin AFTER prefill/process. Preserve those taps,
+        // but never reuse states from a different cached prompt/restore.
+        if(token_history.size()<prompt.size() || !std::equal(prompt.begin(),prompt.end(),token_history.begin()))pending.clear();
+        else pending.erase(pending.lower_bound(prompt.size()),pending.end());
+        next_append=0;llama_dsv41_mtp_reset(mtp);
+    }
+    bool process(const common_batch & batch) override {
+        const auto * layers=llama_dsv41_mtp_layers(mtp);
+        const float * taps[3];
+        for(int i=0;i<3;++i)taps[i]=llama_get_embeddings_layer_inp(params.ctx_tgt,layers[i]);
+        if(!batch.size())return true;
+        const int32_t first=batch.tokens[0].pos[0];
+        if(first<0)return false;
+        pending.erase(pending.lower_bound(first),pending.end());
+        token_history.resize(first,-1);
+        for(int t=0;t<batch.size();++t) {
+            if(batch.tokens[t].seq_id!=0 || batch.tokens[t].pos[0]!=first+t)return false;
+            token_history.push_back(batch.tokens[t].id);
+            auto & row=pending[batch.tokens[t].pos[0]];row.resize(3*width);
+            for(int i=0;i<3;++i)std::copy_n(taps[i]+size_t(t)*width,width,row.data()+i*width);
+        }
+        // The verification suffix can be rejected. Keep it in host staging
+        // until the next anchor tells us exactly which prefix was accepted.
+        while(pending.size()>size_t(window+block+1))pending.erase(pending.begin());
+        return true;
+    }
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto & dp=dparams.at(0);if(!dp.drafting)return;
+        if(dp.pos0<next_append){llama_dsv41_mtp_reset(mtp);next_append=0;}
+        pending.erase(pending.lower_bound(dp.pos0),pending.end());
+        auto it=pending.lower_bound(std::max(next_append,dp.pos0-window));
+        while(it!=pending.end()) {
+            std::vector<float> rows;std::vector<int32_t> positions;
+            do {
+                positions.push_back(it->first);rows.insert(rows.end(),it->second.begin(),it->second.end());++it;
+            } while(it!=pending.end() && positions.size()<size_t(window) && it->first==positions.back()+1);
+            if(!llama_dsv41_mtp_append(mtp,rows.data(),positions.data(),positions.size()))throw std::runtime_error("V4.1 MTP accepted KV update failed");
+            next_append=positions.back()+1;
+        }
+        int count=std::min(n_max,block);if(dp.n_max>=0)count=std::min(count,dp.n_max);
+        if(count<=0)return;
+        std::vector<llama_token> ids(block);std::vector<float> confidence(block);
+        if(!llama_dsv41_mtp_draft(mtp,dp.pos0,dp.id_last,ids.data(),confidence.data()))throw std::runtime_error("V4.1 MTP draft failed");
+        // Deterministic proposals use the target's normal verification sampler.
+        // No q-distributions are supplied for probabilistic rejection sampling.
+        for(int i=0;i<count && confidence[i]>=params.p_min;++i)dp.result->push_back(ids[i]);
+        if(dp.result->size()<size_t(params.n_min))dp.result->clear();
+    }
+    void accept(llama_seq_id,uint16_t,bool) override {} // dp.pos0 is authoritative
+};
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -2599,6 +2676,11 @@ common_speculative_init_result::common_speculative_init_result(
       llama_model * model_tgt,
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
+    if(llama_dsv41_mtp_supported(model_tgt) &&
+       std::find(params.speculative.types.begin(),params.speculative.types.end(),COMMON_SPECULATIVE_TYPE_DRAFT_MTP)!=params.speculative.types.end()) {
+        if(params.speculative.has_dft())throw std::runtime_error("V4.1 MTP uses MTP_MODEL, not --model-draft");
+        return;
+    }
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
@@ -2706,7 +2788,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params.draft.ctx_dft != nullptr ||
+            (params.draft.ctx_tgt && llama_dsv41_mtp_supported(llama_get_model(params.draft.ctx_tgt))));
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }
@@ -2726,7 +2809,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                if(config.params.draft.ctx_tgt && llama_dsv41_mtp_supported(llama_get_model(config.params.draft.ctx_tgt)))
+                    impls.push_back(std::make_unique<common_speculative_impl_dsv41_mtp>(config.params,n_seq));
+                else impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
