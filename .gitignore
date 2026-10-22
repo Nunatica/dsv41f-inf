@@ -1,0 +1,27 @@
+# Build output directories (including vendored projects)
+build*/
+cmake-build*/
+bin/
+CMakeFiles/
+
+# Compiled objects, libraries, and executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.pdb
+
+__pycache__/
+*.pyc
+
+state
+logs
+docs
+vendor/dsv4f-inf-SOURCE.txt
+vendor/Xolotl-SOURCE.txt
