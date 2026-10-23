@@ -49,10 +49,12 @@ __device__ bool acquire(int * state,int slot) {
     while(old>=0) { const int got=atomicCAS(state+slot,old,old+1);if(got==old)return true;old=got; }
     return false;
 }
+template<bool mapped>
 __global__ void route(request * ring,unsigned long long * sequence,int * table,int * readers,
                       const float * x,const int32_t * ids,const float * weights,int weight_stride,
                       int layer,int ne,int nk,float limit,int32_t * plan,float * plan_w,unsigned long long * issued,
-                      int * speculative,bool single,bool skip_no_miss) {
+                      int * speculative,bool single,bool skip_no_miss,
+                      const char * mapping,size_t map_stride,int32_t * local_ids,float * local_weights) {
     __shared__ unsigned long long seq;
     __shared__ uint64_t mask;
     if(threadIdx.x==0) {
@@ -62,15 +64,21 @@ __global__ void route(request * ring,unsigned long long * sequence,int * table,i
         while(r->consumed!=previous) { /* GPU queue cannot overwrite an unconsumed request. */ }
         r->layer=layer;r->nk=nk;r->limit=limit;r->single=single;r->kind=0;r->prefetch_hits=0;
         for(int i=0;i<nk;++i) {
-            const int eid=ids[i];
+            int eid=ids[i];float weight=weights[i*weight_stride];
+            if constexpr(mapped) {
+                const float local=float(*(const int32_t *)(mapping+eid*map_stride));
+                eid=int32_t(fmaxf(local,0.f));
+                weight=__fmul_rn(weight,local+.5f>0.f?1.f:0.f);
+                local_ids[i]=eid;local_weights[i]=weight;
+            }
             const int key=layer*MAX_EXPERTS+eid;
-            int slot=(weights[i*weight_stride]!=0 && eid>=0 && eid<MAX_EXPERTS)?atomicAdd(table+key,0):-1;
+            int slot=(weight!=0 && eid>=0 && eid<MAX_EXPERTS)?atomicAdd(table+key,0):-1;
             if(slot>=0) {
                 if(!acquire(readers,slot))slot=-1;
                 else if(atomicAdd(table+key,0)!=slot){atomicSub(readers+slot,1);slot=-1;}
             }
             if(slot>=0 && speculative && atomicExch(speculative+key,0))r->prefetch_hits|=uint64_t(1)<<i;
-            plan[i]=slot;plan_w[i]=weights[i*weight_stride];
+            plan[i]=slot;plan_w[i]=weight;
             r->ids[i]=eid;r->weights[i]=plan_w[i];
             if(slot>=0 || plan_w[i]==0)mask|=uint64_t(1)<<i;
         }
@@ -1011,11 +1019,13 @@ public:
             layer,node->src[1]->ne[0],node->op_params[12]&1,(float *)node->data);
         CUDA_CHECK(cudaGetLastError());
     }
-    void route_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,int32_t * route_plan,float * route_weights,bool single) {
+    void route_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,int32_t * route_plan,float * route_weights,bool single,
+                   const ggml_tensor * mapping=nullptr,int32_t * local_ids=nullptr,float * local_weights=nullptr) {
         const auto * g=dst->src[3],*u=dst->src[4],*d=dst->src[5];init(g,u,d,dst->src[1]->ne[0]);
         const int layer=descriptor_id(g,u,d);
         float limit;std::memcpy(&limit,&dst->op_params[8],sizeof(limit));const int nk=dst->src[1]->ne[0];auto stream=ctx.stream();
-        route<<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single,skip_no_miss);
+        if(mapping)route<true><<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single,skip_no_miss,(const char *)mapping->data,mapping->nb[1],local_ids,local_weights);
+        else route<false><<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single,skip_no_miss,nullptr,0,nullptr,nullptr);
     }
     void prepare(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
         const int nk=dst->src[1]->ne[0];
@@ -1026,7 +1036,11 @@ public:
             w.data=(char*)w.data+t*w.nb[2];w.ne[2]=1;
             token.ne[1]=1;token.src[0]=&x;token.src[1]=&ids;token.src[2]=&w;
             auto * plan=(int32_t *)((char *)dst->data+t*dst->nb[1]);
-            route_one(ctx,&token,t,plan,(float *)(plan+nk),dst->ne[1]==1);
+            const auto * mapping=dst->src[6];
+            auto * local_ids=mapping?plan:nullptr;
+            auto * local_weights=mapping?(float *)(plan+nk):nullptr;
+            if(mapping)plan+=2*nk;
+            route_one(ctx,&token,t,plan,(float *)(plan+nk),dst->ne[1]==1,mapping,local_ids,local_weights);
         }
     }
     void enqueue_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index,bool single) {
@@ -1035,6 +1049,7 @@ public:
         auto stream=ctx.stream();auto * plan=this->plan;auto * weights=this->weights;
         if(dst->src[6] && dst->src[6]->op_params[9]==GGML_DSV4F_PREPARE_TAG) {
             plan=(int32_t *)((char *)dst->src[6]->data+token_index*dst->src[6]->nb[1]);
+            if(dst->src[6]->src[6])plan+=2*nk;
             weights=(float *)(plan+nk);
         } else route_one(ctx,dst,token_index,plan,weights,single);
         if(slots.empty() && !fused_mxfp4){

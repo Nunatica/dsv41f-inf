@@ -19,7 +19,10 @@ void dsv4f_moe_submit(ggml_cgraph * graph, ggml_tensor * routed);
 
 // Publish this format's CPU requests before expanding routed GPU work.
 // The returned plan is also attached as a live dependency of routed.
-ggml_tensor * dsv4f_moe_prepare(ggml_context * ctx, ggml_tensor * routed);
+// With mapping, routed initially takes global IDs/probabilities. Preparation
+// also produces its local-ID/weight views, avoiding a separate route-plan op.
+ggml_tensor * dsv4f_moe_prepare(ggml_context * ctx, ggml_tensor * routed,
+                              ggml_tensor * mapping = nullptr);
 // Submit predicted global IDs for a future layer; CPU fallback is a no-op.
 ggml_tensor * dsv4f_expert_prefetch(ggml_context * ctx, ggml_tensor * anchor,
     ggml_tensor * ids, ggml_tensor * mapping, ggml_tensor * gate,

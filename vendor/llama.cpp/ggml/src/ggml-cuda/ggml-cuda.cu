@@ -4756,10 +4756,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        static const bool rebuild_executable = [] {
+#if defined(GGML_USE_HIP)
+            const char * value = getenv("DSV4F_HIP_GRAPH_REBUILD");
+            return value && strcmp(value, "1") == 0;
+#else
+            return false;
+#endif
+        }();
+        if (cuda_graph_update_required && rebuild_executable && graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        const bool new_instance = graph->instance == nullptr;
+        if (new_instance) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
-        if (cuda_graph_update_required) { // Update graph executable
+        // Instantiate already binds this exact captured graph. Only an older
+        // executable needs updating; keep all capture/warmup checks unchanged.
+        if (cuda_graph_update_required && !(new_instance && rebuild_executable)) {
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph

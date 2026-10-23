@@ -78,7 +78,11 @@ The CPU computes each missed expert through the complete `gate → SwiGLU with u
 
 For paths with at most four tokens, V4.1's `DSV4F_V41_MOE_OVERLAP=1` and `DSV4F_V41_MOE_PIPELINE=1` arrange the graph to submit format-specific MoE work first, execute other formats' GPU work and the shared expert, and then join CPU results. On ROCm, `DSV4F_V41_ROUTE_FIRST=1` prepares format-specific routing requests first so CPU work can begin earlier. Accumulation preserves the existing shared-expert and tier order.
 
+The launcher default `DSV4F_V41_ROUTE_PUBLISH_FUSED=1` combines format-local ID mapping and probability masking with the service's cache lookup and request publication in one GPU kernel. It requires the ROCm route-first path and fused route planning for batches of at most four tokens. Reader leases, ordered cache observations, no-miss skipping and join order use the existing service logic. Prepared local-ID/weight views also support the CPU fallback. Set `0` for comparison with the separate route-plan kernel. Direct backend use without the environment variable retains the separate path.
+
 The format-specific services share one CPU worker pool, so CPU expert computation is serialized through one lane. Each CPU job overlaps other GPU work; CPU computation from multiple formats does not run concurrently without bounds.
+
+The experimental `DSV4F_HIP_GRAPH_REBUILD=1` instantiates a fresh HIP executable after a required graph capture, instead of updating an existing executable. It also omits the redundant update immediately after first instantiation. Capture eligibility, property checks, two-call warmup and steady replay are unchanged. This option does not reuse an executable across changed shapes or bindings and defaults to `0`.
 
 ## Persistent workers and quantized computation
 
@@ -93,6 +97,8 @@ V4.1 CPU dot products select AVX2 or AVX-512 paths according to CPU support. PTQ
 | `DSV4F_GPU_SERVICE` | `1` | Enables GPU routing and the persistent CPU service |
 | `DSV4F_GPU_WAIT` | `callback` | CPU completion wait mode: `callback` or `poll` |
 | `DSV4F_SKIP_NO_MISS` | `1` | Omit CPU answer/completion work for all-hit or zero-weight routes; keep ordered cache observations. Captured callback nodes remain and return immediately when the batch has no CPU job. Set `0` for the preceding path. |
+| `DSV4F_V41_ROUTE_PUBLISH_FUSED` | `1` | Fuses format-local routing, cache lookup and CPU request publication on the ROCm route-first path; set `0` for the separate route-plan kernel |
+| `DSV4F_HIP_GRAPH_REBUILD` | `0` | Experimental: instantiate a new HIP executable after a required capture, omitting GraphExecUpdate; capture eligibility and steady replay are unchanged |
 | `DSV4F_CPU_THREADS` | `12` | CPU computation parallelism, including the calling thread |
 | `DSV4F_CPU_SCHEDULE` / `DSV4F_CPU_ROW_CHUNK` | `dynamic` / `32` | Row scheduling policy and chunk size |
 | `DSV4F_CPU_SPIN_US` / `DSV4F_CPU_FAST_SYNC` | `300` / `1` | Worker wait and synchronization settings |

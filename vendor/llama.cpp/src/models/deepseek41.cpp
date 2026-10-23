@@ -223,6 +223,7 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
     const bool pipeline=overlap && [] {const char * v=std::getenv("DSV4F_V41_MOE_PIPELINE");return !v || std::strcmp(v,"0");}();
     const int engram_overlap=[&] {const char * v=std::getenv(N<=4?"DSV4F_ENGRAM_OVERLAP":"DSV4F_ENGRAM_PREFILL_OVERLAP");return v?std::atoi(v):0;}();
     const bool route_fused=N<=4 && [] {const char * v=std::getenv("DSV4F_V41_ROUTE_FUSED");return !v || std::strcmp(v,"0");}();
+    const bool route_publish_fused=route_fused && [] {const char * v=std::getenv("DSV4F_V41_ROUTE_PUBLISH_FUSED");return v && !std::strcmp(v,"1");}();
     const int cap=v41_cap(kc,ubatch,mem->capacity);
     auto own=std::make_unique<v41_input>(m,kc,cap,N,mem->capacity,mem->window_capacity);auto * in=own.get();
     auto input=[&](ggml_type ty,int a,int b,const char * name){auto * t=ggml_new_tensor_2d(ctx0,ty,a,b);ggml_set_input(t);ggml_set_name(t,name);return t;};
@@ -451,7 +452,9 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
         std::vector<ggml_tensor *> pending;
         for(auto & e:m.tiers[l]){auto * mapping=e.mapping;if(!mapping){mapping=input(GGML_TYPE_I32,1,hparams.n_expert,"v41_local_expert_ids");in->maps.push_back({mapping,&e.local});}
             ggml_tensor * weight,*lid;
-            if(route_fused && kv_dev && !std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(kv_dev)),"ROCm")) {
+            const bool publish_mapped=route_publish_fused && route_first;
+            if(publish_mapped) {lid=ids;weight=probs;}
+            else if(route_fused && kv_dev && !std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(kv_dev)),"ROCm")) {
                 dsv4f_route_plan(ctx0,mapping,ids,probs,&lid,&weight);
             } else {
                 auto * local=ggml_get_rows(ctx0,ggml_repeat_4d(ctx0,ggml_cast(ctx0,mapping,GGML_TYPE_F32),1,hparams.n_expert,N,1),ids);
@@ -461,7 +464,7 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
             auto * act=fn;
             if(N>4 && N<32){act=ggml_pad(ctx0,fn,0,32-N,0,0);lid=ggml_cast(ctx0,ggml_pad(ctx0,ggml_cast(ctx0,lid,GGML_TYPE_F32),0,32-N,0,0),GGML_TYPE_I32);weight=ggml_pad(ctx0,weight,0,0,32-N,0);}
             auto * routed=dsv4f_moe(ctx0,ggml_cont(ctx0,act),lid,weight,e.gate,e.up,e.down,m.clamp,&scratch);if(N>4&&N<32)routed=ggml_view_2d(ctx0,routed,D,N,routed->nb[1],0);
-            if(pipeline) {if(route_first)ggml_build_forward_expand(gf,dsv4f_moe_prepare(ctx0,routed));else dsv4f_moe_submit(gf,routed);pending.push_back(routed);}
+            if(pipeline) {if(route_first)ggml_build_forward_expand(gf,dsv4f_moe_prepare(ctx0,routed,publish_mapped?mapping:nullptr));else dsv4f_moe_submit(gf,routed);pending.push_back(routed);}
             else sum=overlap && &e==&m.tiers[l].front()?dsv4f_moe_join(ctx0,routed,sum):ggml_add(ctx0,sum,routed);
         }
         if(route_first)for(auto * routed:pending)dsv4f_moe_submit(gf,routed);

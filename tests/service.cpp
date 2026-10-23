@@ -24,26 +24,41 @@ static void delayed_cpu(const ggml_tensor * g,const ggml_tensor * u,const ggml_t
 }
 static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type dtype,int nt=1) {
     constexpr int ne=256,nf=512,experts=8,nk=3;
+    const bool mapped=std::getenv("DSV4F_TEST_ROUTE_PUBLISH")!=nullptr;
+    const bool cpu_only=std::getenv("DSV4F_TEST_ROUTE_CPU")!=nullptr;
     auto * weights=ggml_init({2*1024*1024,nullptr,true});
     auto * g=ggml_new_tensor_3d(weights,type,ne,nf,experts),*u=ggml_new_tensor_3d(weights,type,ne,nf,experts),*d=ggml_new_tensor_3d(weights,dtype,nf,ne,experts);
     auto * wb=ggml_backend_alloc_ctx_tensors(weights,cpu);ggml_backend_buffer_set_usage(wb,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::mt19937 rng(42);std::normal_distribution<float> normal(0,.08);
     for(auto * w:{g,u,d}) {std::vector<float> f(ggml_nelements(w));for(auto & v:f)v=normal(rng);ggml_quantize_chunk(w->type,f.data(),w->data,0,w->ne[1]*w->ne[2],w->ne[0],nullptr);}
     ggml_context * ctx[2];ggml_tensor * x[2],*ids[2],*prob[2],*out[2];ggml_cgraph * graph[2];ggml_backend_buffer_t buffer[2]={nullptr,nullptr};
+    ggml_tensor * global_storage=nullptr,*map_storage=nullptr,*mapping=nullptr,*prepared=nullptr;
     ggml_backend_t backends[]={gpu,cpu};auto * scheduler=ggml_backend_sched_new(backends,nullptr,2,4096,false,true);
     for(int k=0;k<2;++k) {
         ctx[k]=ggml_init({4*1024*1024,nullptr,true});x[k]=ggml_new_tensor_2d(ctx[k],GGML_TYPE_F32,ne,nt);ids[k]=ggml_new_tensor_2d(ctx[k],GGML_TYPE_I32,nk,nt);prob[k]=ggml_new_tensor_3d(ctx[k],GGML_TYPE_F32,1,nk,nt);
-        if(k){out[k]=dsv4f_moe_join(ctx[k],dsv4f_moe(ctx[k],x[k],ids[k],prob[k],g,u,d,.3f),ggml_scale(ctx[k],x[k],.001f));}
+        if(k){
+            if(mapped) {
+                // Simulate TOP_K's retained token stride and a strided map.
+                global_storage=ggml_new_tensor_2d(ctx[k],GGML_TYPE_I32,experts,nt);
+                ids[k]=ggml_view_2d(ctx[k],global_storage,nk,nt,experts*4,0);
+                map_storage=ggml_new_tensor_2d(ctx[k],GGML_TYPE_I32,2,2*experts);
+                mapping=ggml_view_2d(ctx[k],map_storage,1,2*experts,8,0);
+            }
+            auto * routed=dsv4f_moe(ctx[k],x[k],ids[k],prob[k],g,u,d,.3f);
+            if(mapped)prepared=dsv4f_moe_prepare(ctx[k],routed,mapping);
+            out[k]=dsv4f_moe_join(ctx[k],routed,ggml_scale(ctx[k],x[k],.001f));
+        }
         else{auto * x3=ggml_reshape_3d(ctx[k],x[k],ne,1,nt);auto * h=ggml_swiglu_clamp(ctx[k],ggml_mul_mat_id(ctx[k],g,x3,ids[k]),ggml_mul_mat_id(ctx[k],u,x3,ids[k]),.3f);auto * weighted=ggml_mul(ctx[k],ggml_mul_mat_id(ctx[k],d,h,ids[k]),prob[k]);auto * sum=ggml_view_2d(ctx[k],weighted,ne,nt,weighted->nb[2],0);for(int j=1;j<nk;++j)sum=ggml_add(ctx[k],sum,ggml_view_2d(ctx[k],weighted,ne,nt,weighted->nb[2],j*weighted->nb[1]));out[k]=ggml_add(ctx[k],sum,ggml_scale(ctx[k],x[k],.001f));}
         graph[k]=ggml_new_graph(ctx[k]);ggml_build_forward_expand(graph[k],out[k]);if(!k)buffer[k]=ggml_backend_alloc_ctx_tensors(ctx[k],cpu);
-        else {ggml_set_input(x[k]);ggml_set_input(ids[k]);ggml_set_input(prob[k]);
+        else {ggml_set_input(x[k]);if(!mapped)ggml_set_input(ids[k]);ggml_set_input(prob[k]);
+            if(mapped){ggml_set_input(global_storage);ggml_set_input(map_storage);}
             if(!ggml_backend_sched_alloc_graph(scheduler,graph[k]))std::abort();
-            if(ggml_backend_sched_get_tensor_backend(scheduler,out[k])!=gpu || out[k]->src[0]->src[3]!=g)std::abort();
+            if(ggml_backend_sched_get_tensor_backend(scheduler,out[k])!=(cpu_only?cpu:gpu) || out[k]->src[0]->src[3]!=g)std::abort();
         }
     }
     original_cpu=ggml_dsv4f_cpu_experts;delayed=8;ggml_dsv4f_cpu_experts=delayed_cpu;
     bool ok=true;double worst=0;
-    const bool resize_test=cached && type==GGML_TYPE_MXFP4 && dtype==GGML_TYPE_MXFP4;
+    const bool resize_test=!cpu_only && cached && type==GGML_TYPE_MXFP4 && dtype==GGML_TYPE_MXFP4;
     uint64_t full_routes=0,full_hits=0,unused=0;
     uint64_t pressure_routes=0,pressure_hits=0;
     for(int iteration=0;iteration<96;++iteration){
@@ -114,10 +129,29 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
             w[t*nk+j]=float(j+1)/6;}
         // A miss followed by an empty format must not reuse its old CPU answer.
         // Multi-token replays also mix a skipped token with real CPU work.
+        const auto global_w=w;
         if(std::getenv("DSV4F_SKIP_NO_MISS") && std::atoi(std::getenv("DSV4F_SKIP_NO_MISS")) &&
            (iteration==12 || iteration==13 || iteration==36))
             for(int t=0;t<nt;++t)if(iteration!=13 || t%2==0)std::fill_n(w.data()+t*nk,nk,0.f);
-        for(int k=0;k<2;++k){ggml_backend_tensor_set(x[k],input.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_set(ids[k],selected.data(),0,selected.size()*sizeof(int));ggml_backend_tensor_set(prob[k],w.data(),0,w.size()*sizeof(float));if((k?ggml_backend_sched_graph_compute(scheduler,graph[k]):ggml_backend_graph_compute(cpu,graph[k]))!=GGML_STATUS_SUCCESS)ok=false;}
+        std::vector<int32_t> globals(experts*nt,0),map(4*experts,-777);
+        if(mapped) {
+            for(int i=0;i<2*experts;++i)map[2*i]=i<experts?(i^5):-1;
+            for(int t=0;t<nt;++t)for(int j=0;j<nk;++j) {
+                const bool absent=(iteration==12 || iteration==36 || (iteration==13 && t%2==0));
+                globals[t*experts+j]=absent?experts+j:(selected[t*nk+j]^5);
+                if(absent){selected[t*nk+j]=0;w[t*nk+j]=0.f;}
+            }
+            ggml_backend_tensor_set(global_storage,globals.data(),0,globals.size()*4);
+            ggml_backend_tensor_set(map_storage,map.data(),0,map.size()*4);
+        }
+        for(int k=0;k<2;++k){ggml_backend_tensor_set(x[k],input.data(),0,ne*nt*sizeof(float));if(!k || !mapped)ggml_backend_tensor_set(ids[k],selected.data(),0,selected.size()*sizeof(int));const auto & pw=k&&mapped?global_w:w;ggml_backend_tensor_set(prob[k],pw.data(),0,pw.size()*sizeof(float));if((k?ggml_backend_sched_graph_compute(scheduler,graph[k]):ggml_backend_graph_compute(cpu,graph[k]))!=GGML_STATUS_SUCCESS)ok=false;}
+        if(mapped) {
+            std::vector<int32_t> words(4*nk*nt);ggml_backend_tensor_get(prepared,words.data(),0,words.size()*4);
+            for(int t=0;t<nt;++t)for(int j=0;j<nk;++j) {
+                float weight;std::memcpy(&weight,&words[t*4*nk+nk+j],4);
+                ok &= words[t*4*nk+j]==selected[t*nk+j] && weight==w[t*nk+j];
+            }
+        }
         ggml_backend_tensor_get(out[0],a.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_get(out[1],b.data(),0,ne*nt*sizeof(float));double error=0,norm=0;for(int i=0;i<ne*nt;++i){error+=(a[i]-b[i])*(a[i]-b[i]);norm+=a[i]*a[i];ok&=std::isfinite(b[i]);}double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.04;
         if(pressure_test && resize_test && iteration>=90) {
             // Regrowth admits weights asynchronously. Tiny synthetic requests
@@ -137,7 +171,7 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
     // Uniform Q4_K/Q6_K routes need not churn all eight experts with a conservative
     // admission threshold. Require cache population here; the policy test and
     // MXFP4 hot-set shift independently check adaptation and replacement.
-    ok &= routes>0 && (cached ? hits>0 && hits<routes && admissions>=(conservative?4:6) : hits==0 && admissions==0);
+    if(!cpu_only)ok &= routes>0 && (cached ? hits>0 && hits<routes && admissions>=(conservative?4:6) : hits==0 && admissions==0);
     printf("Device service + deferred shared join nt=%d %s/%s worst relative RMSE=%g routes=%llu hits=%llu admissions=%llu %s\n",nt,ggml_type_name(type),ggml_type_name(dtype),worst,(unsigned long long)routes,(unsigned long long)hits,(unsigned long long)admissions,ok?"PASS":"FAIL");
     // Both the service and loader must retire before the source RAM is freed.
     ggml_dsv4f_experts.invalidate(g->data,ggml_nbytes(g));ggml_dsv4f_cpu_experts=original_cpu;
@@ -149,6 +183,7 @@ int main(int argc,char ** argv) {
     pressure_test = argc > 2 && !std::strcmp(argv[2],"pressure");
     if(pressure_test)cached=true;
     setenv("DSV4F_GPU_SERVICE","1",1);setenv("DSV4F_GPU_WAIT",argc>1?argv[1]:"poll",1);setenv("DSV4F_EXPERT_CACHE_MIB",cached?"1":"0",1);setenv("GGML_CUDA_MOE_CACHE","0",1);
+    if(std::getenv("DSV4F_TEST_ROUTE_CPU"))setenv("DSV4F_GPU_SERVICE","0",1);
     ggml_backend_load_all();ggml_cpu_init();auto * gpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);auto * cpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr);
     if(!gpu||!cpu)return 2;
     bool ok=check(gpu,cpu,GGML_TYPE_MXFP4,GGML_TYPE_MXFP4);ok&=check(gpu,cpu,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K);for(int nt:{2,4}){ok&=check(gpu,cpu,GGML_TYPE_MXFP4,GGML_TYPE_MXFP4,nt);ok&=check(gpu,cpu,GGML_TYPE_Q4_K,GGML_TYPE_Q6_K,nt);}

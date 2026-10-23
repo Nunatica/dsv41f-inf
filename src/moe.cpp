@@ -496,13 +496,42 @@ void dsv4f_moe_submit(ggml_cgraph * graph,ggml_tensor * routed) {
 
 static void cpu_prepare(ggml_tensor * dst,int ith,int,void *) {
     // CPU fallback computes the complete routed operation in compute().
-    if(!ith)std::memset(dst->data,0,ggml_nbytes(dst));
+    if(ith)return;
+    std::memset(dst->data,0,ggml_nbytes(dst));
+    if(!dst->src[6])return;
+    const auto * ids=dst->src[1],*prob=dst->src[2],*mapping=dst->src[6];
+    const int nk=ids->ne[0];
+    for(int64_t t=0;t<dst->ne[1];++t)for(int k=0;k<nk;++k) {
+        const int global=*(const int32_t *)((const char *)ids->data+t*ids->nb[1]+k*ids->nb[0]);
+        GGML_ASSERT(global>=0 && global<mapping->ne[1]);
+        const float local=float(*(const int32_t *)((const char *)mapping->data+global*mapping->nb[1]));
+        const int32_t lid=int32_t(std::max(local,0.f));
+        const float p=*(const float *)((const char *)prob->data+t*prob->nb[2]+k*prob->nb[1]);
+        const float weight=p*(local+.5f>0.f?1.f:0.f);
+        auto * row=(char *)dst->data+t*dst->nb[1];
+        std::memcpy(row+k*4,&lid,4);std::memcpy(row+(nk+k)*4,&weight,4);
+    }
 }
-ggml_tensor * dsv4f_moe_prepare(ggml_context * ctx,ggml_tensor * routed) {
+ggml_tensor * dsv4f_moe_prepare(ggml_context * ctx,ggml_tensor * routed,ggml_tensor * mapping) {
     GGML_ASSERT(routed->op==GGML_OP_CUSTOM && routed->op_params[9]==GGML_DSV4F_MOE_TAG && routed->ne[1]<=4 && !routed->src[6]);
-    ggml_tensor * args[6];for(int i=0;i<6;++i)args[i]=routed->src[i];
-    auto * prepared=ggml_custom_4d(ctx,GGML_TYPE_I32,2*args[1]->ne[0],routed->ne[1],1,1,args,6,cpu_prepare,1,nullptr);
+    ggml_tensor * args[7];for(int i=0;i<6;++i)args[i]=routed->src[i];args[6]=mapping;
+    const int nk=args[1]->ne[0],nt=routed->ne[1];
+    if(mapping) {
+        GGML_ASSERT(mapping->type==GGML_TYPE_I32 && mapping->ne[0]==1 && mapping->ne[2]==1 && mapping->ne[3]==1);
+        GGML_ASSERT(args[1]->type==GGML_TYPE_I32 && args[1]->nb[0]==4);
+        GGML_ASSERT(args[2]->type==GGML_TYPE_F32 && args[2]->ne[0]==1 && args[2]->ne[1]==nk && args[2]->ne[2]==nt);
+    }
+    auto * prepared=ggml_custom_4d(ctx,GGML_TYPE_I32,(mapping?4:2)*nk,nt,1,1,args,mapping?7:6,cpu_prepare,1,nullptr);
     prepared->op_params[8]=routed->op_params[8];prepared->op_params[9]=GGML_DSV4F_PREPARE_TAG;
-    ggml_set_name(prepared,"v41_route_prepare");routed->src[6]=prepared;
+    ggml_set_name(prepared,mapping?"v41_route_publish_fused":"v41_route_prepare");
+    if(mapping) {
+        // Each token owns [local IDs, masked probabilities, cache slots,
+        // cache probabilities]. The service fills all four planes together;
+        // the first two also make the ordinary CPU fallback self-contained.
+        routed->src[1]=ggml_view_2d(ctx,prepared,nk,nt,prepared->nb[1],0);
+        routed->src[2]=ggml_view_3d(ctx,prepared,1,nk,nt,4,prepared->nb[1],nk*4);
+        routed->src[2]->type=GGML_TYPE_F32;
+    }
+    routed->src[6]=prepared;
     return prepared;
 }
