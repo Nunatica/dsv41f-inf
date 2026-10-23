@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-moe-cache.h"
 #include "ggml-cpu.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -86,6 +87,9 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,int nt) {
     for(int step=-12;step<32;++step) {
         for(auto & v:input)v=normal(rng)*8;
         for(int i=0;i<nk*nt;++i){ids[i]=(step+16+i*3)%nex;prob[i]=(i+step+16)%5==0?0.f:(i%3+1)/6.f;}
+        if(std::getenv("DSV4F_SKIP_NO_MISS") && std::atoi(std::getenv("DSV4F_SKIP_NO_MISS")) &&
+           (step==8 || step==9 || step==24))
+            for(int t=0;t<nt;++t)if(step!=9 || t%2==0)std::fill_n(prob.data()+t*nk,nk,0.f);
         for(int mode=0;mode<3;++mode) {
             if(step==0 || step==9 || step==17)delays=8;
             auto & m=models[mode];

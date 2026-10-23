@@ -112,6 +112,11 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
         std::vector<float> input(ne*nt),a(ne*nt),b(ne*nt);for(auto & v:input)v=normal(rng)*8;std::vector<int> selected(nk*nt);std::vector<float> w(nk*nt);for(int t=0;t<nt;++t)for(int j=0;j<nk;++j){
             selected[t*nk+j]=resize_test && iteration<80?(iteration+t*3+j)%5+(iteration<24?0:3):(iteration+t*3+j*2)%experts;
             w[t*nk+j]=float(j+1)/6;}
+        // A miss followed by an empty format must not reuse its old CPU answer.
+        // Multi-token replays also mix a skipped token with real CPU work.
+        if(std::getenv("DSV4F_SKIP_NO_MISS") && std::atoi(std::getenv("DSV4F_SKIP_NO_MISS")) &&
+           (iteration==12 || iteration==13 || iteration==36))
+            for(int t=0;t<nt;++t)if(iteration!=13 || t%2==0)std::fill_n(w.data()+t*nk,nk,0.f);
         for(int k=0;k<2;++k){ggml_backend_tensor_set(x[k],input.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_set(ids[k],selected.data(),0,selected.size()*sizeof(int));ggml_backend_tensor_set(prob[k],w.data(),0,w.size()*sizeof(float));if((k?ggml_backend_sched_graph_compute(scheduler,graph[k]):ggml_backend_graph_compute(cpu,graph[k]))!=GGML_STATUS_SUCCESS)ok=false;}
         ggml_backend_tensor_get(out[0],a.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_get(out[1],b.data(),0,ne*nt*sizeof(float));double error=0,norm=0;for(int i=0;i<ne*nt;++i){error+=(a[i]-b[i])*(a[i]-b[i]);norm+=a[i]*a[i];ok&=std::isfinite(b[i]);}double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.04;
         if(pressure_test && resize_test && iteration>=90) {

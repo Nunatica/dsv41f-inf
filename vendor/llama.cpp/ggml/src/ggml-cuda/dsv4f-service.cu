@@ -52,7 +52,7 @@ __device__ bool acquire(int * state,int slot) {
 __global__ void route(request * ring,unsigned long long * sequence,int * table,int * readers,
                       const float * x,const int32_t * ids,const float * weights,int weight_stride,
                       int layer,int ne,int nk,float limit,int32_t * plan,float * plan_w,unsigned long long * issued,
-                      int * speculative,bool single) {
+                      int * speculative,bool single,bool skip_no_miss) {
     __shared__ unsigned long long seq;
     __shared__ uint64_t mask;
     if(threadIdx.x==0) {
@@ -75,6 +75,11 @@ __global__ void route(request * ring,unsigned long long * sequence,int * table,i
             if(slot>=0 || plan_w[i]==0)mask|=uint64_t(1)<<i;
         }
         r->hits=mask;
+        // Retain ordered cache observations, but publish no CPU job/answer
+        // dependency when every nonzero route can execute on the GPU.
+        if(skip_no_miss && mask==((uint64_t(1)<<nk)-1)) {
+            r->kind=2;*issued=0;
+        }
     }
     __syncthreads();
     request * r=ring+(seq%RING);
@@ -107,7 +112,14 @@ __global__ void release_readers(int * readers,const int32_t * plan,int nk) {
     const int i=threadIdx.x;if(i<nk && plan[i]>=0)atomicSub(readers+plan[i],1);
 }
 __global__ void cpu_join(request * ring,const unsigned long long * sequence,float * out,int ne,bool poll) {
-    const unsigned long long seq=*sequence;const request * r=ring+(seq%RING);
+    const unsigned long long seq=*sequence;
+    if(!seq) {
+        // Match the preceding + zero-answer arithmetic without reading a stale
+        // ring answer (including a request slot reused by a previous replay).
+        for(int i=threadIdx.x;i<ne;i+=blockDim.x)out[i]=out[i]+0.0f;
+        return;
+    }
+    const request * r=ring+(seq%RING);
     __shared__ int timeout;
     if(threadIdx.x==0){timeout=0;if(poll){const long long start=clock64();while(r->done!=seq)if(clock64()-start>(1ll<<36)){timeout=1;break;}}}
     __syncthreads();__threadfence_system();
@@ -218,6 +230,7 @@ class service {
     FILE * trace=nullptr;
     request * host=nullptr,*device=nullptr;
     unsigned long long * seq=nullptr,*issued=nullptr;
+    unsigned long long * host_issued=nullptr;
     int * table=nullptr,*readers=nullptr,*claim_h=nullptr,*claim_d=nullptr;
     int * speculative=nullptr;
     int * lookahead_claim_h=nullptr,*lookahead_claim_d=nullptr;
@@ -264,6 +277,10 @@ class service {
     const void * selected_source=nullptr;
     bool configured=false;
     bool poll=true;
+    bool skip_no_miss=false;
+    struct join_args {service * owner=nullptr;int nt=0;};
+    std::array<join_args,4> joins;
+    uint64_t skipped_jobs=0,skipped_callbacks=0;
     bool notify_wait=false,profile=false;
     unsigned callback_spin_us=0;
     unsigned idle_spins=200000;
@@ -463,33 +480,39 @@ class service {
             descriptor layer;
             {std::lock_guard<std::mutex> lock(mutex);layer=layers[r->layer];predict(*r);}
             if(profile)descriptor_time.add(service_ns()-seen);
-            const uint64_t all=(uint64_t(1)<<r->nk)-1;
-            std::unique_lock<std::mutex> cpu_lane(cpu_lane_mutex,std::defer_lock);
-            if(r->hits!=all) {
-                const uint64_t wait_start=profile?service_ns():0;
-                {dsv4f_timeline::scope waiting("wait/cpu_lane");cpu_lane.lock();}
-                if(profile)cpu_lane_wait.add(service_ns()-wait_start);
+            // kind=2 is cache telemetry only: do not clear an answer, acquire
+            // the CPU lane, publish completion, or wake an answer waiter.
+            const bool observation=r->kind==2;
+            if(!observation) {
+                const uint64_t all=(uint64_t(1)<<r->nk)-1;
+                std::unique_lock<std::mutex> cpu_lane(cpu_lane_mutex,std::defer_lock);
+                if(r->hits!=all) {
+                    const uint64_t wait_start=profile?service_ns():0;
+                    {dsv4f_timeline::scope waiting("wait/cpu_lane");cpu_lane.lock();}
+                    if(profile)cpu_lane_wait.add(service_ns()-wait_start);
+                }
+                const auto start=std::chrono::steady_clock::now();
+                {
+                dsv4f_timeline::scope span(gt==GGML_TYPE_Q3_K?"experts/q3_K":gt==GGML_TYPE_Q2_0?"experts/q2_0":gt==GGML_TYPE_PTQ1_0?"experts/ptq1_0":"experts/other");
+                if(r->hits!=all)ggml_dsv4f_cpu_experts(&layer.g,&layer.u,&layer.d,r->x,r->ids,r->weights,r->nk,r->hits,r->limit,r->answer);
+                else std::fill_n(r->answer,ne,0.f);
+                }
+                const auto end=service_clock::now();
+                if(cpu_lane.owns_lock())cpu_lane.unlock();
+                cpu_ms+=std::chrono::duration<double,std::milli>(end-start).count();
+                if(profile)expert_time.add(std::chrono::duration_cast<std::chrono::nanoseconds>(end-start).count());
+                uint64_t done=0;
+                {std::lock_guard<std::mutex> lock(answer_mutex);std::atomic_thread_fence(std::memory_order_release);r->done=next;
+                    if(profile){done=service_ns();timing[next%RING].done.store(done,std::memory_order_relaxed);}
+                    // Host-only acquire/release mirror permits a callback fast path.
+                    if(notify_wait || callback_spin_us || profile)completed.store(next,std::memory_order_release);
+                }answered.notify_all();
+                if(profile)publish_time.add(service_ns()-std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
             }
-            const auto start=std::chrono::steady_clock::now();
-            {
-            dsv4f_timeline::scope span(gt==GGML_TYPE_Q3_K?"experts/q3_K":gt==GGML_TYPE_Q2_0?"experts/q2_0":gt==GGML_TYPE_PTQ1_0?"experts/ptq1_0":"experts/other");
-            if(r->hits!=all)ggml_dsv4f_cpu_experts(&layer.g,&layer.u,&layer.d,r->x,r->ids,r->weights,r->nk,r->hits,r->limit,r->answer);
-            else std::fill_n(r->answer,ne,0.f);
-            }
-            const auto end=service_clock::now();
-            if(cpu_lane.owns_lock())cpu_lane.unlock();
-            cpu_ms+=std::chrono::duration<double,std::milli>(end-start).count();
-            if(profile)expert_time.add(std::chrono::duration_cast<std::chrono::nanoseconds>(end-start).count());
-            uint64_t done=0;
-            {std::lock_guard<std::mutex> lock(answer_mutex);std::atomic_thread_fence(std::memory_order_release);r->done=next;
-                if(profile){done=service_ns();timing[next%RING].done.store(done,std::memory_order_relaxed);}
-                // Host-only acquire/release mirror permits a callback fast path.
-                if(notify_wait || callback_spin_us || profile)completed.store(next,std::memory_order_release);
-            }answered.notify_all();
             const uint64_t published=profile?service_ns():0;
-            if(profile)publish_time.add(published-std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
             {std::lock_guard<std::mutex> lock(mutex);
                 ++requests;
+                skipped_jobs+=observation;
                 int keys[MAX_USED],active[MAX_USED],misses[MAX_USED],nactive=0,nmiss=0;
                 for(int i=0;i<r->nk;++i){
                     keys[i]=r->layer*MAX_EXPERTS+r->ids[i];
@@ -550,12 +573,29 @@ class service {
     }
     static void callback(void * arg) {
         auto & self=*static_cast<service*>(arg);
+        unsigned long long latest=0;
+        for(int i=0;i<RING;++i)latest=std::max(latest,(unsigned long long)(self.host[i].seq));
+        wait_callback(self,latest);
+    }
+    static void selective_callback(void * arg) {
+        auto & join=*static_cast<join_args*>(arg);
+        auto & self=*join.owner;
+        // Stream callback entry makes route's mapped join handles visible. A
+        // zero handle means this token has no CPU request, regardless of older
+        // cache-observation records still being consumed by the service.
+        unsigned long long latest=0;
+        for(int t=0;t<join.nt;++t) {
+            const unsigned long long handle=((volatile unsigned long long*)self.host_issued)[t];
+            latest=std::max(latest,handle);
+        }
+        if(!latest){++self.skipped_callbacks;return;}
+        wait_callback(self,latest);
+    }
+    static void wait_callback(service & self,unsigned long long latest) {
         dsv4f_timeline::scope span(self.gt==GGML_TYPE_Q3_K?"callback/q3_K":self.gt==GGML_TYPE_Q2_0?"callback/q2_0":self.gt==GGML_TYPE_PTQ1_0?"callback/ptq1_0":"callback/other");
         const uint64_t entry=self.profile?service_ns():0;
         // All preceding device work has completed, so the latest request is
         // visible. No CUDA/HIP API may be called from this runtime callback.
-        unsigned long long latest=0;
-        for(int i=0;i<RING;++i)latest=std::max(latest,(unsigned long long)(self.host[i].seq));
         const bool fast=self.notify_wait || self.callback_spin_us;
         if(self.profile){++self.callbacks;if(self.completed.load(std::memory_order_acquire)<latest)++self.callbacks_pending;}
         if(self.notify_wait && self.completed.load(std::memory_order_acquire)<latest) {
@@ -616,6 +656,10 @@ class service {
         uo=(gs+ggml_type_size(ut)-1)/ggml_type_size(ut)*ggml_type_size(ut);
         doff=(uo+us+ggml_type_size(dt)-1)/ggml_type_size(dt)*ggml_type_size(dt);stride=(doff+ds+align-1)/align*align;
         const char * mode=std::getenv("DSV4F_GPU_WAIT");poll=!mode || std::strcmp(mode,"callback")!=0;
+        const char * skip=std::getenv("DSV4F_SKIP_NO_MISS");
+        if(skip && std::strcmp(skip,"0") && std::strcmp(skip,"1"))throw std::runtime_error("DSV4F_SKIP_NO_MISS must be 0 or 1");
+        skip_no_miss=skip && !std::strcmp(skip,"1");
+        for(int t=0;t<4;++t)joins[t]={this,t+1};
         const char * wait=std::getenv("DSV4F_SERVICE_WAIT");
         if(wait && std::strcmp(wait,"legacy") && std::strcmp(wait,"notify"))throw std::runtime_error("DSV4F_SERVICE_WAIT must be legacy or notify");
         notify_wait=wait && !std::strcmp(wait,"notify");
@@ -649,7 +693,11 @@ class service {
             43*g->ne[2]*(sizeof(char *)+4*sizeof(int));
         if(!ggml_dsv4f_reserve_vram(0,scratch))throw std::runtime_error("DSV4F VRAM headroom cannot be preserved for service scratch");
         CUDA_CHECK(cudaHostAlloc((void**)&host,RING*sizeof(request),cudaHostAllocMapped));std::memset(host,0,RING*sizeof(request));CUDA_CHECK(cudaHostGetDevicePointer((void**)&device,host,0));
-        CUDA_CHECK(cudaMalloc((void**)&issued,4*sizeof(unsigned long long)));
+        if(skip_no_miss) {
+            CUDA_CHECK(cudaHostAlloc((void**)&host_issued,4*sizeof(unsigned long long),cudaHostAllocMapped));
+            std::memset(host_issued,0,4*sizeof(unsigned long long));
+            CUDA_CHECK(cudaHostGetDevicePointer((void**)&issued,host_issued,0));
+        } else CUDA_CHECK(cudaMalloc((void**)&issued,4*sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc((void**)&seq,sizeof(unsigned long long)));CUDA_CHECK(cudaMemset(seq,0,sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc((void**)&table,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));CUDA_CHECK(cudaMemset(table,0xff,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));
         if(lookahead==2 || lookahead==4){CUDA_CHECK(cudaMalloc((void**)&speculative,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));CUDA_CHECK(cudaMemset(speculative,0,MAX_LAYERS*MAX_EXPERTS*sizeof(int)));}
@@ -691,6 +739,7 @@ class service {
         stop=false;worker=std::thread([this]{serve();});loader=std::thread([this]{load();});
         if(lookahead==4)lookahead_loader=std::thread([this]{load(true);});
         std::fprintf(stderr,"[dsv4f-service] GPU routing + CPU service: %d slots %.2f GiB, wait=%s\n",count,double(count*stride)/(1ULL<<30),poll?"poll":"callback");
+        if(skip_no_miss)std::fprintf(stderr,"[dsv4f-no-miss] enabled=1 format=%s cache_observations=ordered\n",ggml_type_name(gt));
         if(profile || notify_wait || callback_spin_us || idle_spins!=200000)std::fprintf(stderr,"[dsv4f-service] host_wait=%s callback_spin_us=%u idle_spins=%u profile=%d format=%s\n",notify_wait?"notify":"legacy",callback_spin_us,idle_spins,int(profile),ggml_type_name(gt));
     }
 public:
@@ -839,14 +888,20 @@ public:
     }
     void clear() {
         if(!host){configured=false;selected_source=nullptr;return;}ggml_cuda_set_device(0);CUDA_CHECK(cudaDeviceSynchronize());
+        if(skip_no_miss)drain();
         {std::lock_guard<std::mutex> lock(wake_mutex);stop.store(true,std::memory_order_release);}copies.notify_all();answered.notify_all();ready.notify_all();worker.join();loader.join();if(lookahead_loader.joinable())lookahead_loader.join();
         print_lookahead();
         guard.reset();guard_hits=guard_cancelled=guard_reclaim_denied=guard_compacted=0;
         if(profile)print_callback_profile();
+        if(skip_no_miss)std::fprintf(stderr,"[dsv4f-no-miss] format=%s observations=%llu cpu_requests=%llu skipped_jobs=%llu skipped_callbacks=%llu\n",
+            ggml_type_name(gt),(unsigned long long)requests,(unsigned long long)(requests-skipped_jobs),
+            (unsigned long long)skipped_jobs,(unsigned long long)skipped_callbacks);
         for(auto block:cache_blocks)ggml_dsv4f_free_cache(block.data,block.count*stride);cache_blocks.clear();cache_ptrs.clear();
         CUDA_CHECK(cudaFree(prefill_updates));prefill_updates=nullptr;
         prefill_changes.clear();prefill_leased=false;
-        cudaFree(extra);ggml_dsv4f_free_cache(slab,block_cache?0:slots.size()*stride);cudaFree(seq);cudaFree(issued);cudaFree(table);cudaFree(readers);cudaFree(speculative);speculative=nullptr;cudaFree(gate);cudaFree(down);cudaFree(weights);cudaFree(plan);cudaFree(aq);cudaFree(hq);cudaFreeHost(host);cudaFreeHost(claim_h);cudaStreamDestroy(copy);
+        if(host_issued){CUDA_CHECK(cudaFreeHost(host_issued));host_issued=nullptr;}else cudaFree(issued);
+        issued=nullptr;
+        cudaFree(extra);ggml_dsv4f_free_cache(slab,block_cache?0:slots.size()*stride);cudaFree(seq);cudaFree(table);cudaFree(readers);cudaFree(speculative);speculative=nullptr;cudaFree(gate);cudaFree(down);cudaFree(weights);cudaFree(plan);cudaFree(aq);cudaFree(hq);cudaFreeHost(host);cudaFreeHost(claim_h);cudaStreamDestroy(copy);
         if(lookahead_claim_h){cudaFreeHost(lookahead_claim_h);lookahead_claim_h=lookahead_claim_d=nullptr;}
         if(lookahead_copy){cudaStreamDestroy(lookahead_copy);lookahead_copy=nullptr;}
         if(trace){std::fclose(trace);trace=nullptr;}
@@ -858,6 +913,7 @@ public:
         early_armed_batches=early_skipped_batches=early_batches=early_candidates=early_matches=early_actual=early_ready=early_matched_ready=early_actual_miss=early_matched_miss=early_new_candidates=early_cached_candidates=0;forecast.fill(-1);for(auto & history:last_routes)history.clear();
         predictions=forecast_used=forecast_missed=forecast_consumed=prefetch_copies=prefetch_hits=prefetch_timely=prefetch_rejected=prefetch_failed=0;prefetch_copy_us=0;
         completed=0;descriptor_time={};expert_time={};publish_time={};post_time={};sleep_time={};detect_bound={};idle_cpu={};callback_time={};callback_detect={};callback_tail={};callbacks=callbacks_pending=callbacks_unseen=0;
+        skipped_jobs=skipped_callbacks=0;skip_no_miss=false;
         for(auto & t:timing){t.seen=0;t.done=0;}
     }
     void invalidate(const void * base,size_t bytes) {
@@ -959,7 +1015,7 @@ public:
         const auto * g=dst->src[3],*u=dst->src[4],*d=dst->src[5];init(g,u,d,dst->src[1]->ne[0]);
         const int layer=descriptor_id(g,u,d);
         float limit;std::memcpy(&limit,&dst->op_params[8],sizeof(limit));const int nk=dst->src[1]->ne[0];auto stream=ctx.stream();
-        route<<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single);
+        route<<<1,256,0,stream>>>(device,seq,table,readers,(const float*)dst->src[0]->data,(const int32_t*)dst->src[1]->data,(const float*)dst->src[2]->data,dst->src[2]->nb[1]/sizeof(float),layer,ne,nk,limit,route_plan,route_weights,issued+token_index,speculative,single,skip_no_miss);
     }
     void prepare(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
         const int nk=dst->src[1]->ne[0];
@@ -1024,7 +1080,10 @@ public:
         if(!dst->op_params[10])finish(ctx,dst);
     }
     void finish(ggml_backend_cuda_context & ctx,ggml_tensor * dst) {
-        if(!poll)CUDA_CHECK(cudaLaunchHostFunc(ctx.stream(),callback,this));
+        if(!poll) {
+            if(skip_no_miss)CUDA_CHECK(cudaLaunchHostFunc(ctx.stream(),selective_callback,&joins.at(dst->ne[1]-1)));
+            else CUDA_CHECK(cudaLaunchHostFunc(ctx.stream(),callback,this));
+        }
         for(int64_t t=0;t<dst->ne[1];++t)
             cpu_join<<<1,256,0,ctx.stream()>>>(device,issued+t,(float*)((char*)dst->data+t*dst->nb[1]),ne,poll);
         CUDA_CHECK(cudaGetLastError());

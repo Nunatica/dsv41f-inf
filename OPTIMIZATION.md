@@ -92,6 +92,7 @@ V4.1 CPU dot products select AVX2 or AVX-512 paths according to CPU support. PTQ
 | --- | --- | --- |
 | `DSV4F_GPU_SERVICE` | `1` | Enables GPU routing and the persistent CPU service |
 | `DSV4F_GPU_WAIT` | `callback` | CPU completion wait mode: `callback` or `poll` |
+| `DSV4F_SKIP_NO_MISS` | `1` | Omit CPU answer/completion work for all-hit or zero-weight routes; keep ordered cache observations. Captured callback nodes remain and return immediately when the batch has no CPU job. Set `0` for the preceding path. |
 | `DSV4F_CPU_THREADS` | `12` | CPU computation parallelism, including the calling thread |
 | `DSV4F_CPU_SCHEDULE` / `DSV4F_CPU_ROW_CHUNK` | `dynamic` / `32` | Row scheduling policy and chunk size |
 | `DSV4F_CPU_SPIN_US` / `DSV4F_CPU_FAST_SYNC` | `300` / `1` | Worker wait and synchronization settings |
