@@ -32,16 +32,6 @@ The admission candidate is the highest-scoring expert among the current misses. 
 
 The default format ceilings divide the aggregate budget in an **8:1:5** ratio. Changing the total budget also changes format ceilings that have not been explicitly overridden. These values are ceilings; actual capacity depends on available VRAM and workspace requirements. A format ceiling can also be set to `0`. The launcher sets `GGML_CUDA_MOE_CACHE=0` to avoid enabling the generic llama.cpp MoE cache alongside this implementation.
 
-## Optional expert lookahead
-
-`DSV4F_EXPERT_LOOKAHEAD` defaults to `0`. The experimental early-router path predicts experts by applying the next layer's router to the current post-attention hidden state. Mode `3` collects prediction statistics, `4` prefetches predicted misses, and `5` protects predicted experts against eviction. Modes `1` and `2` provide Q3_K temporal-prediction comparison paths based on the previous token's routing.
-
-Mode `4` reserves temporary slots within the existing format budget, consuming some ordinary cache capacity. `DSV4F_EXPERT_LOOKAHEAD_DEPTH` controls the number of predictions (default 8, range 1–16), and `DSV4F_EXPERT_LOOKAHEAD_READ` limits copying to the highest-ranked predictions (default: depth). Resident candidates are skipped without backfilling from lower ranks. `DSV4F_EXPERT_LOOKAHEAD_SCORE=raw` is the default; `native` applies the actual selection transform and bias.
-
-Mode `5` protects predicted experts through the next token's same-layer routing without speculative copies or temporary slots. If no unprotected victim is available, demand admission is skipped and CPU fallback remains available. Actual expert selection and routing weights remain unchanged, and prefill/phase resets clear the protection state. A higher prediction or cache hit rate does not guarantee higher throughput, so benchmark this feature separately from the default optimizations.
-
-Implementation: [GPU service and loader](vendor/llama.cpp/ggml/src/ggml-cuda/dsv4f-service.cu), [cache policy](vendor/llama.cpp/ggml/src/ggml-dsv4f-cache-policy.h), [V4.1 graph](vendor/llama.cpp/src/models/deepseek41.cpp).
-
 # Dynamic VRAM allocation for prefill / decode switching
 
 ## Redistributing workspace and cache capacity by phase
