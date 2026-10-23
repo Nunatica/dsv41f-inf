@@ -8,6 +8,8 @@ if [[ $backend == auto ]]; then
     else echo 'HIP or CUDA toolkit is required.' >&2; exit 1; fi
 fi
 args=(-S "$ROOT" -B "${BUILD_DIR:-$ROOT/build}" -G Ninja -DCMAKE_BUILD_TYPE=Release
+      -DDSV4F_NATIVE="${DSV4F_NATIVE:-ON}"
+      -DDSV4F_CPU_LTO="${DSV4F_CPU_LTO:-ON}"
       -DLLAMA_OPENSSL=OFF -DLLAMA_USE_PREBUILT_UI=OFF)
 case "$backend" in
     hip) rocm=${ROCM_PATH:-/opt/rocm}; prefix=$rocm

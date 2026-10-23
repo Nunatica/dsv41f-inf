@@ -10,11 +10,44 @@ set(LLAMA_BUILD_SERVER ON CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/llama.cpp)
-target_sources(llama PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41-mtp.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/moe.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/route.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/mxfp4.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/engram.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/engram-async.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/engram-prefetch.cpp"
+set(DSV4F_PROJECT_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41-mtp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/moe.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/route.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/mxfp4.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/engram.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/engram-async.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/engram-prefetch.cpp")
+target_sources(llama PRIVATE ${DSV4F_PROJECT_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/llama.cpp/src/models/deepseek41.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/vendor/llama.cpp/src/llama-kv-cache-dsv41.cpp")
+option(DSV4F_NATIVE "Optimize project C++ sources for the build CPU" ON)
+if(DSV4F_NATIVE)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=native" DSV4F_HAS_MARCH_NATIVE)
+    if(NOT DSV4F_HAS_MARCH_NATIVE)
+        message(FATAL_ERROR "DSV4F_NATIVE requires a C++ compiler supporting -march=native")
+    endif()
+    # Cover both the llama library and project tests that compile these sources.
+    set_property(SOURCE ${DSV4F_PROJECT_SOURCES}
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TARGET_DIRECTORY llama
+        APPEND PROPERTY COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=native>")
+endif()
 target_include_directories(llama PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/vendor/llama.cpp/ggml/src")
 target_include_directories(llama PRIVATE vendor/llama.cpp/vendor)
 target_link_libraries(llama PRIVATE ggml-cpu)
+option(DSV4F_CPU_LTO "Enable Release LTO for CPU inference and server targets" ON)
+if(DSV4F_CPU_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT DSV4F_CPU_IPO_SUPPORTED OUTPUT DSV4F_CPU_IPO_ERROR
+        LANGUAGES C CXX)
+    if(NOT DSV4F_CPU_IPO_SUPPORTED)
+        message(FATAL_ERROR "DSV4F_CPU_LTO is unsupported: ${DSV4F_CPU_IPO_ERROR}")
+    endif()
+    # Keep HIP/CUDA targets on their existing compiler and device-link settings.
+    set_property(TARGET ggml-base ggml ggml-cpu llama llama-common-base
+        llama-common server-context llama-server-impl llama-server
+        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
 add_executable(dsv4f-history-dispatch-probe EXCLUDE_FROM_ALL scripts/history_dispatch_probe.cpp)
 target_include_directories(dsv4f-history-dispatch-probe PRIVATE vendor/llama.cpp/ggml/src)
 target_link_libraries(dsv4f-history-dispatch-probe PRIVATE ggml ggml-cpu)

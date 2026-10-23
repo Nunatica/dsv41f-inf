@@ -101,6 +101,18 @@ After installing the dependencies and placing the model files:
 ./run-server.sh
 ```
 
+CPU-specific optimization of the project's own C++ sources is enabled by
+default (`DSV4F_NATIVE=ON`). This adds `-march=native` to those sources,
+including their test builds. The resulting code targets the build machine's
+CPU and may require the same instruction set on other machines. Build with
+`DSV4F_NATIVE=OFF ./build-engine.sh` to disable it. GPU compiler options are
+unaffected.
+
+Release LTO for the CPU inference libraries and server targets is enabled by
+default (`DSV4F_CPU_LTO=ON`). Disable it with
+`DSV4F_CPU_LTO=OFF ./build-engine.sh`. The build checks C/C++ IPO support and
+keeps HIP/CUDA compiler and device-link settings unchanged.
+
 ## Performance
 
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
