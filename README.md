@@ -92,7 +92,6 @@ In budgeted mode, the RAM cache grows into the budget left after measured proces
 ./run-server.sh                          # Tiered mode, 180 GiB RAM ceiling
 DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stays on SSD
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
-DSV4F_RAM_BUDGET_MIB=163840 ./run-server.sh # Tiered mode, 160 GiB RAM ceiling
 ```
 
 Set the budget before starting a new server. The native engine also selects direct expert loading when this variable is positive; use the launcher (or supply a cgroup yourself) to enforce the total-process hard limit. `state/server.json` records the requested/effective budgets, tier mode and cgroup counters at readiness. An inherited tighter cgroup ceiling is also passed to the native RAM cache. With `DSV4F_RAM_BUDGET_MIB=0`, swap protection remains required and the previous full-model RAM availability check applies.
@@ -140,7 +139,8 @@ keeps HIP/CUDA compiler and device-link settings unchanged.
 
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
 | --- | ---: | ---: |
-| dsv41f-inf | 200.65 | 19.72 |
+| dsv41f-inf (2.6bpw, full weights on ram) | 226.65 | 20.87 |
+| dsv41f-inf (2.6bpw, 128 GiB budget, cold test) | 37.63 | 10.38 |
 | llama.cpp | - | - |
 
 These historical measurements used resident weights (equivalent to `DSV4F_RAM_BUDGET_MIB=0`) on the target system with `PROMPT_TEST.md`. Direct-SSD performance depends on cache misses and SSD throughput.
