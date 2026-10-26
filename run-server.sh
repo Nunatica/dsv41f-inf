@@ -176,6 +176,8 @@ export DSV4F_DECODE_UBATCH=${DSV4F_DECODE_UBATCH:-256}
 # Expert lookahead: 0 off, 1/2 temporal, 3/4 early-router shadow/copy, 5 cache protection.
 export DSV4F_EXPERT_LOOKAHEAD=${DSV4F_EXPERT_LOOKAHEAD:-0}
 case "$DSV4F_EXPERT_LOOKAHEAD" in 0|1|2|3|4|5) ;; *) echo 'DSV4F_EXPERT_LOOKAHEAD must be 0..5.' >&2; exit 1;; esac
+export DSV4F_RAM_LOOKAHEAD=${DSV4F_RAM_LOOKAHEAD:-0}
+case "$DSV4F_RAM_LOOKAHEAD" in 0|1) ;; *) echo 'DSV4F_RAM_LOOKAHEAD must be 0 or 1.' >&2; exit 1;; esac
 export DSV4F_EXPERT_LOOKAHEAD_DEPTH=${DSV4F_EXPERT_LOOKAHEAD_DEPTH:-8}
 export DSV4F_EXPERT_LOOKAHEAD_SCORE=${DSV4F_EXPERT_LOOKAHEAD_SCORE:-raw}
 case "$DSV4F_EXPERT_LOOKAHEAD_SCORE" in raw|native) ;; *) echo 'DSV4F_EXPERT_LOOKAHEAD_SCORE must be raw or native.' >&2; exit 1;; esac

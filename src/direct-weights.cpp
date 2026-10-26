@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <list>
@@ -16,6 +17,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -81,6 +84,7 @@ struct source {
     std::map<uintptr_t,span> spans;
     std::vector<int> fds;
     bool closing=false;
+    size_t prefetches=0;
     ~source(){for(int fd:fds)close(fd);}
 };
 struct load {
@@ -107,7 +111,13 @@ struct cache {
     std::map<uintptr_t,std::shared_ptr<load>> loads;
     std::map<const void*,uintptr_t> leases;
     std::list<uintptr_t> ages;
+    struct prefetch_job { source * owner; uintptr_t key; size_t bytes; };
+    std::condition_variable prefetch_ready;
+    std::deque<prefetch_job> prefetch_queue;
+    std::unordered_set<uintptr_t> prefetch_pending;
+    std::vector<std::thread> prefetch_workers;
     uint64_t used=0,reserved=0,hits=0,reads=0,bytes=0,evictions=0;
+    uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
     ~cache()=default;
     uint64_t limit() const {
         const uint64_t budget=dsv4f_ram_budget();
@@ -134,6 +144,53 @@ struct cache {
 };
 // Outlives model/backend static teardown; it contains no allocations after model unload.
 cache & pool(){static auto * p=new cache;return *p;}
+const void * acquire(const void * ptr,size_t n);
+void release(const void * ptr);
+void prefetch_worker() {
+    auto & c=pool();
+    for(;;) {
+        cache::prefetch_job job{};
+        {
+            std::unique_lock<std::mutex> lock(c.mutex);
+            c.prefetch_ready.wait(lock,[&]{return !c.prefetch_queue.empty();});
+            job=c.prefetch_queue.front();c.prefetch_queue.pop_front();
+        }
+        bool ok=false;
+        try {const void * p=acquire((const void *)job.key,job.bytes);release(p);ok=true;}
+        catch(...) {}
+        {
+            std::lock_guard<std::mutex> lock(c.mutex);
+            c.prefetch_pending.erase(job.key);
+            GGML_ASSERT(job.owner->prefetches);--job.owner->prefetches;
+            if(ok)++c.prefetch_completed;else ++c.prefetch_failed;
+            c.changed.notify_all();
+        }
+    }
+}
+void prefetch(const void * ptr,size_t n) {
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    const auto key=(uintptr_t)ptr;
+    auto s=c.sources.upper_bound(key);if(s==c.sources.begin())return;--s;
+    source * owner=s->second;
+    if(key-s->first>=owner->address->bytes || owner->closing)return;
+    auto sp=owner->spans.upper_bound(key);if(sp==owner->spans.begin())return;--sp;
+    const auto & span=sp->second;const size_t local=key-span.begin;
+    if(local>=span.bytes || n!=span.expert || local%span.expert || n>span.bytes-local)return;
+    if(c.entries.count(key) || c.loads.count(key) || c.prefetch_pending.count(key))return;
+    // Predictions are useful for only the immediately following layer. Keep
+    // the newest hints when SSD workers fall behind instead of draining stale
+    // layers and displacing demand-loaded experts.
+    constexpr size_t queue_limit=96;
+    while(c.prefetch_queue.size()>=queue_limit) {
+        const auto old=c.prefetch_queue.front();c.prefetch_queue.pop_front();
+        c.prefetch_pending.erase(old.key);GGML_ASSERT(old.owner->prefetches);
+        --old.owner->prefetches;++c.prefetch_dropped;
+    }
+    c.prefetch_pending.insert(key);c.prefetch_queue.push_back({owner,key,n});
+    ++owner->prefetches;++c.prefetch_queued;
+    if(c.prefetch_workers.empty())for(int i=0;i<3;++i)c.prefetch_workers.emplace_back(prefetch_worker);
+    c.prefetch_ready.notify_all();
+}
 const void * acquire(const void * ptr,size_t n) {
     auto & c=pool();std::unique_lock<std::mutex> lock(c.mutex);
     const auto key=(uintptr_t)ptr;
@@ -209,7 +266,14 @@ void free_buffer(ggml_backend_buffer_t buffer) {
     auto * owner=(source*)buffer->context;
     auto & c=pool();
     {std::unique_lock<std::mutex> lock(c.mutex);owner->closing=true;
+        for(auto it=c.prefetch_queue.begin();it!=c.prefetch_queue.end();) {
+            if(it->owner==owner) {
+                c.prefetch_pending.erase(it->key);GGML_ASSERT(owner->prefetches);
+                --owner->prefetches;++c.prefetch_dropped;it=c.prefetch_queue.erase(it);
+            } else ++it;
+        }
         c.changed.wait(lock,[&] {
+            if(owner->prefetches)return false;
             for(const auto & item:c.loads)if(item.second->owner==owner)return false;
             for(const auto & item:c.entries)if(item.second.owner==owner && item.second.users)return false;
             return true;
@@ -218,7 +282,12 @@ void free_buffer(ggml_backend_buffer_t buffer) {
             if(it->second.owner==owner){auto old=it++;c.erase(old);}else ++it;
         }
         c.sources.erase((uintptr_t)owner->address->data);
-        if(c.sources.empty())ggml_dsv4f_host_weights={};
+        if(c.sources.empty()) {
+            std::fprintf(stderr,"[dsv4f-ram-prefetch] queued=%llu completed=%llu dropped=%llu failed=%llu\n",
+                (unsigned long long)c.prefetch_queued,(unsigned long long)c.prefetch_completed,
+                (unsigned long long)c.prefetch_dropped,(unsigned long long)c.prefetch_failed);
+            ggml_dsv4f_host_weights={};
+        }
     }
     delete owner;
 }
@@ -326,7 +395,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     auto * b=ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(),iface,owner.get(),owner->address->bytes);
     at=0;for(const auto & t:tensors){ggml_backend_tensor_alloc(b,t.tensor,(char*)owner->address->data+at);at+=rounded(ggml_nbytes(t.tensor));}
     c.sources.emplace((uintptr_t)owner->address->data,owner.get());
-    ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;
+    ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;ggml_dsv4f_host_weights.prefetch=prefetch;
     std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB, io_lock=%s\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30),unlocked_io()?"released":"held");
     owner.release();return b;
 }

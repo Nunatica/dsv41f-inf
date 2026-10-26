@@ -52,6 +52,15 @@ int main() {
         while(ready.load()!=12)std::this_thread::yield();go.store(true,std::memory_order_release);
         for(auto & thread:threads)thread.join();require(ok,same?"coalesced cold leases":"parallel cold leases");
     }
+    // A speculative hint must remain non-blocking for its caller. A demand
+    // lease may either hit the completed entry or coalesce with its O_DIRECT
+    // load, and source teardown below must drain any remaining hints safely.
+    require(ggml_dsv4f_host_weights.prefetch,"direct prefetch API");
+    ggml_dsv4f_host_weights.prefetch((char*)t->data+13*plane,plane);
+    {
+        ggml_dsv4f_host_lease lease((char*)t->data+13*plane,plane);
+        require(!std::memcmp(lease.data,expected.data()+offset+13*plane,plane),"prefetched expert bytes");
+    }
     // A live lease survives many evictions and is shared by simultaneous readers.
     {
         ggml_dsv4f_host_lease first(t->data,plane);

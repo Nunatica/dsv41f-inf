@@ -286,6 +286,8 @@ class service {
     bool configured=false;
     bool poll=true;
     bool skip_no_miss=false;
+    bool host_lookahead=false;
+    uint64_t host_lookahead_planes=0;
     struct join_args {service * owner=nullptr;int nt=0;};
     std::array<join_args,4> joins;
     uint64_t skipped_jobs=0,skipped_callbacks=0;
@@ -437,6 +439,13 @@ class service {
             // never causes a lower-ranked expert to be copied as a replacement.
             if(k>=early_read)continue;
             selected.push_back(key);++early_read_candidates;
+            if(host_lookahead) {
+                const int id=r.ids[k];const auto & layer=layers[r.layer];
+                for(const ggml_tensor * tensor:{&layer.g,&layer.u,&layer.d}) {
+                    ggml_dsv4f_host_weights.prefetch((const char *)tensor->data+size_t(id)*tensor->nb[2],tensor->nb[2]);
+                    ++host_lookahead_planes;
+                }
+            }
             if(policy.contains(key) || temporary_contains(key)){++early_cached_candidates;continue;}
             ++early_new_candidates;has_new=true;
             if(lookahead!=4)continue;
@@ -696,6 +705,9 @@ class service {
             requested_lookahead=std::atoi(value);
         }
         lookahead=((requested_lookahead>=3 && v41) || gt==GGML_TYPE_Q3_K)?requested_lookahead:0;forecast.fill(-1);
+        const char * host_prefetch=std::getenv("DSV4F_RAM_LOOKAHEAD");
+        if(host_prefetch && std::strcmp(host_prefetch,"0") && std::strcmp(host_prefetch,"1"))throw std::runtime_error("DSV4F_RAM_LOOKAHEAD must be 0 or 1");
+        host_lookahead=lookahead>=3 && host_prefetch && !std::strcmp(host_prefetch,"1") && ggml_dsv4f_host_weights.prefetch;
         early_depth=setting("DSV4F_EXPERT_LOOKAHEAD_DEPTH",8,16);
         early_read=setting("DSV4F_EXPERT_LOOKAHEAD_READ",early_depth,early_depth);
         const size_t scratch=5*sizeof(unsigned long long)+MAX_LAYERS*MAX_EXPERTS*sizeof(int)*(1+(lookahead==2 || lookahead==4))+
@@ -747,6 +759,7 @@ class service {
         }
         if(lookahead)std::fprintf(stderr,"[dsv4f-lookahead] enabled mode=%d predictor=%s depth=%d read=%d temporary_slots=%d format=%s\n",
             lookahead,lookahead>=3?"current-hidden-next-router":"previous-token-next-layer",lookahead>=3?early_depth:1,early_read,temporary_slots,ggml_type_name(gt));
+        if(host_lookahead)std::fprintf(stderr,"[dsv4f-ram-prefetch] enabled format=%s depth=%d workers=3 queue=96\n",ggml_type_name(gt),early_read);
         stop=false;worker=std::thread([this]{serve();});loader=std::thread([this]{load();});
         if(lookahead==4)lookahead_loader=std::thread([this]{load(true);});
         std::fprintf(stderr,"[dsv4f-service] GPU routing + CPU service: %d slots %.2f GiB, wait=%s\n",count,double(count*stride)/(1ULL<<30),poll?"poll":"callback");
@@ -902,6 +915,7 @@ public:
         if(skip_no_miss)drain();
         {std::lock_guard<std::mutex> lock(wake_mutex);stop.store(true,std::memory_order_release);}copies.notify_all();answered.notify_all();ready.notify_all();worker.join();loader.join();if(lookahead_loader.joinable())lookahead_loader.join();
         print_lookahead();
+        if(host_lookahead)std::fprintf(stderr,"[dsv4f-ram-prefetch] format=%s submitted_planes=%llu\n",ggml_type_name(gt),(unsigned long long)host_lookahead_planes);
         guard.reset();guard_hits=guard_cancelled=guard_reclaim_denied=guard_compacted=0;
         if(profile)print_callback_profile();
         if(skip_no_miss)std::fprintf(stderr,"[dsv4f-no-miss] format=%s observations=%llu cpu_requests=%llu skipped_jobs=%llu skipped_callbacks=%llu\n",
@@ -924,7 +938,7 @@ public:
         early_armed_batches=early_skipped_batches=early_batches=early_candidates=early_matches=early_actual=early_ready=early_matched_ready=early_actual_miss=early_matched_miss=early_new_candidates=early_cached_candidates=0;forecast.fill(-1);for(auto & history:last_routes)history.clear();
         predictions=forecast_used=forecast_missed=forecast_consumed=prefetch_copies=prefetch_hits=prefetch_timely=prefetch_rejected=prefetch_failed=0;prefetch_copy_us=0;
         completed=0;descriptor_time={};expert_time={};publish_time={};post_time={};sleep_time={};detect_bound={};idle_cpu={};callback_time={};callback_detect={};callback_tail={};callbacks=callbacks_pending=callbacks_unseen=0;
-        skipped_jobs=skipped_callbacks=0;skip_no_miss=false;
+        skipped_jobs=skipped_callbacks=0;skip_no_miss=false;host_lookahead=false;host_lookahead_planes=0;
         for(auto & t:timing){t.seen=0;t.done=0;}
     }
     void invalidate(const void * base,size_t bytes) {

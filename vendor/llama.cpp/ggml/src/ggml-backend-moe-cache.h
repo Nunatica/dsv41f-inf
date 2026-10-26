@@ -138,6 +138,9 @@ GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
 struct ggml_dsv4f_host_weights_api {
     const void * (*acquire)(const void *, size_t);
     void (*release)(const void *);
+    // Non-blocking hint. The direct-weight backend may populate its RAM cache
+    // in the background; resident backends leave this null.
+    void (*prefetch)(const void *, size_t);
 };
 #ifdef __cplusplus
 extern "C" {
