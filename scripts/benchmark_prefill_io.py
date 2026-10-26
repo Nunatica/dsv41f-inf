@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare cold/warm PROMPT_TEST2 prefill under a fixed RAM budget, MTP off."""
+"""Compare cold/warm long-prompt prefill under a fixed RAM budget, MTP off."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -25,6 +25,9 @@ def main():
     parser.add_argument('--runs', type=int, default=3)
     parser.add_argument('--ram-budget-mib', type=int, default=163840)
     parser.add_argument('--scan-cache', choices=['0', '1'], default='0')
+    parser.add_argument('--prompt-file', type=Path, default=ROOT/'PROMPT_TEST.md')
+    parser.add_argument('--validation-tokens', type=int, default=0,
+                        help='generate a short-prompt sample after all timed runs')
     args = parser.parse_args()
     if args.runs < 2:
         parser.error('--runs must be at least 2 (cold and warm)')
@@ -33,7 +36,7 @@ def main():
     manifest = ROOT/'state/server.json'
     if manifest.exists():
         raise RuntimeError('An owned server already exists')
-    prompt = (ROOT/'PROMPT_TEST2.md').read_text(encoding='utf-8')
+    prompt = args.prompt_file.read_text(encoding='utf-8')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     build = ROOT/'build'
@@ -51,7 +54,7 @@ def main():
             env.pop(key)
     hashes = {name: hashlib.sha256((build/'bin'/name).read_bytes()).hexdigest()
               for name in ('dsv4f-server', 'libggml-hip.so', 'libllama.so')}
-    report = dict(date_utc=datetime.now(timezone.utc).isoformat(), prompt_file='PROMPT_TEST2.md',
+    report = dict(date_utc=datetime.now(timezone.utc).isoformat(), prompt_file=str(args.prompt_file),
                   prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), batch_io=args.batch_io,
                   ram_budget_mib=args.ram_budget_mib, scan_cache=args.scan_cache,
                   mtp=0, binary_sha256=hashes, runs=[])
@@ -129,6 +132,11 @@ def main():
                                      warm_median_prefill_tps=statistics.median(values[1:]))
             (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
             print(report['summary'], flush=True)
+            if args.validation_tokens:
+                sample = generate(state['url'], args.validation_tokens, cache_prompt=False)
+                report['validation_sample'] = sample
+                (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
+                print('Short-prompt validation:', sample['content'], flush=True)
         finally:
             if state:
                 try:

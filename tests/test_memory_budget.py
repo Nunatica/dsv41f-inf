@@ -69,6 +69,7 @@ class MemoryBudgetTest(unittest.TestCase):
         self.assertIn('--load-mode dio', result.stdout)
         self.assertIn('--lazy-mode off', result.stdout)
         self.assertIn('--no-host', result.stdout)
+        self.assertIn('--batch-size 1024 --ubatch-size 1024', result.stdout)
         for value in ('-1', '123.4', '4096'):
             result = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                     env={**env, 'DSV4F_RAM_BUDGET_MIB': value}, capture_output=True)
@@ -79,6 +80,14 @@ class MemoryBudgetTest(unittest.TestCase):
         self.assertEqual(legacy.returncode, 0, legacy.stderr)
         self.assertIn('--load-mode none', legacy.stdout)
         self.assertNotIn('--no-host', legacy.stdout)
+        self.assertIn('--batch-size 4096 --ubatch-size 4096', legacy.stdout)
+
+        tiered_batch = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
+                               env={**env, 'DSV4F_DECODE_UBATCH': '128', 'DSV4F_DECODE_BATCH': '4',
+                                    'BATCH_SIZE': '8192', 'UBATCH_SIZE': '4096', 'DSV4F_PHASE_WORKSPACE': '1'},
+                               capture_output=True, text=True)
+        self.assertEqual(tiered_batch.returncode, 0, tiered_batch.stderr)
+        self.assertIn('--batch-size 1024 --ubatch-size 1024', tiered_batch.stdout)
 
         tiered = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                 env={**env, 'DSV4F_RAM_BUDGET_MIB': '163840'}, capture_output=True, text=True)

@@ -949,10 +949,10 @@ public:
     bool prefill_begin(const ggml_tensor * g, const ggml_tensor * u, const ggml_tensor * d,
                        int nk, int group, std::vector<int> & active, ggml_dsv4f_prefill_cache_plan & output) {
         const char * enabled=std::getenv("DSV4F_GPU_SERVICE");
-        if(!enabled || !std::atoi(enabled) || nk>8 || g->ne[0]>MAX_EMBD ||
+        if(active.empty() || !enabled || !std::atoi(enabled) || nk>8 || g->ne[0]>MAX_EMBD ||
            !compatible(g,u,d,nk))return false;
         init(g,u,d,nk);
-        if(!fused_mxfp4 || cache_ptrs.empty())return false;
+        if((!fused_mxfp4 && !v41) || cache_ptrs.empty())return false;
         // The service's background admission must retire before borrowing its
         // slots. Once leased, host policy and GPU readers both exclude them.
         drain();
@@ -966,6 +966,23 @@ public:
             layer=layers.size();GGML_ASSERT(layer<MAX_LAYERS);
             layers.push_back({*g,*u,*d});layer_ids[g->data]=layer;
         } else layer=found->second;
+        const bool complementary=ggml_dsv4f_host_weights.resident_many && ggml_dsv4f_host_weights.discard;
+        // Inspect all three planes in one snapshot. In tiered mode the GPU
+        // holds SSD-only experts; RAM-covered slots are the first victims.
+        std::vector<bool> ram_keys(MAX_LAYERS*MAX_EXPERTS,false);
+        if(complementary) {
+            std::vector<int> keys;
+            for(const auto & s:slots)if(s.key>=0)keys.push_back(s.key);
+            for(int e:active)keys.push_back(layer*MAX_EXPERTS+e);
+            std::sort(keys.begin(),keys.end());keys.erase(std::unique(keys.begin(),keys.end()),keys.end());
+            std::vector<const void *> pointers;std::vector<size_t> sizes;
+            for(int key:keys)for(const auto * t:{&layers[key/MAX_EXPERTS].g,&layers[key/MAX_EXPERTS].u,&layers[key/MAX_EXPERTS].d}) {
+                pointers.push_back((const char *)t->data+size_t(key%MAX_EXPERTS)*t->nb[2]);sizes.push_back(t->nb[2]);
+            }
+            auto present=std::make_unique<bool[]>(pointers.size());
+            ggml_dsv4f_host_weights.resident_many(pointers.data(),sizes.data(),present.get(),pointers.size());
+            for(size_t i=0;i<keys.size();++i)ram_keys[keys[i]]=present[3*i] && present[3*i+1] && present[3*i+2];
+        }
         std::vector<int> location(g->ne[2],-1);
         for(size_t i=0;i<slots.size();++i) {
             const int key=slots[i].key;
@@ -975,34 +992,53 @@ public:
         std::vector<int> ordered=active;
         std::stable_partition(ordered.begin(),ordered.end(),[&](int e){return location[e]>=0;});
         int nhits=0;for(int e:ordered)nhits+=location[e]>=0;
+        if(complementary)std::stable_partition(ordered.begin()+nhits,ordered.end(),[&](int e){return ram_keys[layer*MAX_EXPERTS+e];});
         std::vector<bool> pinned(slots.size(),false);
         for(int e:ordered)if(location[e]>=0)pinned[location[e]]=true;
         // Only ring positions actually used by misses need replacement slots.
         std::vector<int> ring(2*group,-1),final_key(2*group,-1),victims;
-        for(size_t i=nhits;i<ordered.size();++i)final_key[i%(2*group)]=layer*MAX_EXPERTS+ordered[i];
-        int needed=0;for(int key:final_key)needed+=key>=0;
+        const int needed=std::min<int>(2*group,ordered.size()-nhits);
         for(size_t i=0;i<slots.size();++i)if(!pinned[i] && slots[i].ready)victims.push_back(i);
         if(int(victims.size())<needed)return false;
         std::stable_sort(victims.begin(),victims.end(),[&](int a,int b) {
             const bool empty_a=slots[a].key<0,empty_b=slots[b].key<0;
-            return empty_a!=empty_b?empty_a:policy.score(slots[a].key)<policy.score(slots[b].key);
+            if(empty_a!=empty_b)return empty_a;
+            if(complementary && !empty_a && ram_keys[slots[a].key]!=ram_keys[slots[b].key])return bool(ram_keys[slots[a].key]);
+            return policy.score(slots[a].key)<policy.score(slots[b].key);
         });
+        // Fill unused capacity with dedicated SSD-only experts instead of
+        // repeatedly overwriting only the 2*group staging ring. Once full,
+        // preserve the other layers' SSD coverage during dense scans.
+        std::vector<int> assigned(ordered.size(),-1);
+        size_t next=needed;
+        for(size_t i=nhits;i<ordered.size();++i) {
+            const int key=layer*MAX_EXPERTS+ordered[i];
+            if(complementary && !ram_keys[key] && next<victims.size() &&
+               (slots[victims[next]].key<0 || ram_keys[slots[victims[next]].key]))assigned[i]=victims[next++];
+            else final_key[i%(2*group)]=key;
+        }
         prefill_changes.clear();
         auto lease=[&](int index,int key) {
             prefill_changes.insert(prefill_changes.end(),{index,slots[index].key,key});
             slots[index].ready=false;
         };
-        int next=0;
+        int ring_next=0;
         for(int i=0;i<2*group;++i)if(final_key[i]>=0) {
-            ring[i]=victims[next++];lease(ring[i],final_key[i]);
+            ring[i]=victims[ring_next++];
+            // Staging slots turn over at every layer. Keep their host copies
+            // and return the slots empty; only dedicated slots own SSD-only
+            // residency. Otherwise a small active set never fills RAM and is
+            // reread from SSD every time another layer reuses the ring.
+            lease(ring[i],complementary?-1:final_key[i]);
         }
-        output={};output.hits=nhits;output.borrowed=needed;
+        output={};output.hits=nhits;output.borrowed=ring_next;
         output.up_offset=uo;output.down_offset=doff;
         for(size_t i=0;i<ordered.size();++i) {
             const int hit=location[ordered[i]];
             if(hit>=0)lease(hit,layer*MAX_EXPERTS+ordered[i]);
+            else if(assigned[i]>=0){lease(assigned[i],layer*MAX_EXPERTS+ordered[i]);++output.borrowed;}
             output.resident.push_back(hit>=0);
-            output.experts.push_back(cache_ptrs[hit>=0?hit:ring[i%(2*group)]]);
+            output.experts.push_back(cache_ptrs[hit>=0?hit:assigned[i]>=0?assigned[i]:ring[i%(2*group)]]);
         }
         active=std::move(ordered);
         prefill_leased=true;
@@ -1017,7 +1053,15 @@ public:
         // admission, memory reclamation, graph capture, or another backend.
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::lock_guard<std::mutex> lock(mutex);
-        for(size_t i=0;i<prefill_changes.size();i+=3)policy.publish(prefill_changes[i],prefill_changes[i+2]);
+        for(size_t i=0;i<prefill_changes.size();i+=3) {
+            const int key=prefill_changes[i+2];
+            policy.publish(prefill_changes[i],key);
+            if(key>=0 && ggml_dsv4f_host_weights.discard) {
+                const auto & l=layers[key/MAX_EXPERTS];
+                for(const auto * t:{&l.g,&l.u,&l.d})ggml_dsv4f_host_weights.discard(
+                    (const char *)t->data+size_t(key%MAX_EXPERTS)*t->nb[2],t->nb[2]);
+            }
+        }
         prefill_lease<<<(prefill_changes.size()/3+127)/128,128,0,copy>>>(readers,table,prefill_updates,prefill_changes.size()/3,true);
         CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
         prefill_changes.clear();prefill_leased=false;

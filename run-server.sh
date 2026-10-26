@@ -184,6 +184,14 @@ fi
 export DSV4F_PHASE_WORKSPACE=${DSV4F_PHASE_WORKSPACE:-1}
 export DSV4F_DECODE_BATCH=${DSV4F_DECODE_BATCH:-512}
 export DSV4F_DECODE_UBATCH=${DSV4F_DECODE_UBATCH:-256}
+if ((ram_budget_mib)); then
+    if [[ ! $DSV4F_DECODE_UBATCH =~ ^[0-9]{1,10}$ ]] || ((10#$DSV4F_DECODE_UBATCH < 4 || 10#$DSV4F_DECODE_UBATCH > 4294967295)); then
+        echo 'DSV4F_DECODE_UBATCH must be an integer in 4..4294967295.' >&2; exit 1
+    fi
+    export DSV4F_DECODE_BATCH=$DSV4F_DECODE_UBATCH
+    export BATCH_SIZE=1024 UBATCH_SIZE=1024
+    export DSV4F_PHASE_WORKSPACE=1
+fi
 # Expert lookahead: 0 off, 1/2 temporal, 3/4 early-router shadow/copy, 5 cache protection.
 export DSV4F_EXPERT_LOOKAHEAD=${DSV4F_EXPERT_LOOKAHEAD:-0}
 case "$DSV4F_EXPERT_LOOKAHEAD" in 0|1|2|3|4|5) ;; *) echo 'DSV4F_EXPERT_LOOKAHEAD must be 0..5.' >&2; exit 1;; esac

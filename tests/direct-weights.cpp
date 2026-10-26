@@ -64,6 +64,33 @@ int main() {
     preload=dsv4f_preload_experts();
     require(!preload.planes && !preload.read_bytes,"zero budget performed preload");
     setenv("DSV4F_RAM_BUDGET_MIB","131072",1);
+    // GPU handoff drops duplicate RAM copies without invalidating live DMA
+    // leases. Residency queries must neither read SSD nor promote transient data.
+    require(ggml_dsv4f_host_weights.resident_many && ggml_dsv4f_host_weights.discard,"GPU handoff API");
+    {
+        const void * pointers[]={t->data,(char*)t->data+plane*63};
+        size_t sizes[]={plane,plane};bool present[2]{};
+        ggml_dsv4f_host_weights_stats before{},after{};
+        ggml_dsv4f_host_weights.statistics(&before);
+        ggml_dsv4f_host_weights.resident_many(pointers,sizes,present,2);
+        require(present[0] && !present[1],"residency snapshot");
+        sizes[0]++;ggml_dsv4f_host_weights.resident_many(pointers,sizes,present,2);
+        require(!present[0],"residency accepted partial plane");sizes[0]--;
+        {
+            ggml_dsv4f_host_lease first(t->data,plane),second(t->data,plane);
+            ggml_dsv4f_host_weights.discard(t->data,plane);
+            ggml_dsv4f_host_weights.resident_many(pointers,sizes,present,2);
+            require(!present[0],"handoff still advertises RAM residency");
+            require(first.data==second.data && !std::memcmp(first.data,expected.data()+offset,plane),"handoff invalidated live leases");
+        }
+        ggml_dsv4f_host_weights.statistics(&after);
+        require(after.reads==before.reads && !after.transient_bytes,"handoff read SSD or leaked a lease");
+        require(before.resident_bytes-after.resident_bytes==allocated_plane,"handoff did not return RAM");
+        ggml_dsv4f_host_weights.discard((char*)t->data+plane,plane);
+        pointers[0]=(char*)t->data+plane;
+        ggml_dsv4f_host_weights.resident_many(pointers,sizes,present,2);
+        require(!present[0],"idle handoff retained RAM");
+    }
     // Cold loads for distinct experts may run concurrently. Requests for the
     // same cold expert coalesce onto one in-flight read and share its lease.
     for(bool same:{false,true}) {

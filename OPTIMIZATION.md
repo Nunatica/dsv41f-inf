@@ -36,9 +36,9 @@ The default format ceilings divide the aggregate budget in an **8:1:5** ratio. C
 
 ## Redistributing workspace and cache capacity by phase
 
-Prefill processes many tokens at once and needs large activations, matrix-multiplication buffers, and expert staging space. Decode processes only a few tokens, allowing smaller workspaces and more VRAM for the expert cache. `DSV4F_PHASE_WORKSPACE=1` switches graph reservation sizes between these phases.
+With `DSV4F_RAM_BUDGET_MIB=0`, prefill processes many tokens at once and needs large activations, matrix-multiplication buffers, and expert staging space. Decode processes only a few tokens, allowing smaller workspaces and more VRAM for the expert cache. `DSV4F_PHASE_WORKSPACE=1` switches graph reservation sizes between these phases. With a positive RAM budget, phase switching stays enabled and the prefill batch/ubatch are capped at 1024. Decode uses `DSV4F_DECODE_UBATCH` for both ceilings.
 
-The launcher defaults to a prefill batch and ubatch of 4096 each. Decode lowers the batch ceiling to 512 and the ubatch ceiling to 256, but **actual decode graph workspace reservation is limited to four tokens**. Ordinary token decode with at most four input tokens and small inputs in an MTP context use this path. Larger inputs return to the prefill workspace. Embedding inputs in an ordinary context have an additional eligibility condition.
+The launcher defaults to a prefill batch and ubatch of 4096 each in resident mode, or 1024 each with a positive RAM budget. Decode lowers the batch ceiling to 512 and the ubatch ceiling to 256, but **actual decode graph workspace reservation is limited to four tokens**. Ordinary token decode with at most four input tokens and small inputs in an MTP context use this path. Larger inputs return to the prefill workspace. Embedding inputs in an ordinary context have an additional eligibility condition.
 
 A phase transition synchronizes outstanding computation, releases the previous graphs and scheduler, trims backend temporary-memory pools, and reserves the graph needed for the new phase. V4.1 manages its cache as reclaimable blocks, so returning to prefill does not require evicting every expert first. The allocator reclaims enough capacity for the new workspace and then grows the cache into the remaining space.
 
@@ -53,8 +53,8 @@ When an engine workspace allocation needs more room, expert-cache blocks can be 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `DSV4F_PHASE_WORKSPACE` | `1` | Enables workspace switching by phase |
-| `BATCH_SIZE` / `UBATCH_SIZE` | `4096` / `4096` | Prefill batch and ubatch sizes |
-| `DSV4F_DECODE_BATCH` / `DSV4F_DECODE_UBATCH` | `512` / `256` | Decode batch and ubatch ceilings |
+| `BATCH_SIZE` / `UBATCH_SIZE` | `4096` / `4096` | Resident prefill sizes; positive RAM budgets use `1024` / `1024` |
+| `DSV4F_DECODE_BATCH` / `DSV4F_DECODE_UBATCH` | `512` / `256` | Decode ceilings; positive RAM budgets use the ubatch ceiling for both decode batch sizes |
 | `DSV4F_VRAM_HEADROOM_MIB` | `256` | VRAM headroom; the implementation enforces a minimum of 128 MiB |
 | `DSV4F_VRAM_GUARD_MIB` | `256` | Additional allowance for library and similar allocations |
 
@@ -64,7 +64,7 @@ Prefill groups routed token rows by expert for GPU matrix multiplication. Rather
 
 This path is configured through `DSV4F_PREFILL_STREAM=1` and `DSV4F_PREFILL_GROUP=16`. PTQ1_0 weights are converted on the GPU to a Q2_0 staging representation for the MMQ path. Staging and conversion scratch are graph operands, so their reservations are included when budgeting VRAM alongside the expert cache. The V4.1 graph reuses scratch across layers.
 
-The optional `DSV4F_PREFILL_CACHE=1` path reuses resident experts and borrows cache slots. It defaults to `0`. When enabled, it is attempted only for inputs meeting `DSV4F_PREFILL_CACHE_MIN_TOKENS` (default 4096). Borrowed slots are published back to the decode cache after the layer finishes computing.
+With resident weights, the optional `DSV4F_PREFILL_CACHE=1` path reuses resident experts and borrows cache slots only for inputs meeting `DSV4F_PREFILL_CACHE_MIN_TOKENS` (default 4096). With a positive RAM budget, cache reuse is automatic for every streamed prefill, including microbatches smaller than that threshold. Empty slots and RAM-covered victims admit SSD-only experts into dedicated slots; other misses pass through the bounded staging ring. Cache entries retain native MXFP4/Q3/Q2/PTQ weights for decode. PTQ expands into Q2 staging on the GPU for prefill. Dedicated slots are published after the layer finishes computing and their duplicate RAM planes are released. Staging slots return empty and keep their host copies, so reusing the ring for another layer does not force SSD rereads. Host scan reads preserve the remaining RAM set instead of evicting it on each dense pass.
 
 Implementation: [phase-specific graph reservation](vendor/llama.cpp/src/llama-context.cpp), [VRAM budgeting](vendor/llama.cpp/ggml/src/ggml-cuda/dsv4f-memory.cuh), [cache reclamation and growth](vendor/llama.cpp/ggml/src/ggml-cuda/dsv4f-service.cu), [prefill streaming](vendor/llama.cpp/ggml/src/ggml-cuda/dsv4f-prefill.cu), [scratch layout](vendor/llama.cpp/ggml/src/ggml-dsv4f-prefill.h).
 

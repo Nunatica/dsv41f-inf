@@ -89,6 +89,8 @@ DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 
 Set the budget before starting a new server. The native engine also selects direct expert loading when this variable is positive; use the launcher (or supply a cgroup yourself) to enforce the total-process hard limit. `state/server.json` records the requested/effective budgets, tier mode and cgroup counters at readiness. An inherited tighter cgroup ceiling is also passed to the native RAM cache. With `DSV4F_RAM_BUDGET_MIB=0`, swap protection remains required and the previous full-model RAM availability check applies.
 
+With a positive RAM budget, the launcher enables phase workspace reallocation and uses a prefill batch/ubatch of `1024`. The native context also caps tiered prefill at `1024`. Decode uses `DSV4F_DECODE_UBATCH` (default `256`) for both its batch and ubatch ceilings. Prefill automatically uses the VRAM expert cache for MXFP4, Q3, Q2 and PTQ experts, prioritizing experts absent from RAM and releasing their duplicate RAM copies after uploads complete. Overflow host reads use a bounded streaming window to preserve the RAM resident set. PTQ stays compressed in the cache and expands on the GPU for prefill.
+
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 
 ```bash

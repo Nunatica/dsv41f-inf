@@ -30,6 +30,9 @@ int main() {
         p.unprotect(10);require(p.protected_key(10),"overlapping leases retain protection");
         p.unprotect(10);require(p.select(&hot,1,pending).index==0,"last lease expiry permits eviction");
         p.unprotect(11);
+        p.publish(0,-1);
+        require(!p.contains(10) && p.slots[0].ready,"prefill staging slot returns empty and reusable");
+        p.publish(0,10);
         ggml_dsv4f_lookahead_guard guard(p);
         guard.begin(1);guard.add(1,10);guard.consume(1);
         require(p.protected_key(10),"forecast survives current token's route");

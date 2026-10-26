@@ -1067,7 +1067,7 @@ static __global__ void mul_mat_q(
 
         const char * tile_x = x;
         int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-        if constexpr (type == GGML_TYPE_MXFP4) {
+        if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q2_0) {
             if (expert_ptrs) {
                 tile_x = expert_ptrs[zt] + expert_offset;
                 offset_x = it*I*stride_row_x;
@@ -1168,7 +1168,7 @@ static __global__ void mul_mat_q(
 
         const char * tile_x = x;
         int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-        if constexpr (type == GGML_TYPE_MXFP4) {
+        if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q2_0) {
             if (expert_ptrs) {
                 tile_x = expert_ptrs[zt] + expert_offset;
                 offset_x = it*I*stride_row_x;
@@ -1259,7 +1259,7 @@ static __global__ void mul_mat_q(
 
     const char * tile_x = x;
     int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-    if constexpr (type == GGML_TYPE_MXFP4) {
+    if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q2_0) {
         if (expert_ptrs) {
             tile_x = expert_ptrs[zt] + expert_offset;
             offset_x = it*I*stride_row_x;

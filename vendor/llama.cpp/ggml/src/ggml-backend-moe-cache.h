@@ -152,6 +152,11 @@ struct ggml_dsv4f_host_weights_api {
     // Transient allocations remain leased through H2D, then return to the OS.
     void (*acquire_prefill)(const void * const *, const size_t *, const void **, size_t);
     void (*statistics)(struct ggml_dsv4f_host_weights_stats *);
+    // Snapshot complete-plane residency without touching LRU or reading SSD.
+    void (*resident_many)(const void * const *, const size_t *, bool *, size_t);
+    // Hand a plane to the GPU cache. Live CPU/DMA leases remain valid, but
+    // its RAM copy is removed at the last release (or immediately if idle).
+    void (*discard)(const void *, size_t);
 };
 #ifdef __cplusplus
 extern "C" {

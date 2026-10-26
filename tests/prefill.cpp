@@ -8,16 +8,40 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
+#include <unordered_set>
 #include <vector>
 
+// Model a host cache large enough for staging misses. GPU handoff removes
+// ownership from RAM; all other planes must survive ring reuse across layers.
+static std::unordered_set<const void *> host_resident;
+static std::mutex host_mutex;
+static uint64_t host_reads=0;
+static ggml_type weight_type=GGML_TYPE_MXFP4;
+static const void * host_acquire(const void * p,size_t) {
+    std::lock_guard<std::mutex> lock(host_mutex);
+    if(host_resident.insert(p).second)++host_reads;
+    return p;
+}
+static void host_release(const void *) {}
+static void host_many(const void * const * p,const size_t * n,const void ** out,size_t count) {
+    for(size_t i=0;i<count;++i)out[i]=host_acquire(p[i],n[i]);
+}
+static void host_present(const void * const * p,const size_t *,bool * out,size_t count) {
+    std::lock_guard<std::mutex> lock(host_mutex);
+    for(size_t i=0;i<count;++i)out[i]=host_resident.count(p[i]);
+}
+static void host_discard(const void * p,size_t) {std::lock_guard<std::mutex> lock(host_mutex);host_resident.erase(p);}
+
 static bool check(ggml_backend_t gpu, ggml_backend_t cpu, int nt, float limit, int ne=512, int nf=512, int nex=37) {
+    host_resident.clear();host_reads=0;
     const int nk=std::min(6,nex);
     const int depth=nt==257?3:1;
     ggml_context * wc=ggml_init({2*1024*1024,nullptr,true});
-    auto * g=ggml_new_tensor_3d(wc,GGML_TYPE_MXFP4,ne,nf,nex);
+    auto * g=ggml_new_tensor_3d(wc,weight_type,ne,nf,nex);
     auto * u=ggml_dup_tensor(wc,g);
-    auto * d=ggml_new_tensor_3d(wc,GGML_TYPE_MXFP4,nf,ne,nex);
+    auto * d=ggml_new_tensor_3d(wc,weight_type,nf,ne,nex);
     auto * wb=ggml_backend_alloc_ctx_tensors_from_buft(wc,ggml_backend_dev_host_buffer_type(ggml_backend_get_device(gpu)));
     ggml_backend_buffer_set_usage(wb,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::mt19937 rng(731); std::normal_distribution<float> normal(0,.08f);
@@ -72,6 +96,7 @@ static bool check(ggml_backend_t gpu, ggml_backend_t cpu, int nt, float limit, i
     bool ok=true; double worst=0;
     std::vector<float> input(ne*nt), weights(nk*nt), a(ne*nt), b(ne*nt);std::vector<int32_t> selected(nk*nt);
     const int sparse[]={0,3,7,12,18,21,29};
+    uint64_t cold_reads=0;
     for(int step=0;step<8;++step) {
         for(auto & v:input)v=normal(rng)*20;
         for(int t=0;t<nt;++t)for(int j=0;j<nk;++j) {
@@ -90,6 +115,14 @@ static bool check(ggml_backend_t gpu, ggml_backend_t cpu, int nt, float limit, i
         double error=0,norm=0;
         for(size_t i=0;i<a.size();++i){error+=double(a[i]-b[i])*(a[i]-b[i]);norm+=double(a[i])*a[i];ok&=std::isfinite(b[i]);}
         const double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.003;
+        if(ggml_dsv4f_host_weights.resident_many) {
+            if(!step)cold_reads=host_reads;
+            else if(host_reads!=cold_reads) {
+                std::fprintf(stderr,"Staging ring lost RAM coverage: step=%d reads=%llu cold=%llu\n",step,
+                             (unsigned long long)host_reads,(unsigned long long)cold_reads);
+                ok=false;
+            }
+        }
     }
     if(depth==1 && std::getenv("DSV4F_GPU_SERVICE")) {
         // Return leased slots to the ordinary decode kernels, including GPU
@@ -130,6 +163,13 @@ int main(int argc, char ** argv) {
         setenv("DSV4F_PREFILL_CACHE","1",1);
         setenv("DSV4F_PREFILL_CACHE_MIN_TOKENS",boundary?"4096":"32",1);
         setenv("DSV4F_PREFILL_GROUP","4",1);
+        if(!std::strncmp(argv[1],"tiered",6)) {
+            if(!std::strcmp(argv[1],"tiered-q3"))weight_type=GGML_TYPE_Q3_K;
+            if(!std::strcmp(argv[1],"tiered-q2"))weight_type=GGML_TYPE_Q2_0;
+            ggml_dsv4f_host_weights.acquire=host_acquire;ggml_dsv4f_host_weights.release=host_release;
+            ggml_dsv4f_host_weights.acquire_many=ggml_dsv4f_host_weights.acquire_prefill=host_many;
+            ggml_dsv4f_host_weights.resident_many=host_present;ggml_dsv4f_host_weights.discard=host_discard;
+        }
     }
     setenv("GGML_CUDA_MOE_CACHE","0",1);
     ggml_backend_load_all();ggml_cpu_init();

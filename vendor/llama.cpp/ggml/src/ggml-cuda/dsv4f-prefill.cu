@@ -35,6 +35,7 @@ bool batched_host_reads() {
     return value;
 }
 bool scan_host_reads() {
+    if(ggml_dsv4f_host_weights.resident_many)return true;
     static const bool value=[] {
         const char * v=std::getenv("DSV4F_PREFILL_SCAN_CACHE");
         if(!v || !std::strcmp(v,"0"))return false;
@@ -251,8 +252,9 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     const char * cache_env = std::getenv("DSV4F_PREFILL_CACHE");
     const char * min_env = std::getenv("DSV4F_PREFILL_CACHE_MIN_TOKENS");
     const int min_tokens = min_env ? std::max(1, std::atoi(min_env)) : 4096;
-    const bool cached = cache_env && std::atoi(cache_env) != 0 && nt >= min_tokens && ctx.device == 0 &&
+    const bool cached = (ggml_dsv4f_host_weights.resident_many || (cache_env && std::atoi(cache_env) != 0 && nt >= min_tokens)) && ctx.device == 0 &&
         ggml_dsv4f_prefill_cache_begin(g, u, d, nk, group, active, cache_plan);
+    const bool direct_cache=cached && g->type!=GGML_TYPE_PTQ1_0;
     auto ** expert_ptrs = (const char **) (scratch+layout.expert_ptrs);
     if (cached) {
         // Synchronous metadata copy: vector storage may be destroyed on return.
@@ -299,17 +301,33 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
                 if (cache_plan.resident[first+j]) continue;
                 char * target = const_cast<char *>(cache_plan.experts[first+j]);
                 const int expert = active[first+j];
-                const void * gl=leases.acquire((const char*)g->data+expert*layout.gbytes,layout.gbytes);
-                const void * ul=leases.acquire((const char*)u->data+expert*layout.ubytes,layout.ubytes);
-                const void * dl=leases.acquire((const char*)d->data+expert*layout.dbytes,layout.dbytes);
+                const void * gl=leases.acquire((const char*)g->data+expert*g->nb[2],g->nb[2]);
+                const void * ul=leases.acquire((const char*)u->data+expert*u->nb[2],u->nb[2]);
+                const void * dl=leases.acquire((const char*)d->data+expert*d->nb[2],d->nb[2]);
                 CUDA_CHECK(cudaMemcpyAsync(target, gl,
-                    layout.gbytes, cudaMemcpyHostToDevice, state.copy));
+                    g->nb[2], cudaMemcpyHostToDevice, state.copy));
                 CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, ul,
-                    layout.ubytes, cudaMemcpyHostToDevice, state.copy));
+                    u->nb[2], cudaMemcpyHostToDevice, state.copy));
                 CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, dl,
-                    layout.dbytes, cudaMemcpyHostToDevice, state.copy));
+                    d->nb[2], cudaMemcpyHostToDevice, state.copy));
                 leases.copied(state.copy);
-                copied += layout.gbytes+layout.ubytes+layout.dbytes;
+                copied += g->nb[2]+u->nb[2]+d->nb[2];
+            }
+            // Keep PTQ in its native cache representation for decode, and
+            // expand to the existing Q2 MMQ staging ring entirely on device.
+            if(!direct_cache) {
+                size_t stage_offset=0;
+                for(const auto * tensor:{g,u,d}) {
+                    const size_t source_offset=tensor==g?0:tensor==u?cache_plan.up_offset:cache_plan.down_offset;
+                    const size_t bytes=ggml_dsv4f_prefill_layout::stage_bytes(tensor);
+                    const int64_t nb=ggml_nelements(tensor)/tensor->ne[2]/128;
+                    for(int j=0;j<count;++j) {
+                        const auto * source=(const uint8_t *)cache_plan.experts[first+j]+source_offset;
+                        dsv4f_ptq_to_q2<<<(nb*32+255)/256,256,0,state.copy>>>(source,(block_q2_0 *)(stage+stage_offset+j*bytes),nb);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    stage_offset+=group*bytes;
+                }
             }
             CUDA_CHECK(cudaEventRecord(state.ready[slot], state.copy));
             leases.retire(state.copy);
@@ -358,8 +376,8 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         for (int j = 0; j < count; ++j) max_rows = std::max(max_rows, counts[active[first+j]]);
         const char * stage = scratch+layout.stage+slot*layout.stage_stride;
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), state.ready[slot], 0));
-        product(ctx, stage, xq, gate, identity, bounds+first, count, max_rows, nr, ne, nf, layout.gbytes, g->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:g->type, cached ? expert_ptrs+first : nullptr);
-        product(ctx, stage+group*layout.gbytes, xq, up, identity, bounds+first, count, max_rows, nr, ne, nf, layout.ubytes, u->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:u->type, cached ? expert_ptrs+first : nullptr, cache_plan.up_offset);
+        product(ctx, stage, xq, gate, identity, bounds+first, count, max_rows, nr, ne, nf, layout.gbytes, g->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:g->type, direct_cache ? expert_ptrs+first : nullptr);
+        product(ctx, stage+group*layout.gbytes, xq, up, identity, bounds+first, count, max_rows, nr, ne, nf, layout.ubytes, u->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:u->type, direct_cache ? expert_ptrs+first : nullptr, cache_plan.up_offset);
         activate<<<(int64_t(rows)*nf+255)/256, 256, 0, ctx.stream()>>>(gate, up, int64_t(r0)*nf, int64_t(rows)*nf, limit);
         // MMQ stores [K block][sorted row], not independent row-major byte
         // strings. Scatter this group's hidden rows using the full-layer row
@@ -367,7 +385,7 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         quantize_scatter_mmq_q8_1_cuda(gate+int64_t(r0)*nf, identity+r0, hq, stage_type,
                                      nf, nf, GGML_PAD(nf, 512), rows, nr, 1, ctx.stream());
         product(ctx, stage+group*(layout.gbytes+layout.ubytes), hq, down, identity, bounds+first,
-                count, max_rows, nr, nf, ne, layout.dbytes, d->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:d->type, cached ? expert_ptrs+first : nullptr, cache_plan.down_offset);
+                count, max_rows, nr, nf, ne, layout.dbytes, d->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:d->type, direct_cache ? expert_ptrs+first : nullptr, cache_plan.down_offset);
         CUDA_CHECK(cudaEventRecord(state.used[slot], ctx.stream()));
         if (gi+2 < groups) upload(gi+2);
     }

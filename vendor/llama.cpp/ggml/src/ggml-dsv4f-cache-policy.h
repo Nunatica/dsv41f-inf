@@ -62,7 +62,7 @@ public:
     }
     void publish(int index,int key) {
         if(slots[index].key>=0)location[slots[index].key]=-1;
-        slots[index]={key,true};location[key]=index;
+        slots[index]={key,true};if(key>=0)location[key]=index;
     }
     decision select(const int * misses,int n,const std::unordered_set<int> & pending) {
         if(slots.empty())return {};

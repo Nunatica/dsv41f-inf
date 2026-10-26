@@ -104,6 +104,7 @@ struct entry {
     std::unique_ptr<region> storage;
     const void * pointer=nullptr;
     size_t users=0;
+    size_t bytes=0;
     source * owner=nullptr;
     bool transient=false;
     std::list<uintptr_t>::iterator age;
@@ -256,7 +257,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
         read_aligned(span.fd,storage->data,total,offset-delta,delta+n);
         const void * output=(char*)storage->data+delta;
         c.ages.push_back(key);
-        entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.owner=owner;e.age=std::prev(c.ages.end());
+        entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.bytes=n;e.owner=owner;e.age=std::prev(c.ages.end());
         c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
         if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
         return output;
@@ -274,7 +275,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
     }
     const void * output=(char*)request->storage->data+delta;
     c.ages.push_back(key);
-    entry e;e.storage=std::move(request->storage);e.pointer=output;e.users=request->users;e.owner=owner;e.age=std::prev(c.ages.end());
+    entry e;e.storage=std::move(request->storage);e.pointer=output;e.users=request->users;e.bytes=n;e.owner=owner;e.age=std::prev(c.ages.end());
     c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
     request->pointer=output;request->done=true;c.loads.erase(key);
     if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
@@ -472,7 +473,7 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
     for(const auto & r:reads) {
         if(error){fail(r,error);continue;}
         const void * p=(char*)r.request->storage->data+r.delta;c.ages.push_back(r.key);
-        entry e;e.storage=std::move(r.request->storage);e.pointer=p;e.users=r.request->users;
+        entry e;e.storage=std::move(r.request->storage);e.pointer=p;e.users=r.request->users;e.bytes=r.required-r.delta;
         e.owner=r.request->owner;e.age=std::prev(c.ages.end());e.transient=r.request->transient;
         c.entries.emplace(r.key,std::move(e));c.leases.emplace(p,r.key);
         c.reserved-=r.bytes;c.used+=r.bytes;++c.reads;c.bytes+=r.bytes;
@@ -497,6 +498,23 @@ void acquire_prefill(const void * const * p,const size_t * n,const void ** out,s
 void statistics(ggml_dsv4f_host_weights_stats * out) {
     auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
     *out={c.used-c.transient_used,c.transient_used,c.reads,c.bytes,c.evictions,c.transient_reads,c.transient_bytes};
+}
+void resident_many(const void * const * pointers,const size_t * sizes,bool * output,size_t count) {
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    for(size_t i=0;i<count;++i) {
+        auto it=c.entries.find((uintptr_t)pointers[i]);
+        output[i]=it!=c.entries.end() && !it->second.transient && it->second.bytes==sizes[i];
+    }
+}
+void discard(const void * pointer,size_t bytes) {
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    auto it=c.entries.find((uintptr_t)pointer);
+    if(it==c.entries.end() || it->second.bytes!=bytes)return;
+    if(!it->second.users)c.erase(it);
+    else if(!it->second.transient) {
+        it->second.transient=true;c.transient_used+=it->second.storage->bytes;
+    }
+    c.changed.notify_all();
 }
 void free_buffer(ggml_backend_buffer_t buffer) {
     auto * owner=(source*)buffer->context;
@@ -697,6 +715,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;ggml_dsv4f_host_weights.prefetch=prefetch;
     ggml_dsv4f_host_weights.acquire_many=acquire_many;
     ggml_dsv4f_host_weights.acquire_prefill=acquire_prefill;ggml_dsv4f_host_weights.statistics=statistics;
+    ggml_dsv4f_host_weights.resident_many=resident_many;ggml_dsv4f_host_weights.discard=discard;
     std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB, io_lock=%s\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30),unlocked_io()?"released":"held");
     owner.release();return b;
 }
