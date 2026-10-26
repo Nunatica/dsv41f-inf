@@ -19,6 +19,7 @@ int main() {
     setenv("DSV4F_RAM_BUDGET_MIB","131072",1);
     setenv("DSV4F_RAM_CACHE_MIB","1",1);
     setenv("DSV4F_RAM_RESERVE_MIB","4",1);
+    setenv("DSV4F_RAM_UNLOCK_IO","1",1);
     char path[]="/tmp/dsv4f-direct-XXXXXX";
     const int fd=mkstemp(path);require(fd>=0,"create fixture");
     constexpr size_t offset=123,plane=65536,count=64;
@@ -35,6 +36,22 @@ int main() {
     auto * ctx=ggml_init({1<<20,nullptr,true});require(ctx,"context");
     auto * t=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,128,128,count);
     auto * b=dsv4f_direct_weights_buffer({{t,fd,offset}});
+    // Cold loads for distinct experts may run concurrently. Requests for the
+    // same cold expert coalesce onto one in-flight read and share its lease.
+    for(bool same:{false,true}) {
+        std::atomic<int> ready{0};std::atomic<bool> go{false},ok{true};
+        std::vector<std::thread> threads;
+        for(int i=0;i<12;++i)threads.emplace_back([&,i] {
+            ++ready;while(!go.load(std::memory_order_acquire))std::this_thread::yield();
+            try {
+                const size_t eid=same?12:size_t(i);
+                ggml_dsv4f_host_lease lease((char*)t->data+eid*plane,plane);
+                if(std::memcmp(lease.data,expected.data()+offset+eid*plane,plane))ok=false;
+            } catch(...) {ok=false;}
+        });
+        while(ready.load()!=12)std::this_thread::yield();go.store(true,std::memory_order_release);
+        for(auto & thread:threads)thread.join();require(ok,same?"coalesced cold leases":"parallel cold leases");
+    }
     // A live lease survives many evictions and is shared by simultaneous readers.
     {
         ggml_dsv4f_host_lease first(t->data,plane);

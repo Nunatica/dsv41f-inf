@@ -100,7 +100,7 @@ def main():
                              'memory_budget_bytes': budget, 'requested_memory_budget_bytes': requested_budget, 'memory_tiers': 'vram/ram/direct-ssd' if budget else 'resident',
                              'cgroup': memory_state(),
                              'engine_options': {k: child_env[k] for k in (
-                                 'DSV4F_RAM_BUDGET_MIB', 'DSV4F_RAM_RESERVE_MIB', 'DSV4F_RAM_CACHE_MIB',
+                                 'DSV4F_RAM_BUDGET_MIB', 'DSV4F_RAM_RESERVE_MIB', 'DSV4F_RAM_CACHE_MIB', 'DSV4F_RAM_UNLOCK_IO',
                                  'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_VRAM_GUARD_MIB', 'DSV4F_EXPERT_CACHE_MIB',
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',

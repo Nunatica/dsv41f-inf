@@ -4,9 +4,11 @@
 #include "ggml-cpu.h"
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <list>
 #include <map>
@@ -33,6 +35,15 @@ uint64_t env_mib(const char * name,uint64_t fallback) {
         n=n*10+(*p-'0');
     }
     return n*MiB;
+}
+bool unlocked_io() {
+    static const bool value=[] {
+        const char * v=std::getenv("DSV4F_RAM_UNLOCK_IO");
+        if(!v || !std::strcmp(v,"1"))return true;
+        if(!std::strcmp(v,"0"))return false;
+        throw std::runtime_error("DSV4F_RAM_UNLOCK_IO must be 0 or 1");
+    }();
+    return value;
 }
 size_t rounded(size_t n) {
     if(n>SIZE_MAX-alignment)throw std::runtime_error("direct I/O size overflow");
@@ -65,7 +76,17 @@ struct source {
     struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;};
     std::map<uintptr_t,span> spans;
     std::vector<int> fds;
+    bool closing=false;
     ~source(){for(int fd:fds)close(fd);}
+};
+struct load {
+    std::unique_ptr<region> storage;
+    source * owner=nullptr;
+    const void * pointer=nullptr;
+    size_t users=1;
+    bool done=false;
+    std::exception_ptr error;
+    std::condition_variable ready;
 };
 struct entry {
     std::unique_ptr<region> storage;
@@ -76,11 +97,13 @@ struct entry {
 };
 struct cache {
     std::mutex mutex;
+    std::condition_variable changed;
     std::map<uintptr_t,source*> sources;
     std::map<uintptr_t,entry> entries;
+    std::map<uintptr_t,std::shared_ptr<load>> loads;
     std::map<const void*,uintptr_t> leases;
     std::list<uintptr_t> ages;
-    uint64_t used=0,hits=0,reads=0,bytes=0,evictions=0;
+    uint64_t used=0,reserved=0,hits=0,reads=0,bytes=0,evictions=0;
     ~cache()=default;
     uint64_t limit() const {
         const uint64_t budget=dsv4f_ram_budget();
@@ -108,12 +131,13 @@ struct cache {
 // Outlives model/backend static teardown; it contains no allocations after model unload.
 cache & pool(){static auto * p=new cache;return *p;}
 const void * acquire(const void * ptr,size_t n) {
-    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    auto & c=pool();std::unique_lock<std::mutex> lock(c.mutex);
     const auto key=(uintptr_t)ptr;
     auto s=c.sources.upper_bound(key);
     if(s==c.sources.begin())return ptr;
     --s;source * owner=s->second;
     if(key-s->first>=owner->address->bytes)return ptr;
+    if(owner->closing)throw std::runtime_error("direct weight source is closing");
     auto sp=owner->spans.upper_bound(key);
     if(sp==owner->spans.begin())throw std::runtime_error("invalid direct weight address");
     --sp;const auto & span=sp->second;
@@ -125,35 +149,69 @@ const void * acquire(const void * ptr,size_t n) {
         ++it->second.users;++c.hits;c.ages.splice(c.ages.end(),c.ages,it->second.age);
         return it->second.pointer;
     }
+    auto loading=c.loads.find(key);
+    if(loading!=c.loads.end()) {
+        auto request=loading->second;++request->users;
+        request->ready.wait(lock,[&]{return request->done;});
+        if(request->error)std::rethrow_exception(request->error);
+        ++c.hits;
+        return request->pointer;
+    }
     const uint64_t offset=span.offset+local;
     const size_t delta=offset%alignment,total=rounded(delta+n);
     const uint64_t cap=c.limit();
     if(total>cap)throw std::runtime_error("RAM budget has no room for an expert plane; reduce context/batch or reserve");
-    while(c.used>cap-total) {
+    while(c.used>cap-total || c.reserved>cap-total-c.used) {
         auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
         if(victim==c.ages.end())throw std::runtime_error("RAM expert cache is exhausted by active leases");
         c.erase(c.entries.find(*victim));
     }
     auto storage=std::make_unique<region>(total);
-    read_aligned(span.fd,storage->data,total,offset-delta,delta+n);
-    const void * output=(char*)storage->data+delta;
+    if(!unlocked_io()) {
+        read_aligned(span.fd,storage->data,total,offset-delta,delta+n);
+        const void * output=(char*)storage->data+delta;
+        c.ages.push_back(key);
+        entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.owner=owner;e.age=std::prev(c.ages.end());
+        c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
+        if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
+        return output;
+    }
+    auto request=std::make_shared<load>();request->storage=std::move(storage);request->owner=owner;
+    c.loads.emplace(key,request);c.reserved+=total;
+    lock.unlock();
+    try {read_aligned(span.fd,request->storage->data,total,offset-delta,delta+n);}
+    catch(...) {request->error=std::current_exception();}
+    lock.lock();c.reserved-=total;
+    if(request->error) {
+        request->storage.reset();request->done=true;c.loads.erase(key);
+        lock.unlock();request->ready.notify_all();c.changed.notify_all();
+        std::rethrow_exception(request->error);
+    }
+    const void * output=(char*)request->storage->data+delta;
     c.ages.push_back(key);
-    entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.owner=owner;e.age=std::prev(c.ages.end());
+    entry e;e.storage=std::move(request->storage);e.pointer=output;e.users=request->users;e.owner=owner;e.age=std::prev(c.ages.end());
     c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
+    request->pointer=output;request->done=true;c.loads.erase(key);
     if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
+    lock.unlock();request->ready.notify_all();c.changed.notify_all();
     return output;
 }
 void release(const void * ptr) {
     auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
     auto it=c.leases.find(ptr);if(it==c.leases.end())return;
-    auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);--e.users;
+    auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);if(!--e.users)c.changed.notify_all();
 }
 void free_buffer(ggml_backend_buffer_t buffer) {
     auto * owner=(source*)buffer->context;
     auto & c=pool();
-    {std::lock_guard<std::mutex> lock(c.mutex);
+    {std::unique_lock<std::mutex> lock(c.mutex);owner->closing=true;
+        c.changed.wait(lock,[&] {
+            for(const auto & item:c.loads)if(item.second->owner==owner)return false;
+            for(const auto & item:c.entries)if(item.second.owner==owner && item.second.users)return false;
+            return true;
+        });
         for(auto it=c.entries.begin();it!=c.entries.end();) {
-            if(it->second.owner==owner){GGML_ASSERT(!it->second.users);auto old=it++;c.erase(old);}else ++it;
+            if(it->second.owner==owner){auto old=it++;c.erase(old);}else ++it;
         }
         c.sources.erase((uintptr_t)owner->address->data);
         if(c.sources.empty())ggml_dsv4f_host_weights={};
@@ -208,6 +266,6 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     at=0;for(const auto & t:tensors){ggml_backend_tensor_alloc(b,t.tensor,(char*)owner->address->data+at);at+=rounded(ggml_nbytes(t.tensor));}
     c.sources.emplace((uintptr_t)owner->address->data,owner.get());
     ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;
-    std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30));
+    std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB, io_lock=%s\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30),unlocked_io()?"released":"held");
     owner.release();return b;
 }

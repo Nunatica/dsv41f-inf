@@ -4,6 +4,8 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Zero keeps the original resident loader; a positive process-tree budget enables tiering.
 export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-0}
 export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-4096}
+export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
+case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
 for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
     value=${!name}
     if [[ ! $value =~ ^[0-9]{1,10}$ ]] || ((10#$value > 16777216)); then
