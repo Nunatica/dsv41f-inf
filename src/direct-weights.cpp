@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -93,6 +94,7 @@ struct load {
     const void * pointer=nullptr;
     size_t users=1;
     bool done=false;
+    bool transient=false;
     std::exception_ptr error;
     std::condition_variable ready;
 };
@@ -101,6 +103,7 @@ struct entry {
     const void * pointer=nullptr;
     size_t users=0;
     source * owner=nullptr;
+    bool transient=false;
     std::list<uintptr_t>::iterator age;
 };
 struct cache {
@@ -117,6 +120,7 @@ struct cache {
     std::unordered_set<uintptr_t> prefetch_pending;
     std::vector<std::thread> prefetch_workers;
     uint64_t used=0,reserved=0,hits=0,reads=0,bytes=0,evictions=0;
+    uint64_t transient_used=0,transient_reserved=0,transient_reads=0,transient_bytes=0;
     uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
     ~cache()=default;
     uint64_t limit() const {
@@ -138,8 +142,18 @@ struct cache {
         return ceiling;
     }
     void erase(std::map<uintptr_t,entry>::iterator it) {
+        if(it->second.transient)transient_used-=it->second.storage->bytes;
+        else ++evictions;
         used-=it->second.storage->bytes;leases.erase(it->second.pointer);
-        ages.erase(it->second.age);entries.erase(it);++evictions;
+        ages.erase(it->second.age);entries.erase(it);
+    }
+    void release_locked(const void * ptr) {
+        auto lease=leases.find(ptr);if(lease==leases.end())return;
+        auto it=entries.find(lease->second);GGML_ASSERT(it!=entries.end() && it->second.users);
+        if(!--it->second.users) {
+            if(it->second.transient)erase(it);
+            changed.notify_all();
+        }
     }
 };
 // Outlives model/backend static teardown; it contains no allocations after model unload.
@@ -259,8 +273,7 @@ const void * acquire(const void * ptr,size_t n) {
 }
 void release(const void * ptr) {
     auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
-    auto it=c.leases.find(ptr);if(it==c.leases.end())return;
-    auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);if(!--e.users)c.changed.notify_all();
+    c.release_locked(ptr);
 }
 
 struct batch_read {
@@ -323,10 +336,10 @@ void read_batch(const batch_read * reads,size_t count) {
         read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
 }
 
-void acquire_many(const void * const * pointers,const size_t * sizes,const void ** output,size_t count) {
+void acquire_many_impl(const void * const * pointers,const size_t * sizes,const void ** output,size_t count,bool scan) {
     if(!count)return;
     // Preserve the lock-held diagnostic mode, and keep single-plane calls cheap.
-    if(count==1 || !unlocked_io()) {
+    if(!scan && (count==1 || !unlocked_io())) {
         size_t held=0;
         try{for(;held<count;++held)output[held]=acquire(pointers[held],sizes[held]);}
         catch(...){while(held)release(output[--held]);throw;}
@@ -336,17 +349,45 @@ void acquire_many(const void * const * pointers,const size_t * sizes,const void 
     std::vector<ticket> tickets(count);std::vector<batch_read> reads;reads.reserve(count);
     auto & c=pool();std::unique_lock<std::mutex> lock(c.mutex);
     const uint64_t cap=c.limit();
+    struct source_guard {
+        cache & c;
+        std::vector<source*> owners;
+        source_guard(cache & p,size_t n):c(p){owners.reserve(n);}
+        void retain(source * p){if(std::find(owners.begin(),owners.end(),p)==owners.end()){owners.push_back(p);++p->prefetches;}}
+        ~source_guard(){for(auto * p:owners){GGML_ASSERT(p->prefetches);--p->prefetches;}c.changed.notify_all();}
+    } sources(c,count);
+    uint64_t stream_room=0,resident_cap=cap;
+    if(scan) {
+        uint64_t batch_bytes=0;
+        for(size_t i=0;i<count;++i) {
+            if(sizes[i]>SIZE_MAX-alignment)throw std::runtime_error("prefill plane size overflow");
+            const size_t n=rounded(sizes[i]+alignment-1);
+            if(n>cap || batch_bytes>cap-n)throw std::runtime_error("prefill group exceeds RAM cache budget");
+            batch_bytes+=n;
+        }
+        // Keep a bounded streaming window INSIDE the expert cache allowance.
+        // Two groups cover the staging ring; ordinary group=16 needs <1 GiB.
+        stream_room=std::min(cap,std::max(2*batch_bytes,std::min<uint64_t>(1024*MiB,cap/4)));
+        resident_cap=cap-stream_room;
+        // Reclaim only when existing residency exceeds the new allowance
+        // (e.g. first prefill after decode, a smaller budget, larger group/KV).
+        while(c.used-c.transient_used+c.reserved-c.transient_reserved>resident_cap) {
+            auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){const auto & e=c.entries.at(k);return !e.transient && !e.users;});
+            if(victim==c.ages.end())break;
+            c.erase(c.entries.find(*victim));
+        }
+    }
     auto rollback=[&] {
         for(auto & t:tickets) {
             if(t.request && !t.request->done){GGML_ASSERT(t.request->users);--t.request->users;continue;}
             const void * p=t.request?t.request->pointer:t.pointer;
-            auto it=c.leases.find(p);
-            if(it!=c.leases.end()){auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);--e.users;}
+            c.release_locked(p);
         }
         c.changed.notify_all();
     };
     auto fail=[&](const batch_read & r,const std::exception_ptr & error) {
         r.request->error=error;r.request->storage.reset();r.request->done=true;
+        if(r.request->transient)c.transient_reserved-=r.bytes;
         c.reserved-=r.bytes;c.loads.erase(r.key);r.request->ready.notify_all();
     };
     try {
@@ -357,6 +398,7 @@ void acquire_many(const void * const * pointers,const size_t * sizes,const void 
             --s;source * owner=s->second;
             if(key-s->first>=owner->address->bytes){tickets[i].pointer=pointers[i];continue;}
             if(owner->closing)throw std::runtime_error("direct weight source is closing");
+            sources.retain(owner);
             auto sp=owner->spans.upper_bound(key);
             if(sp==owner->spans.begin())throw std::runtime_error("invalid direct weight address");
             --sp;const auto & span=sp->second;const size_t local=key-span.begin;
@@ -375,12 +417,37 @@ void acquire_many(const void * const * pointers,const size_t * sizes,const void 
             const size_t delta=offset%alignment,total=rounded(delta+n);
             if(total>cap)throw std::runtime_error("RAM budget has no room for a batched expert plane");
             while(c.used>cap-total || c.reserved>cap-total-c.used) {
-                auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
-                if(victim==c.ages.end())throw std::runtime_error("RAM expert batch is exhausted by active leases");
-                c.erase(c.entries.find(*victim));
+                if(!scan) {
+                    auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
+                    if(victim==c.ages.end())throw std::runtime_error("RAM expert batch is exhausted by active leases");
+                    c.erase(c.entries.find(*victim));
+                } else {
+                    if(c.used-c.transient_used+c.reserved-c.transient_reserved>resident_cap) {
+                        auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){const auto & e=c.entries.at(k);return !e.transient && !e.users;});
+                        if(victim!=c.ages.end()){c.erase(c.entries.find(*victim));continue;}
+                    }
+                    // Previous groups' copy callbacks can free transient space.
+                    // Do not evict the resident scan set to admit these misses.
+                    if(c.changed.wait_for(lock,std::chrono::seconds(30))==std::cv_status::timeout)
+                        throw std::runtime_error("prefill streaming window exhausted by active leases");
+                    if(owner->closing)throw std::runtime_error("direct weight source is closing");
+                }
+            }
+            // A callback/demand thread can acquire this key while a scan waits
+            // for streaming space. Recheck before registering a new load.
+            it=c.entries.find(key);
+            if(it!=c.entries.end()) {
+                ++it->second.users;++c.hits;c.ages.splice(c.ages.end(),c.ages,it->second.age);
+                tickets[i].pointer=it->second.pointer;continue;
+            }
+            loading=c.loads.find(key);
+            if(loading!=c.loads.end()) {
+                tickets[i].request=loading->second;++loading->second->users;++c.hits;continue;
             }
             auto request=std::make_shared<load>();request->storage=std::make_unique<region>(total);request->owner=owner;
+            request->transient=scan && c.used-c.transient_used+c.reserved-c.transient_reserved+total>resident_cap;
             c.loads.emplace(key,request);c.reserved+=total;tickets[i].request=request;
+            if(request->transient)c.transient_reserved+=total;
             reads.push_back({key,request,span.fd,offset-delta,delta,total,delta+n});
         }
     } catch(...) {
@@ -396,9 +463,10 @@ void acquire_many(const void * const * pointers,const size_t * sizes,const void 
         if(error){fail(r,error);continue;}
         const void * p=(char*)r.request->storage->data+r.delta;c.ages.push_back(r.key);
         entry e;e.storage=std::move(r.request->storage);e.pointer=p;e.users=r.request->users;
-        e.owner=r.request->owner;e.age=std::prev(c.ages.end());
+        e.owner=r.request->owner;e.age=std::prev(c.ages.end());e.transient=r.request->transient;
         c.entries.emplace(r.key,std::move(e));c.leases.emplace(p,r.key);
         c.reserved-=r.bytes;c.used+=r.bytes;++c.reads;c.bytes+=r.bytes;
+        if(r.request->transient){c.transient_reserved-=r.bytes;c.transient_used+=r.bytes;++c.transient_reads;c.transient_bytes+=r.bytes;}
         r.request->pointer=p;r.request->done=true;c.loads.erase(r.key);r.request->ready.notify_all();
         if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
     }
@@ -409,6 +477,16 @@ void acquire_many(const void * const * pointers,const size_t * sizes,const void 
     }
     for(size_t i=0;i<count;++i)output[i]=tickets[i].request?tickets[i].request->pointer:tickets[i].pointer;
     c.changed.notify_all();
+}
+void acquire_many(const void * const * p,const size_t * n,const void ** out,size_t count) {
+    acquire_many_impl(p,n,out,count,false);
+}
+void acquire_prefill(const void * const * p,const size_t * n,const void ** out,size_t count) {
+    acquire_many_impl(p,n,out,count,true);
+}
+void statistics(ggml_dsv4f_host_weights_stats * out) {
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    *out={c.used-c.transient_used,c.transient_used,c.reads,c.bytes,c.evictions,c.transient_reads,c.transient_bytes};
 }
 void free_buffer(ggml_backend_buffer_t buffer) {
     auto * owner=(source*)buffer->context;
@@ -545,6 +623,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     c.sources.emplace((uintptr_t)owner->address->data,owner.get());
     ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;ggml_dsv4f_host_weights.prefetch=prefetch;
     ggml_dsv4f_host_weights.acquire_many=acquire_many;
+    ggml_dsv4f_host_weights.acquire_prefill=acquire_prefill;ggml_dsv4f_host_weights.statistics=statistics;
     std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB, io_lock=%s\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30),unlocked_io()?"released":"held");
     owner.release();return b;
 }

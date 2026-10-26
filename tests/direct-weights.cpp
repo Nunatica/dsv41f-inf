@@ -114,6 +114,37 @@ int main() {
     bool rejected=false;
     try{ggml_dsv4f_host_lease invalid(t->data,plane+1);}catch(const std::runtime_error &){rejected=true;}
     require(rejected,"invalid range accepted");
+    // Repeated dense scans larger than the cache must keep a stable resident
+    // set. Overflow bytes disappear at last release; decode may evict normally.
+    require(ggml_dsv4f_host_weights.acquire_prefill && ggml_dsv4f_host_weights.statistics,"scan API");
+    ggml_dsv4f_host_weights_stats previous{};bool saw_transient=false;
+    for(int pass=0;pass<3;++pass) {
+        for(size_t i=0;i<count;i+=2) {
+            const void * pointers[]={(char*)t->data+i*plane,(char*)t->data+(i+1)*plane};
+            const size_t sizes[]={plane,plane};const void * outputs[2]{};
+            ggml_dsv4f_host_weights.acquire_prefill(pointers,sizes,outputs,2);
+            ggml_dsv4f_host_weights_stats live{};ggml_dsv4f_host_weights.statistics(&live);
+            require(live.resident_bytes+live.transient_bytes<=1<<20,"scan exceeded cache cap");
+            saw_transient|=live.transient_bytes!=0;
+            for(int j=0;j<2;++j) {
+                require(!std::memcmp(outputs[j],expected.data()+offset+(i+j)*plane,plane),"scan expert bytes");
+                ggml_dsv4f_host_weights.release(outputs[j]);
+            }
+        }
+        ggml_dsv4f_host_weights_stats current{};ggml_dsv4f_host_weights.statistics(&current);
+        require(!current.transient_bytes,"scan transient leak");
+        if(pass) {
+            require(current.evictions==previous.evictions,"scan evicted the resident set");
+            require(current.reads-previous.reads==current.transient_reads-previous.transient_reads,"scan readmiss admitted into stable set");
+            require(current.resident_bytes==previous.resident_bytes,"scan resident set changed");
+            require(current.reads-previous.reads<count,"scan did not reuse resident experts");
+        }
+        previous=current;
+    }
+    require(saw_transient,"scan never streamed overflow");
+    for(size_t i=0;i<count;++i){ggml_dsv4f_host_lease decode((char*)t->data+i*plane,plane);}
+    ggml_dsv4f_host_weights_stats after_decode{};ggml_dsv4f_host_weights.statistics(&after_decode);
+    require(after_decode.evictions>previous.evictions,"decode did not restore ordinary LRU");
     // The engine never faults weight file pages into the OS file cache.
     std::vector<unsigned char> residency(file_pages);
     require(mincore(file_map,file_pages*4096,residency.data())==0,"mincore");

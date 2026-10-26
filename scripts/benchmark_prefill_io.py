@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare cold/warm PROMPT_TEST2 prefill in a fresh 160-GiB server, MTP off."""
+"""Compare cold/warm PROMPT_TEST2 prefill under a fixed RAM budget, MTP off."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -23,9 +23,13 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--batch-io', choices=['0', '1'], required=True)
     parser.add_argument('--runs', type=int, default=3)
+    parser.add_argument('--ram-budget-mib', type=int, default=163840)
+    parser.add_argument('--scan-cache', choices=['0', '1'], default='0')
     args = parser.parse_args()
     if args.runs < 2:
         parser.error('--runs must be at least 2 (cold and warm)')
+    if args.ram_budget_mib <= 4096:
+        parser.error('--ram-budget-mib must exceed the 4096-MiB runtime reserve')
     manifest = ROOT/'state/server.json'
     if manifest.exists():
         raise RuntimeError('An owned server already exists')
@@ -34,9 +38,10 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     build = ROOT/'build'
     env = dict(os.environ, HOST='127.0.0.1', PORT='18094', BUILD_DIR=str(build),
-               DSV4F_RAM_BUDGET_MIB='163840', DSV4F_MTP='0', DSV4F_EXPERT_LOOKAHEAD='0',
+               DSV4F_RAM_BUDGET_MIB=str(args.ram_budget_mib), DSV4F_MTP='0', DSV4F_EXPERT_LOOKAHEAD='0',
                DSV4F_RAM_LOOKAHEAD='0', DSV4F_PREFILL_GROUP_LEASE='1',
                DSV4F_PREFILL_BATCH_IO=args.batch_io, DSV4F_CPU_EXPERT_LEASE='1',
+               DSV4F_PREFILL_SCAN_CACHE=args.scan_cache, DSV4F_PREFILL_RAM_STATS='1',
                DSV4F_RAM_UNLOCK_IO='1', DSV4F_ENGRAM_BATCH_IO='1',
                LD_LIBRARY_PATH=str(build/'bin')+':'+os.environ.get('LD_LIBRARY_PATH', ''),
                GGML_BACKEND_PATH=str(build/'bin'))
@@ -48,15 +53,16 @@ def main():
               for name in ('dsv4f-server', 'libggml-hip.so', 'libllama.so')}
     report = dict(date_utc=datetime.now(timezone.utc).isoformat(), prompt_file='PROMPT_TEST2.md',
                   prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), batch_io=args.batch_io,
-                  ram_budget_mib=163840, mtp=0, binary_sha256=hashes, runs=[])
+                  ram_budget_mib=args.ram_budget_mib, scan_cache=args.scan_cache,
+                  mtp=0, binary_sha256=hashes, runs=[])
     state = None
     with (out/'launcher.log').open('w') as log:
         proc = subprocess.Popen(['systemd-run', '--user', '--scope', '--quiet',
-                                 '-p', 'MemorySwapMax=0', '-p', 'MemoryMax=160G', './run-server.sh'],
+                                 '-p', 'MemorySwapMax=0', '-p', f'MemoryMax={args.ram_budget_mib*2**20}', './run-server.sh'],
                                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         try:
-            print('Loading batch_io='+args.batch_io, flush=True)
+            print(f'Loading batch_io={args.batch_io} scan_cache={args.scan_cache} ram_mib={args.ram_budget_mib}', flush=True)
             for _ in range(600):
                 if proc.poll() is not None:
                     raise RuntimeError('Server exited during load; inspect launcher.log')
@@ -64,7 +70,8 @@ def main():
                     candidate = json.loads(manifest.read_text())
                     assert candidate['url'] == 'http://127.0.0.1:18094'
                     options = candidate['engine_options']
-                    for key, value in [('DSV4F_RAM_BUDGET_MIB', '163840'), ('DSV4F_MTP', '0'),
+                    for key, value in [('DSV4F_RAM_BUDGET_MIB', str(args.ram_budget_mib)), ('DSV4F_MTP', '0'),
+                                       ('DSV4F_PREFILL_SCAN_CACHE', args.scan_cache),
                                        ('DSV4F_PREFILL_GROUP_LEASE', '1'), ('DSV4F_PREFILL_BATCH_IO', args.batch_io)]:
                         assert options[key] == value
                     assert Path(f'/proc/{candidate["pid"]}/exe').resolve() == build/'bin/dsv4f-server'
@@ -85,7 +92,20 @@ def main():
                 io = {line.split(':')[0]: int(line.split()[1])
                       for line in Path(f'/proc/{state["pid"]}/io').read_text().splitlines()}
                 assert memory['VmSwap'] == 0
-                return {'memory': memory, 'io': io}
+                cgroot = Path(state['cgroup']['path'])
+                cgroup = {k: int((cgroot/k).read_text().strip()) for k in
+                          ('memory.current', 'memory.peak', 'memory.swap.current', 'memory.max')}
+                cgroup['events'] = dict(line.split() for line in (cgroot/'memory.events').read_text().splitlines())
+                assert cgroup['memory.max'] == args.ram_budget_mib*2**20
+                assert cgroup['memory.peak'] <= cgroup['memory.max']
+                assert cgroup['memory.swap.current'] == 0
+                assert int(cgroup['events']['oom_kill']) == 0
+                weights = dict(reads=0, read_bytes=0, evictions=0, transient_reads=0, transient_read_bytes=0)
+                for line in reversed(Path(state['log']).read_text().splitlines()):
+                    if line.startswith('[dsv4f-ram-prefill]'):
+                        weights = {k: int(v) for k, v in (field.split('=', 1) for field in line.split()[1:]) if k != 'layer'}
+                        break
+                return {'memory': memory, 'io': io, 'cgroup': cgroup, 'weights': weights}
 
             for index in range(args.runs):
                 before = snapshot()
@@ -95,11 +115,14 @@ def main():
                 record = dict(index=index+1, timings=result['timings'], wall_seconds=result['wall_seconds'],
                               usage=result['usage'], content=result['content'], before=before, after=after,
                               read_bytes=after['io']['read_bytes']-before['io']['read_bytes'])
+                record['expert_read_bytes'] = after['weights']['read_bytes']-before['weights']['read_bytes']
+                record['expert_evictions'] = after['weights']['evictions']-before['weights']['evictions']
                 report['runs'].append(record)
                 (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
                 print('run', index+1, 'tokens', result['timings']['prompt_n'],
                       'prefill_tps', round(result['timings']['prompt_per_second'], 3),
-                      'read_gib', round(record['read_bytes']/2**30, 3),
+                      'expert_read_gib', round(record['expert_read_bytes']/2**30, 3),
+                      'evictions', record['expert_evictions'],
                       'rss_gib', round(after['memory']['VmRSS']/2**30, 3), flush=True)
             values = [r['timings']['prompt_per_second'] for r in report['runs']]
             report['summary'] = dict(cold_prefill_tps=values[0],

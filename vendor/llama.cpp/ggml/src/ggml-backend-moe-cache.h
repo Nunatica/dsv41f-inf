@@ -135,6 +135,10 @@ GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
 #endif
 
 // Direct SSD/RAM expert source. Leases keep host bytes alive through CPU work or DMA.
+struct ggml_dsv4f_host_weights_stats {
+    uint64_t resident_bytes, transient_bytes, reads, read_bytes, evictions;
+    uint64_t transient_reads, transient_read_bytes;
+};
 struct ggml_dsv4f_host_weights_api {
     const void * (*acquire)(const void *, size_t);
     void (*release)(const void *);
@@ -144,6 +148,10 @@ struct ggml_dsv4f_host_weights_api {
     // All-or-nothing batch of complete expert-plane leases. Cold planes can
     // read concurrently into their final RAM-cache allocations (no bounce).
     void (*acquire_many)(const void * const *, const size_t *, const void **, size_t);
+    // Prefill scan: preserve resident weights, bypass admission on overflow.
+    // Transient allocations remain leased through H2D, then return to the OS.
+    void (*acquire_prefill)(const void * const *, const size_t *, const void **, size_t);
+    void (*statistics)(struct ggml_dsv4f_host_weights_stats *);
 };
 #ifdef __cplusplus
 extern "C" {

@@ -34,6 +34,15 @@ bool batched_host_reads() {
     }();
     return value;
 }
+bool scan_host_reads() {
+    static const bool value=[] {
+        const char * v=std::getenv("DSV4F_PREFILL_SCAN_CACHE");
+        if(!v || !std::strcmp(v,"0"))return false;
+        if(!std::strcmp(v,"1"))return true;
+        throw std::runtime_error("DSV4F_PREFILL_SCAN_CACHE must be 0 or 1");
+    }();
+    return value;
+}
 
 // Keep direct-RAM entries alive until every H2D in a prefill group has consumed
 // them. The legacy path synchronizes and releases after each expert/plane. The
@@ -71,7 +80,9 @@ public:
     void prepare(const std::vector<const void *> & pointers,const std::vector<size_t> & sizes) {
         GGML_ASSERT(grouped && held.empty() && ggml_dsv4f_host_weights.acquire_many);
         prepared=pointers;held.resize(pointers.size());
-        try{ggml_dsv4f_host_weights.acquire_many(pointers.data(),sizes.data(),held.data(),pointers.size());}
+        const auto acquire=scan_host_reads() && ggml_dsv4f_host_weights.acquire_prefill?
+            ggml_dsv4f_host_weights.acquire_prefill:ggml_dsv4f_host_weights.acquire_many;
+        try{acquire(pointers.data(),sizes.data(),held.data(),pointers.size());}
         catch(...){held.clear();prepared.clear();throw;}
     }
     const void * acquire(const void * p,size_t n) {
@@ -366,6 +377,14 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     CUDA_CHECK(cudaEventRecord(state.done, ctx.stream()));
     state.pending = true;
     if (cached) ggml_dsv4f_prefill_cache_end(ctx.stream());
+    static const bool ram_stats=[] {const char * v=std::getenv("DSV4F_PREFILL_RAM_STATS");return v && !std::strcmp(v,"1");}();
+    if(ram_stats && ggml_dsv4f_host_weights.statistics) {
+        ggml_dsv4f_host_weights_stats s{};ggml_dsv4f_host_weights.statistics(&s);
+        std::fprintf(stderr,"[dsv4f-ram-prefill] layer=%s tokens=%d reads=%llu read_bytes=%llu evictions=%llu transient_reads=%llu transient_read_bytes=%llu resident_bytes=%llu transient_bytes=%llu scan=%d\n",
+            g->name,nt,(unsigned long long)s.reads,(unsigned long long)s.read_bytes,(unsigned long long)s.evictions,
+            (unsigned long long)s.transient_reads,(unsigned long long)s.transient_read_bytes,
+            (unsigned long long)s.resident_bytes,(unsigned long long)s.transient_bytes,int(scan_host_reads()));
+    }
     if (std::getenv("DSV4F_PREFILL_PROFILE")) {
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count();
