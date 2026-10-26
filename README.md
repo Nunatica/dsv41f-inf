@@ -73,16 +73,6 @@ Alternately, you can use high quality model near original from [unsloth/DeepSeek
 
 The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf` and `DSV4F_ENGRAM_DIR=models/`, both resolved relative to the repository root. Format selection requires an exact first filename: `DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf` or `DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf`. Set `MODEL` and `DSV4F_ENGRAM_DIR` before launching if your files are elsewhere, keeping these filenames. For UD-Q4_K_XL, supply shards 1–7 and 9; the missing Engram shard 8 is replaced by the original FP8 Engram `.safetensors` in `DSV4F_ENGRAM_DIR`. Missing other shards or incompatible original Engram tables are rejected. Use a fast SSD with enough space for both the GGUF and Engram weights; Engram rows are read during inference.
 
-The launcher defaults to **180 GiB RAM** (`DSV4F_RAM_BUDGET_MIB=184320`) with VRAM/RAM/SSD tiering. Explicitly set `DSV4F_RAM_BUDGET_MIB=0` for resident loading: the model weights remain resident as before, with Engram tables read from SSD. Resident mode uses `--load-mode none --lazy-mode off` and applies no explicit RAM ceiling. Swap protection remains required, and available RAM must cover the full GGUF plus 2 GiB, with additional room for runtime buffers and Engram caching.
-
-Set a positive `DSV4F_RAM_BUDGET_MIB` to enable VRAM/RAM/SSD tiering with a total RAM budget. The launcher creates a systemd user scope with cgroup v2 `MemoryMax` and `MemorySwapMax=0`, unless the current cgroup already enforces equal or tighter limits. This bounds the server and supervisor together, including KV/history, compute buffers, pinned host allocations, Engram caches, and charged file memory. A working systemd user session with memory control, or an externally configured cgroup, is required for the budgeted mode; a launch without the requested limit is refused.
-
-In budgeted mode, the engine keeps its existing dynamic VRAM expert cache. Experts absent from VRAM use a bounded LRU RAM cache; misses read the original GGUF shards through **O_DIRECT**, with aligned anonymous buffers. Expert tensors have protected virtual descriptor addresses, with no full tensor allocation or file mapping. Leases keep an expert's bytes alive during CPU computation and GPU uploads. Eviction returns the allocation to the OS with `munmap`. GGUF, Engram, and optional MTP **weight payloads** use direct I/O; small metadata headers are still parsed normally. Unsupported direct I/O fails instead of silently using buffered reads. This follows Strata's direct file-tier approach without converting or replacing the model.
-
-In budgeted mode, the RAM cache grows into the budget left after measured process RSS and a safety reserve. SSD latency therefore affects cold reads and cache misses. The full GGUF no longer needs to fit in RAM. These settings are in MiB:
-
-Startup expert preload is **off by default** (`DSV4F_RAM_PRELOAD=0`). Set `DSV4F_RAM_PRELOAD=1` with a positive RAM budget to preload expert planes into the RAM cache after context allocation and warmup, before the server becomes ready. It reads shards and tensor offsets in ascending file order through O_DIRECT, stopping when the next plane would exceed the current cache allowance (including alignment). Existing cached experts are reused, and preload never evicts earlier entries to scan the rest of the model. The process budget, runtime RSS, `DSV4F_RAM_RESERVE_MIB`, and optional `DSV4F_RAM_CACHE_MIB` all constrain the preload. Progress and the final loaded amount appear under `[dsv4f-ram-preload]`; startup takes longer to perform these reads. With `DSV4F_RAM_BUDGET_MIB=0`, the original resident loader remains in use and this preload step does nothing even if enabled.
-
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
 | `DSV4F_RAM_BUDGET_MIB` | `184320` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
@@ -93,7 +83,6 @@ Startup expert preload is **off by default** (`DSV4F_RAM_PRELOAD=0`). Set `DSV4F
 
 ```bash
 ./run-server.sh                          # Tiered mode, 180 GiB RAM ceiling
-DSV4F_RAM_PRELOAD=1 ./run-server.sh       # Optional startup expert preload
 DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stays on SSD
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```
@@ -126,18 +115,6 @@ After installing the dependencies and placing the model files:
 ./build-engine.sh
 ./run-server.sh
 ```
-
-CPU-specific optimization of the project's own C++ sources is enabled by
-default (`DSV4F_NATIVE=ON`). This adds `-march=native` to those sources,
-including their test builds. The resulting code targets the build machine's
-CPU and may require the same instruction set on other machines. Build with
-`DSV4F_NATIVE=OFF ./build-engine.sh` to disable it. GPU compiler options are
-unaffected.
-
-Release LTO for the CPU inference libraries and server targets is enabled by
-default (`DSV4F_CPU_LTO=ON`). Disable it with
-`DSV4F_CPU_LTO=OFF ./build-engine.sh`. The build checks C/C++ IPO support and
-keeps HIP/CUDA compiler and device-link settings unchanged.
 
 ## Performance
 
