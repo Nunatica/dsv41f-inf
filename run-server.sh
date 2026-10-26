@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Zero keeps the original resident loader; a positive process-tree budget enables tiering.
+export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-0}
+export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-4096}
+for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
+    value=${!name}
+    if [[ ! $value =~ ^[0-9]{1,10}$ ]] || ((10#$value > 16777216)); then
+        echo "$name must be an integer in 0..16777216 MiB." >&2; exit 1
+    fi
+done
+ram_budget_mib=$((10#$DSV4F_RAM_BUDGET_MIB))
+if ((ram_budget_mib && ram_budget_mib <= 10#$DSV4F_RAM_RESERVE_MIB + 64)); then
+    echo 'RAM budget must exceed RAM reserve by more than 64 MiB.' >&2; exit 1
+fi
+if [[ -v DSV4F_RAM_CACHE_MIB ]]; then
+    if [[ ! $DSV4F_RAM_CACHE_MIB =~ ^[0-9]{1,10}$ ]] || ((10#$DSV4F_RAM_CACHE_MIB < 64 || 10#$DSV4F_RAM_CACHE_MIB > 16777216)); then
+        echo 'DSV4F_RAM_CACHE_MIB must be an integer in 64..16777216 MiB.' >&2; exit 1
+    fi
+    export DSV4F_RAM_CACHE_MIB
+fi
 export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf}"
 export DSV4F_ENGRAM_DIR="${DSV4F_ENGRAM_DIR:-$ROOT/models}"
 export DSV4F_ENGRAM_DECODE=${DSV4F_ENGRAM_DECODE:-lut}
@@ -101,6 +120,7 @@ export DSV4F_BATCH_TRANSFERS=${DSV4F_BATCH_TRANSFERS:-1}
 export DSV4F_GPU_JOIN=${DSV4F_GPU_JOIN:-1}
 export DSV4F_PINNED_COMPUTE=${DSV4F_PINNED_COMPUTE:-1}
 export DSV4F_PINNED_WEIGHTS=${DSV4F_PINNED_WEIGHTS:-$DSV4F_PINNED_COMPUTE}
+if ((ram_budget_mib)); then export DSV4F_PINNED_WEIGHTS=0; fi
 export DSV4F_EXPERT_GRAPHS=${DSV4F_EXPERT_GRAPHS:-1}
 # Experimental: instantiate each captured HIP graph instead of updating an old executable.
 export DSV4F_HIP_GRAPH_REBUILD=${DSV4F_HIP_GRAPH_REBUILD:-0}
@@ -198,8 +218,10 @@ fi
 BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 
 #--jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning off --reasoning-budget 0 --no-context-shift
+load_mode=none
+if ((ram_budget_mib)); then load_mode=dio; fi
 args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v q8_0
-      --load-mode none --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
+      --load-mode "$load_mode" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
       --batch-size "${BATCH_SIZE:-4096}" --ubatch-size "${UBATCH_SIZE:-4096}"
       --flash-attn on --parallel 1 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
@@ -215,18 +237,30 @@ if [[ -n ${MMPROJ:-} ]]; then
 fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
+    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'
     exit 0
 fi
-if ! python3 "$ROOT/scripts/model_info.py" --swap-check; then
-    if command -v systemd-run >/dev/null; then
-        exec systemd-run --user --scope --quiet --unit="dsv4f-$$" -p MemorySwapMax=0 "$ROOT/run-server.sh" "$@"
+[[ -x "$BUILD_DIR/bin/dsv4f-server" ]] || "$ROOT/build-engine.sh"
+if ! python3 "$ROOT/scripts/memory_budget.py" --check; then
+    if [[ ${DSV4F_SCOPE_REQUESTED:-0} == 1 ]]; then
+        echo 'Requested cgroup RAM/swap limits were not applied; refusing an unbounded launch.' >&2; exit 1
     fi
-    echo 'Cannot forbid swap. Disable system swap (sudo swapoff -a) or enable user systemd cgroups.' >&2
+    if command -v systemd-run >/dev/null; then
+        scope_args=(-p MemorySwapMax=0)
+        if ((ram_budget_mib)); then
+            scope_args+=(-p "MemoryMax=$((ram_budget_mib * 1048576))"
+                         -p "MemoryHigh=$(((ram_budget_mib - 10#$DSV4F_RAM_RESERVE_MIB / 2) * 1048576))")
+        fi
+        export DSV4F_SCOPE_REQUESTED=1
+        exec systemd-run --user --scope --quiet --unit="dsv4f-$$" "${scope_args[@]}" "$ROOT/run-server.sh" "$@"
+    fi
+    echo 'Cannot enforce RAM/swap limits. A systemd user session with cgroup v2 memory control is required.' >&2
     exit 1
 fi
-[[ -x "$BUILD_DIR/bin/dsv4f-server" ]] || "$ROOT/build-engine.sh"
-mkdir -p "$ROOT/logs" "$ROOT/state"
-exec python3 "$ROOT/scripts/serve.py" --state-dir "$ROOT/state" --log-dir "$ROOT/logs" -- \
+state_dir=${DSV4F_STATE_DIR:-$ROOT/state}
+log_dir=${DSV4F_LOG_DIR:-$ROOT/logs}
+mkdir -p "$log_dir" "$state_dir"
+exec python3 "$ROOT/scripts/serve.py" --state-dir "$state_dir" --log-dir "$log_dir" -- \
     "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "$@"

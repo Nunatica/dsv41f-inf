@@ -133,3 +133,26 @@ GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
 #ifdef __cplusplus
 }
 #endif
+
+// Direct SSD/RAM expert source. Leases keep host bytes alive through CPU work or DMA.
+struct ggml_dsv4f_host_weights_api {
+    const void * (*acquire)(const void *, size_t);
+    void (*release)(const void *);
+};
+#ifdef __cplusplus
+extern "C" {
+#endif
+GGML_BACKEND_API struct ggml_dsv4f_host_weights_api ggml_dsv4f_host_weights;
+#ifdef __cplusplus
+}
+#endif
+#ifdef __cplusplus
+struct ggml_dsv4f_host_lease {
+    const void * data;
+    explicit ggml_dsv4f_host_lease(const void * p, size_t n) :
+        data(ggml_dsv4f_host_weights.acquire ? ggml_dsv4f_host_weights.acquire(p,n) : p) {}
+    ~ggml_dsv4f_host_lease(){if(ggml_dsv4f_host_weights.release)ggml_dsv4f_host_weights.release(data);}
+    ggml_dsv4f_host_lease(const ggml_dsv4f_host_lease &) = delete;
+    ggml_dsv4f_host_lease & operator=(const ggml_dsv4f_host_lease &) = delete;
+};
+#endif

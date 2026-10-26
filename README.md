@@ -72,7 +72,28 @@ Get the model from [icecubetr/DeepSeek-V4.1-Flash-1017-dsx-2.6bit](https://huggi
 
 The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf` and `DSV4F_ENGRAM_DIR=models/`, both resolved relative to the repository root. Set `MODEL` and `DSV4F_ENGRAM_DIR` before launching if your files are elsewhere or the GGUF has a different name. For a split GGUF, download every shard and point `MODEL` to the first shard. Use a fast SSD with enough space for both the GGUF and Engram weights; Engram rows are read during inference.
 
-The launcher requires swap protection: either system swap must already be disabled, or a working systemd user session with cgroup v2 memory control must allow `systemd-run --user --scope -p MemorySwapMax=0` (the launcher applies this automatically). It refuses to start if neither is available. The initial memory check requires available RAM of at least the total GGUF file size plus 2 GiB; allow additional memory for runtime buffers and Engram caching.
+The launcher defaults to **resident loading** (`DSV4F_RAM_BUDGET_MIB=0`): the model weights remain resident as before, with Engram tables read from SSD. It uses `--load-mode none --lazy-mode off` and applies no explicit RAM ceiling. Swap protection remains required, and available RAM must cover the full GGUF plus 2 GiB, with additional room for runtime buffers and Engram caching.
+
+Set a positive `DSV4F_RAM_BUDGET_MIB` to enable VRAM/RAM/SSD tiering with a total RAM budget. The launcher creates a systemd user scope with cgroup v2 `MemoryMax` and `MemorySwapMax=0`, unless the current cgroup already enforces equal or tighter limits. This bounds the server and supervisor together, including KV/history, compute buffers, pinned host allocations, Engram caches, and charged file memory. A working systemd user session with memory control, or an externally configured cgroup, is required for the budgeted mode; a launch without the requested limit is refused.
+
+In budgeted mode, the engine keeps its existing dynamic VRAM expert cache. Experts absent from VRAM use a bounded LRU RAM cache; misses read the original GGUF shards through **O_DIRECT**, with aligned anonymous buffers. Expert tensors have protected virtual descriptor addresses, with no full tensor allocation or file mapping. Leases keep an expert's bytes alive during CPU computation and GPU uploads. Eviction returns the allocation to the OS with `munmap`. GGUF, Engram, and optional MTP **weight payloads** use direct I/O; small metadata headers are still parsed normally. Unsupported direct I/O fails instead of silently using buffered reads. This follows Strata's direct file-tier approach without converting or replacing the model.
+
+In budgeted mode, the RAM cache grows into the budget left after measured process RSS and a safety reserve. SSD latency therefore affects cold reads and cache misses. The full GGUF no longer needs to fit in RAM. These settings are in MiB:
+
+| Environment variable | Default | Meaning |
+| --- | ---: | --- |
+| `DSV4F_RAM_BUDGET_MIB` | `0` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
+| `DSV4F_RAM_RESERVE_MIB` | `4096` | Headroom left outside the expert cache for runtime growth. |
+| `DSV4F_RAM_CACHE_MIB` | automatic | Optional additional ceiling for the expert RAM cache. |
+| `DSV4F_EXPERT_CACHE_MIB` | `14336` | Existing aggregate VRAM expert-cache ceiling. |
+
+```bash
+./run-server.sh                          # Resident model weights; Engram stays on SSD
+DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
+DSV4F_RAM_BUDGET_MIB=163840 ./run-server.sh # Tiered mode, 160 GiB RAM ceiling
+```
+
+Set the budget before starting a new server. The native engine also selects direct expert loading when this variable is positive; use the launcher (or supply a cgroup yourself) to enforce the total-process hard limit. `state/server.json` records the requested/effective budgets, tier mode and cgroup counters at readiness. An inherited tighter cgroup ceiling is also passed to the native RAM cache. With `DSV4F_RAM_BUDGET_MIB=0`, swap protection remains required and the previous full-model RAM availability check applies.
 
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 
@@ -120,7 +141,7 @@ keeps HIP/CUDA compiler and device-link settings unchanged.
 | dsv41f-inf | 200.65 | 19.72 |
 | llama.cpp | - | - |
 
-Data was measured at target system. test was done with same prompt with PROMPT_TEST.md
+These historical measurements used resident weights (equivalent to `DSV4F_RAM_BUDGET_MIB=0`) on the target system with `PROMPT_TEST.md`. They do not describe the opt-in direct-SSD mode, whose speed depends on cache misses and SSD throughput.
 
 ## Credits
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)

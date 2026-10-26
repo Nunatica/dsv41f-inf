@@ -82,9 +82,10 @@ class cache {
             // finish can release a hit slot before its GPU branch completes.
             // Weight replacement must wait for all previously dispatched reads.
             CUDA_CHECK(cudaStreamWaitEvent(copy,compute_done,0));
-            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride, j.g, gs, cudaMemcpyHostToDevice,copy));
-            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride + uo, j.u, us, cudaMemcpyHostToDevice,copy));
-            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride + doff, j.d, ds, cudaMemcpyHostToDevice,copy));
+            ggml_dsv4f_host_lease g(j.g,gs),u(j.u,us),d(j.d,ds);
+            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride, g.data, gs, cudaMemcpyHostToDevice,copy));
+            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride + uo, u.data, us, cudaMemcpyHostToDevice,copy));
+            CUDA_CHECK(cudaMemcpyAsync(slab + j.si*stride + doff, d.data, ds, cudaMemcpyHostToDevice,copy));
             CUDA_CHECK(cudaStreamSynchronize(copy));
             lock.lock(); slots[j.si].ready=true;
         }

@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
+#include "direct-weights.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
 
@@ -316,9 +317,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        if (dsv4f_direct_weights_enabled()) {
+            if (fname.empty() || !llama_mmap::SUPPORTED) {
+                throw std::runtime_error("RAM-budgeted loading requires a Linux GGUF file");
+            }
+            params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+            params.no_host = true;
+            params.use_extra_bufts = false;
+        }
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
+        if (dsv4f_direct_weights_enabled() && ml.get_arch() != LLM_ARCH_DEEPSEEK41) {
+            throw std::runtime_error("RAM-budgeted direct expert loading currently requires deepseek41");
+        }
         ml.lazy.mode = params.lazy_mode;
 
         ml.print_info();

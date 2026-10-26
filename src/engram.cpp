@@ -1,4 +1,5 @@
 #include "engram.h"
+#include "direct-weights.h"
 #include "engram-fp8.h"
 #include "models/deepseek41.h"
 #include "nlohmann/json.hpp"
@@ -21,6 +22,7 @@ namespace {
 uint64_t now_ns() {return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 uint64_t mix(uint64_t x) {x^=x>>30;x*=UINT64_C(0xbf58476d1ce4e5b9);x^=x>>27;x*=UINT64_C(0x94d049bb133111eb);return x^(x>>31);}
 void read_exact(int fd,void * out,size_t n,uint64_t off,dsv4f_engram::stats * stats) {
+    if(fcntl(fd,F_GETFL)&O_DIRECT){dsv4f_direct_read(fd,out,n,off);if(stats){++stats->reads;stats->bytes+=n;}return;}
     size_t done=0;while(done<n){ssize_t got=pread(fd,(char*)out+done,n-done,off+done);if(stats){++stats->reads;if(got>0)stats->bytes+=got;}if(got<0 && errno==EINTR)continue;if(got<=0)throw std::runtime_error("[dsv4f-engram] truncated or unreadable table");done+=got;}
 }
 void write_exact(int fd,const void * data,size_t n) {
@@ -77,7 +79,7 @@ dsv4f_engram::dsv4f_engram(const llama_model_deepseek41 & m,const std::string & 
                 if(t.at("dtype")!=(k?"F8_E8M0":"F8_E4M3") || shape!=std::vector<int64_t>{m.engram_rows[s],width} || off.size()!=2 || off[1]<off[0] || off[1]-off[0]!=(uint64_t)m.engram_rows[s]*width || off[1]>size-8-bytes)throw std::runtime_error("Engram tensor dtype/shape/extent mismatch: "+key);
                 auto & tab=tables[s];int & fd=k?tab.fds:tab.fdw;uint64_t & at=k?tab.os:tab.ow;
                 if(fd>=0)throw std::runtime_error("duplicate Engram tensor: "+key);
-                fd=open(entry.path().c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("cannot open Engram shard");at=8+bytes+off[0];
+                fd=open(entry.path().c_str(),O_RDONLY|O_CLOEXEC|(dsv4f_direct_weights_enabled()?O_DIRECT:0));if(fd<0)throw std::runtime_error("cannot open Engram shard");at=8+bytes+off[0];
             }
         }
         for(auto & t:tables)if(t.fdw<0 || t.fds<0)throw std::runtime_error("missing original FP8 Engram tables");

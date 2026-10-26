@@ -566,9 +566,12 @@ class service {
             if(guarded){if(success)policy.unpublish(j.slot);lock.unlock();}
             if(success){const int eid=j.key%MAX_EXPERTS;
                 char * dest=block_cache?cache_ptrs[j.slot]:slab+j.slot*stride;
-                CUDA_CHECK(cudaMemcpyAsync(dest,(const char*)l.g.data+eid*gs,gs,cudaMemcpyHostToDevice,work_stream));
-                CUDA_CHECK(cudaMemcpyAsync(dest+uo,(const char*)l.u.data+eid*us,us,cudaMemcpyHostToDevice,work_stream));
-                CUDA_CHECK(cudaMemcpyAsync(dest+doff,(const char*)l.d.data+eid*ds,ds,cudaMemcpyHostToDevice,work_stream));
+                ggml_dsv4f_host_lease g((const char*)l.g.data+eid*gs,gs);
+                ggml_dsv4f_host_lease u((const char*)l.u.data+eid*us,us);
+                ggml_dsv4f_host_lease d((const char*)l.d.data+eid*ds,ds);
+                CUDA_CHECK(cudaMemcpyAsync(dest,g.data,gs,cudaMemcpyHostToDevice,work_stream));
+                CUDA_CHECK(cudaMemcpyAsync(dest+uo,u.data,us,cudaMemcpyHostToDevice,work_stream));
+                CUDA_CHECK(cudaMemcpyAsync(dest+doff,d.data,ds,cudaMemcpyHostToDevice,work_stream));
                 publish_slot<<<1,32,0,work_stream>>>(readers,table,j.slot,j.key,speculative,j.predicted);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(work_stream));
             }
             lock.lock();if(j.predicted){if(success){++prefetch_copies;prefetch_copy_us+=std::chrono::duration<double,std::micro>(service_clock::now()-copy_start).count();}else ++prefetch_failed;}

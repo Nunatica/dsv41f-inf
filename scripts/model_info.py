@@ -132,12 +132,14 @@ def swap_protected():
         if line.startswith('0::'):
             root = Path('/sys/fs/cgroup')
             path = root / line[3:].lstrip('/')
-            while path != root:
+            while True:
                 try:
                     if (path/'memory.swap.max').read_text().strip() == '0':
                         return True
                 except FileNotFoundError:
                     pass
+                if path == root:
+                    break
                 path = path.parent
     return False
 

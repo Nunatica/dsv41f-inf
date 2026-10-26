@@ -193,12 +193,16 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
                 if (cache_plan.resident[first+j]) continue;
                 char * target = const_cast<char *>(cache_plan.experts[first+j]);
                 const int expert = active[first+j];
-                CUDA_CHECK(cudaMemcpyAsync(target, (const char *) g->data+expert*layout.gbytes,
+                ggml_dsv4f_host_lease gl((const char*)g->data+expert*layout.gbytes,layout.gbytes);
+                ggml_dsv4f_host_lease ul((const char*)u->data+expert*layout.ubytes,layout.ubytes);
+                ggml_dsv4f_host_lease dl((const char*)d->data+expert*layout.dbytes,layout.dbytes);
+                CUDA_CHECK(cudaMemcpyAsync(target, gl.data,
                     layout.gbytes, cudaMemcpyHostToDevice, state.copy));
-                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, (const char *) u->data+expert*layout.ubytes,
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, ul.data,
                     layout.ubytes, cudaMemcpyHostToDevice, state.copy));
-                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, (const char *) d->data+expert*layout.dbytes,
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, dl.data,
                     layout.dbytes, cudaMemcpyHostToDevice, state.copy));
+                if(ggml_dsv4f_host_weights.acquire) CUDA_CHECK(cudaStreamSynchronize(state.copy));
                 copied += layout.gbytes+layout.ubytes+layout.dbytes;
             }
             CUDA_CHECK(cudaEventRecord(state.ready[slot], state.copy));
@@ -211,7 +215,9 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
                 const size_t ds=ggml_dsv4f_prefill_layout::stage_bytes(tensor);
                 char * temporary=scratch+layout.transcode+slot*group*std::max({g->nb[2],u->nb[2],d->nb[2]});
                 for(int j=0;j<count;++j) {
-                    CUDA_CHECK(cudaMemcpyAsync(temporary,(const char*)tensor->data+active[first+j]*tensor->nb[2],tensor->nb[2],cudaMemcpyHostToDevice,state.copy));
+                    ggml_dsv4f_host_lease lease((const char*)tensor->data+active[first+j]*tensor->nb[2],tensor->nb[2]);
+                    CUDA_CHECK(cudaMemcpyAsync(temporary,lease.data,tensor->nb[2],cudaMemcpyHostToDevice,state.copy));
+                    if(ggml_dsv4f_host_weights.acquire) CUDA_CHECK(cudaStreamSynchronize(state.copy));
                     const int64_t nb=ggml_nelements(tensor)/tensor->ne[2]/128;
                     dsv4f_ptq_to_q2<<<(nb*32+255)/256,256,0,state.copy>>>((const uint8_t*)temporary,(block_q2_0*)(stage+offset+j*ds),nb);
                     CUDA_CHECK(cudaGetLastError());copied+=tensor->nb[2];
@@ -221,10 +227,12 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
             // Coalesce adjacent selected experts within this group's plane.
             for (int j = 0; j < count;) {
                 int end = j+1;
-                while (end < count && active[first+end] == active[first+end-1]+1) ++end;
+                while (!ggml_dsv4f_host_weights.acquire && end < count && active[first+end] == active[first+end-1]+1) ++end;
                 const size_t bytes = (end-j)*tensor->nb[2];
+                ggml_dsv4f_host_lease lease((const char*)tensor->data+active[first+j]*tensor->nb[2],bytes);
                 CUDA_CHECK(cudaMemcpyAsync(stage+offset+j*tensor->nb[2],
-                    (const char *) tensor->data+active[first+j]*tensor->nb[2], bytes, cudaMemcpyHostToDevice, state.copy));
+                    lease.data, bytes, cudaMemcpyHostToDevice, state.copy));
+                if(ggml_dsv4f_host_weights.acquire) CUDA_CHECK(cudaStreamSynchronize(state.copy));
                 copied += bytes;
                 j = end;
             }

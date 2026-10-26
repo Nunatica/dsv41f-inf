@@ -3,6 +3,7 @@
 import argparse
 import json
 from benchmark import api_headers
+from memory_budget import memory_state, protected
 from pathlib import Path
 import threading
 import time
@@ -59,8 +60,9 @@ worker=threading.Thread(target=generate);worker.start()
 while worker.is_alive():
     samples.append(int(vram.read_text()));worker.join(.1)
 after=counters()
-result.update(memory=memory(),observation_seconds=time.monotonic()-start,read_bytes_delta=after[0]-before[0],major_fault_delta=after[1]-before[1],vram_gib_min=min(samples)/2**30,vram_gib_max=max(samples)/2**30,stream_smoke=stream)
+result.update(cgroup=memory_state(), memory_budget_bytes=state.get('memory_budget_bytes',0),memory=memory(),observation_seconds=time.monotonic()-start,read_bytes_delta=after[0]-before[0],major_fault_delta=after[1]-before[1],vram_gib_min=min(samples)/2**30,vram_gib_max=max(samples)/2**30,stream_smoke=stream)
 args.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
+assert protected(result['memory_budget_bytes'],result['cgroup']),result['cgroup']
 assert health['status']=='ok' and result['context']>=1024
 assert result['memory']['VmSwap']==0 and result['memory_swap_max']=='0' and result['memory_swap_current']=='0'
 assert '--cache-type-k' in result['command'] and result['command'][result['command'].index('--cache-type-k')+1]=='q8_0'

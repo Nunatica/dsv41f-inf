@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "direct-weights.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -577,6 +578,9 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        if (dsv4f_direct_weights_enabled() && !files.back()->has_direct_io()) {
+            throw std::runtime_error("RAM-budgeted loading requires O_DIRECT support; buffered fallback refused");
+        }
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +649,9 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                if (dsv4f_direct_weights_enabled() && !files.back()->has_direct_io()) {
+                    throw std::runtime_error("GGUF shard does not support O_DIRECT");
+                }
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1118,9 +1125,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    const bool is_direct = dsv4f_direct_weights_enabled() && !(flags & TENSOR_SKIP) &&
+        (tn.str().find(".ffn_gate_exps.") != std::string::npos ||
+         tn.str().find(".ffn_up_exps.") != std::string::npos ||
+         tn.str().find(".ffn_down_exps.") != std::string::npos);
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_direct };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1208,7 +1219,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (is_lazy) {
+        if (is_lazy || is_direct) {
             return lazy_read::buft();
         }
 

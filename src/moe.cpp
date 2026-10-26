@@ -241,6 +241,8 @@ public:
 
 void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * ag,const void * au,
                   int eid,int start,int end,int ne,float limit,float * output) {
+    ggml_dsv4f_host_lease gate_lease((const char*)gate->data+eid*gate->nb[2],gate->nb[2]);
+    ggml_dsv4f_host_lease up_lease((const char*)up->data+eid*up->nb[2],up->nb[2]);
     const auto * tg=ggml_get_type_traits_cpu(gate->type),*tu=ggml_get_type_traits_cpu(up->type);
     const int tile=options().rows;
     const bool tiled=tile>1 && gate->type==GGML_TYPE_MXFP4 && up->type==GGML_TYPE_MXFP4 &&
@@ -248,7 +250,7 @@ void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * a
     int r=start;
     if(tiled) {
       const auto full=dsv4f_mxfp4_kernel_for(tile),tail=dsv4f_mxfp4_kernel_for(2);
-      const char * gb=(const char*)gate->data+eid*gate->nb[2],*ub=(const char*)up->data+eid*up->nb[2];
+      const char * gb=(const char*)gate_lease.data,*ub=(const char*)up_lease.data;
       for(;r<end;) {
         const int count=std::min(tile/2,end-r);const void * streams[4];float values[4];
         for(int i=0;i<count;++i){streams[2*i]=gb+(r+i)*gate->nb[1];streams[2*i+1]=ub+(r+i)*up->nb[1];}
@@ -257,20 +259,21 @@ void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * a
         r+=count;
       }
     }
-    for(;r<end;++r){float g,u;tg->vec_dot(ne,&g,0,(const char*)gate->data+eid*gate->nb[2]+r*gate->nb[1],0,ag,0,1);tu->vec_dot(ne,&u,0,(const char*)up->data+eid*up->nb[2]+r*up->nb[1],0,au,0,1);g=std::fmin(g,limit);u=std::fmax(-limit,std::fmin(u,limit));output[r]=(g/(1.f+std::exp(-g)))*u;}
+    for(;r<end;++r){float g,u;tg->vec_dot(ne,&g,0,(const char*)gate_lease.data+r*gate->nb[1],0,ag,0,1);tu->vec_dot(ne,&u,0,(const char*)up_lease.data+r*up->nb[1],0,au,0,1);g=std::fmin(g,limit);u=std::fmax(-limit,std::fmin(u,limit));output[r]=(g/(1.f+std::exp(-g)))*u;}
 }
 void down_rows(const ggml_tensor * down,const void * hq,int eid,int start,int end,int nf,float * output) {
+    ggml_dsv4f_host_lease down_lease((const char*)down->data+eid*down->nb[2],down->nb[2]);
     const auto * td=ggml_get_type_traits_cpu(down->type);int r=start;
     const int tile=options().rows;
     if(tile>1 && down->type==GGML_TYPE_MXFP4 && td->vec_dot_type==GGML_TYPE_Q8_0 && nf%32==0) {
-        const auto full=dsv4f_mxfp4_kernel_for(tile);const char * base=(const char*)down->data+eid*down->nb[2];
+        const auto full=dsv4f_mxfp4_kernel_for(tile);const char * base=(const char*)down_lease.data;
         for(;r<end;) {
             const int count=std::min(tile,end-r);const void * streams[4];
             for(int i=0;i<count;++i)streams[i]=base+(r+i)*down->nb[1];
             (count==tile?full:dsv4f_mxfp4_kernel_for(count))(nf,streams,hq,output+r);r+=count;
         }
     }
-    for(;r<end;++r)td->vec_dot(nf,output+r,0,(const char*)down->data+eid*down->nb[2]+r*down->nb[1],0,hq,0,1);
+    for(;r<end;++r)td->vec_dot(nf,output+r,0,(const char*)down_lease.data+r*down->nb[1],0,hq,0,1);
 }
 
 // Called only by the device service thread. Scratch stays resident across layers.

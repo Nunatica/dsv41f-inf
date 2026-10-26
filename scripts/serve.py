@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the native server and verify that all routed weights are resident."""
+"""Supervise resident or RAM-budgeted VRAM/RAM/direct-SSD inference."""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -13,6 +13,7 @@ import time
 from urllib.error import URLError
 from urllib.request import urlopen
 from model_info import inspect, inspect_mtp, swap_protected
+from memory_budget import budget_bytes, memory_state, effective_budget
 
 
 def proc_memory(pid):
@@ -37,8 +38,15 @@ def main():
     if not swap_protected():
         raise RuntimeError('Swap protection is absent; refusing to start')
     mem = {k: int(v.split()[0])*1024 for k, v in (s.split(':', 1) for s in Path('/proc/meminfo').read_text().splitlines())}
+    budget = budget_bytes()
+    group = memory_state()
+    requested_budget = budget
+    budget = effective_budget(budget, group)
+    child_env = os.environ.copy()
+    if budget:
+        child_env['DSV4F_RAM_BUDGET_MIB'] = str(budget // (1 << 20))
     resident_bytes = info['model_bytes'] + info.get('mtp', {}).get('model_bytes', 0)
-    if mem['MemAvailable'] < resident_bytes + 2*(1<<30):
+    if not budget and mem['MemAvailable'] < resident_bytes + 2*(1<<30):
         raise RuntimeError(f"Need at least {(resident_bytes/(1<<30)+2):.1f} GiB available RAM for resident loading")
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     logfile = opts.log_dir/f'server-{stamp}.log'
@@ -48,10 +56,11 @@ def main():
         host = '127.0.0.1' if host == '0.0.0.0' else '[::1]'
     url = f"http://{host}:{os.environ.get('PORT', '8080')}"
     print(f"[dsv4f] {info['name']}: {info['model_bytes']/(1<<30):.2f} GiB in {len(info['shards'])} shards", flush=True)
-    print(f'[dsv4f] swap forbidden; resident loading (no mmap/lazy); log: {logfile}', flush=True)
+    mode = f'VRAM/RAM/O_DIRECT SSD; process RAM cap={budget/(1<<30):.2f} GiB' if budget else 'resident loading (no mmap/lazy)'
+    print(f'[dsv4f] swap forbidden; {mode}; log: {logfile}', flush=True)
     # Verbose GGUF tokenizer metadata can contain non-UTF-8 token bytes.
     child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, encoding='utf-8', errors='replace', bufsize=1)
+                             text=True, encoding='utf-8', errors='replace', bufsize=1, env=child_env)
     def forward(sig, _):
         if child.poll() is None:
             child.send_signal(sig)
@@ -83,12 +92,15 @@ def main():
                 except (URLError, TimeoutError, ValueError):
                     ready = False
                 if ready:
-                    if status.get('VmRSS', 0) < info['expert_bytes']*0.97:
+                    if not budget and status.get('VmRSS', 0) < info['expert_bytes']*0.97:
                         raise RuntimeError(f"Resident RSS {status.get('VmRSS',0)/(1<<30):.2f} GiB is smaller than routed weights {info['expert_bytes']/(1<<30):.2f} GiB")
                     verified = True
                     state = {**info, 'pid': child.pid, 'supervisor_pid': os.getpid(), 'url': url,
                              'log': str(logfile), 'command': cmd, 'memory': status,
-                             'engine_options': {k: os.environ[k] for k in (
+                             'memory_budget_bytes': budget, 'requested_memory_budget_bytes': requested_budget, 'memory_tiers': 'vram/ram/direct-ssd' if budget else 'resident',
+                             'cgroup': memory_state(),
+                             'engine_options': {k: child_env[k] for k in (
+                                 'DSV4F_RAM_BUDGET_MIB', 'DSV4F_RAM_RESERVE_MIB', 'DSV4F_RAM_CACHE_MIB',
                                  'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_VRAM_GUARD_MIB', 'DSV4F_EXPERT_CACHE_MIB',
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',
@@ -112,7 +124,7 @@ def main():
                                  'GGML_CUDA_GRAPH_OPT', 'GGML_CUDA_NO_PINNED',
                                  'GGML_HIP_SPARSE_FA', 'GGML_HIP_SPARSE_FA_DEBUG',
                                  'GGML_HIP_PREFILL_FA', 'GGML_HIP_PREFILL_FA_DEBUG',
-                                 'GGML_HIP_INDEXER_WMMA', 'GGML_HIP_PREFILL_FA_SPILL', 'GGML_HIP_Q2_MMQ_TUNE') if k in os.environ},
+                                 'GGML_HIP_INDEXER_WMMA', 'GGML_HIP_PREFILL_FA_SPILL', 'GGML_HIP_Q2_MMQ_TUNE') if k in child_env},
                              'swap_protected': True, 'load_seconds': time.monotonic()-started}
                     temporary = manifest.with_suffix('.tmp')
                     temporary.write_text(json.dumps(state, indent=2))

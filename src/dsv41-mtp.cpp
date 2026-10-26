@@ -1,3 +1,5 @@
+#include "direct-weights.h"
+#include "llama-mmap.h"
 // Native DeepSeek V4.1 DSpark. Graph arithmetic adapted from Xolotl/Strata's
 // tools/v41/engine/ds41_dspark.cpp (MIT):
 // Copyright (c) 2026 Niko1221 and the Strata contributors
@@ -84,9 +86,9 @@ llama_dsv41_mtp::llama_dsv41_mtp(llama_context * target,const char * path,const 
         ggml_type type;uint64_t offset,bytes;std::vector<int64_t> dims;
     };
     std::map<std::string,source> sources;
-    std::ifstream stream(path,std::ios::binary|std::ios::ate);
-    const auto file_bytes=stream.tellg();
-    if(file_bytes<0)throw std::runtime_error("cannot open DSpark binary");
+    llama_file stream(path,"rb",dsv4f_direct_weights_enabled());
+    const auto file_bytes=stream.size();
+    if(dsv4f_direct_weights_enabled() && !stream.has_direct_io())throw std::runtime_error("DSpark binary requires O_DIRECT under a RAM budget");
     for(const auto & item:index.at("tensors")) {
         const auto name=item.at(0).get<std::string>();
         if(name.rfind("mtp.",0)!=0 || name.find(".bias_vl")!=std::string::npos)continue;
@@ -166,10 +168,10 @@ llama_dsv41_mtp::llama_dsv41_mtp(llama_context * target,const char * path,const 
     ggml_backend_buffer_set_usage(weights_buf.get(),GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<char> chunk(8*1024*1024);std::vector<float> converted;size_t loaded=0;
     for(const auto & upload:uploads) {
-        const auto & src=*upload.src;stream.seekg(src.offset);
+        const auto & src=*upload.src;stream.seek(src.offset,SEEK_SET);
         for(size_t at=0;at<src.bytes;) {
             const size_t n=std::min<uint64_t>(chunk.size(),src.bytes-at);
-            if(!stream.read(chunk.data(),n))throw std::runtime_error("cannot read DSpark tensor payload");
+            stream.read_raw(chunk.data(),n);
             if(src.type==GGML_TYPE_BF16) {
                 converted.resize(n/sizeof(ggml_bf16_t));
                 ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(chunk.data()),converted.data(),converted.size());
