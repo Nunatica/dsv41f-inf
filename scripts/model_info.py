@@ -7,6 +7,56 @@ import re
 import struct
 import sys
 
+DSX_FILENAME = 'DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf'
+UD_FILENAME = 'DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf'
+
+
+def model_format(path):
+    name = Path(path).name
+    if name == DSX_FILENAME:
+        return 'dsx-2.6bit'
+    if name == UD_FILENAME:
+        return 'ud-q4-k-xl'
+    raise ValueError('Unsupported model filename; expected exactly '+DSX_FILENAME+' or '+UD_FILENAME)
+
+
+def original_engram(meta, directory):
+    layers = meta['deepseek41.ple.layers']
+    per = (meta['deepseek41.ple.ngram_size']-1)*meta['deepseek41.ple.heads_per_ngram']
+    sizes = meta['deepseek41.ple.head_vocab_sizes']
+    width = meta['deepseek41.embedding_length_per_layer_input']
+    if per <= 0 or len(sizes) != len(layers)*per or width <= 0 or width % 32:
+        raise ValueError('Invalid native Engram geometry')
+    required = {}
+    for slot, layer in enumerate(layers):
+        rows = sum(sizes[slot*per:(slot+1)*per])
+        for suffix, dtype, columns in [('weight', 'F8_E4M3', width), ('scale', 'F8_E8M0', width//32)]:
+            required[f'layers.{layer}.engram.embed.{suffix}'] = (dtype, [rows, columns])
+    found = {}
+    for path in sorted(Path(directory).glob('*.safetensors')):
+        with path.open('rb') as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                raise ValueError('Truncated safetensors header: '+str(path))
+            n = struct.unpack('<Q', raw)[0]
+            if n > 64*1024*1024:
+                raise ValueError('Invalid safetensors header: '+str(path))
+            entries = json.loads(f.read(n))
+        for key, (dtype, shape) in required.items():
+            if key not in entries:
+                continue
+            t = entries[key]
+            off = t['data_offsets']
+            if key in found:
+                raise ValueError('Duplicate original Engram: '+key)
+            if (t['dtype'] != dtype or t['shape'] != shape or len(off) != 2 or off[0] < 0 or
+                    off[1]-off[0] != shape[0]*shape[1] or off[1] > path.stat().st_size-8-n):
+                raise ValueError('Original Engram dtype/shape/extent mismatch: '+key)
+            found[key] = str(path.resolve())
+    if set(found) != set(required):
+        raise ValueError('Missing original FP8 Engram: '+', '.join(sorted(set(required)-set(found))))
+    return {'directory': str(Path(directory).resolve()), 'tensors': found}
+
 
 def header(path):
     with open(path, 'rb') as f:
@@ -56,11 +106,16 @@ def header(path):
 
 
 def inspect(path):
+    requested = Path(path)
     path = Path(path).resolve()
     meta, _, _ = header(path)
     arch = meta.get('general.architecture')
     if arch not in ('deepseek4', 'deepseek41'):
         raise ValueError('This engine requires a deepseek4 or deepseek41 GGUF model')
+    variant = model_format(requested) if arch == 'deepseek41' else None
+    native = variant == 'ud-q4-k-xl'
+    if native and meta.get('split.count') != 9:
+        raise ValueError('UD-Q4_K_XL requires exactly nine declared shards')
     count = meta.get('split.count', 1)
     if count > 1:
         m = re.fullmatch(r'(.*)-\d{5}-of-\d{5}\.gguf', str(path))
@@ -71,20 +126,30 @@ def inspect(path):
             raise ValueError('MODEL must point to the first GGUF shard')
     else:
         paths = [path]
-    total = expert = 0
+    total = expert = tensor_count = 0
+    available, skipped = [], []
+    external = original_engram(meta, os.environ.get('DSV4F_ENGRAM_DIR', requested.parent)) if native else None
     for i, shard in enumerate(paths):
+        if native and i == 7 and not shard.exists():
+            skipped.append(str(shard))
+            continue
         sm, tensors, start = header(shard)
         if sm.get('split.no', 0) != i or sm.get('split.count', 1) != count:
             raise ValueError(f'Inconsistent shard metadata: {shard}')
         size = shard.stat().st_size
+        available.append(str(shard))
+        tensor_count += len(tensors)
         total += size
         for j, t in enumerate(tensors):
             if re.search(r'\.ffn_(gate|up|down)_exps(?:\.[^.]+)?\.weight$', t[0]):
                 end = tensors[j+1][3] if j+1 < len(tensors) else size-start
                 expert += end-t[3]
-    return {'model': str(path), 'name': meta.get('general.name'), 'shards': [str(p) for p in paths],
-            'model_bytes': total, 'expert_bytes': expert, 'layers': meta.get('deepseek41.num_hidden_layers') if arch == 'deepseek41' else meta.get('deepseek4.block_count'),
-            'context_limit': meta.get('deepseek41.max_position_embeddings') if arch == 'deepseek41' else meta.get('deepseek4.context_length')}
+    if native and tensor_count+len(skipped) != meta['split.tensors.count']:
+        raise ValueError('Native GGUF tensor count mismatch beyond the external Engram embedding')
+    return {'model': str(path), 'name': meta.get('general.name'), 'shards': available,
+            'format': variant, 'skipped_engram_shards': skipped, 'original_engram': external,
+            'model_bytes': total, 'expert_bytes': expert, 'layers': meta.get('deepseek41.num_hidden_layers', meta.get('deepseek41.block_count')) if arch == 'deepseek41' else meta.get('deepseek4.block_count'),
+            'context_limit': meta.get('deepseek41.max_position_embeddings', meta.get('deepseek41.context_length')) if arch == 'deepseek41' else meta.get('deepseek4.context_length')}
 
 
 def inspect_mtp(path, manifest=None):

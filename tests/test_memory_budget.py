@@ -55,7 +55,7 @@ class MemoryBudgetTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith('DSV4F_')}
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        model = Path(temporary.name)/'fixture.gguf'
+        model = Path(temporary.name)/'DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf'
         def string(value):
             value = value.encode()
             return struct.pack('<Q', len(value))+value
@@ -64,10 +64,10 @@ class MemoryBudgetTest(unittest.TestCase):
         result = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'], env=env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('RAM budget: 0 MiB; SSD payload I/O: resident', result.stdout)
-        self.assertIn('--load-mode none', result.stdout)
+        self.assertIn('RAM budget: 184320 MiB; SSD payload I/O: O_DIRECT', result.stdout)
+        self.assertIn('--load-mode dio', result.stdout)
         self.assertIn('--lazy-mode off', result.stdout)
-        self.assertNotIn('--no-host', result.stdout)
+        self.assertIn('--no-host', result.stdout)
         for value in ('-1', '123.4', '4096'):
             result = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                     env={**env, 'DSV4F_RAM_BUDGET_MIB': value}, capture_output=True)

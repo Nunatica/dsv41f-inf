@@ -13,7 +13,7 @@ lib.ggml_quantize_chunk.argtypes=[C.c_int,C.c_void_p,C.c_void_p,C.c_longlong,C.c
 lib.ggml_quantize_chunk.restype=C.c_size_t
 rng=np.random.default_rng(41)
 parser=argparse.ArgumentParser(description=__doc__)
-parser.add_argument('output',nargs='?',type=Path,default=Path('/tmp/dsv4f-v41-fixture.gguf'))
+parser.add_argument('output',nargs='?',type=Path,default=Path('/tmp/dsv4f-v41-fixture/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf'))
 parser.add_argument('--mtp',action='store_true',help='also create a small DSpark raw binary/JSON sidecar')
 parser.add_argument('--indexer-heads',type=int,choices=[2,4,32,64],default=2)
 parser.add_argument('--indexer-topk',type=int,default=8)
@@ -76,7 +76,7 @@ head=b'GGUF'+struct.pack('<IQQ',3,len(tensors),len(meta))+b''.join(kv(k,v) for k
 for name,shape,ty,data in tensors:
  head+=string(name)+struct.pack('<I',len(shape))+struct.pack('<'+'Q'*len(shape),*shape)+struct.pack('<IQ',ty,len(payload));payload+=data;payload+=bytes(-len(payload)%32)
 head+=bytes(-len(head)%32)
-path=args.output;path.write_bytes(head+payload);print(path,len(head+payload))
+path=args.output;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(head+payload);print(path,len(head+payload))
 
 engram_dir=path.with_suffix('.engram');engram_dir.mkdir(exist_ok=True)
 w=(np.arange(18*32,dtype=np.uint16)%110).astype(np.uint8).tobytes();sc=bytes([121]*18)

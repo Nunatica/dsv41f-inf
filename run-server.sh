@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Zero keeps the original resident loader; a positive process-tree budget enables tiering.
-export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-0}
+export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-184320}
 export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-4096}
 export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
 case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
@@ -22,7 +22,7 @@ if [[ -v DSV4F_RAM_CACHE_MIB ]]; then
     fi
     export DSV4F_RAM_CACHE_MIB
 fi
-export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf}"
+export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf}"
 export DSV4F_ENGRAM_DIR="${DSV4F_ENGRAM_DIR:-$ROOT/models}"
 export DSV4F_ENGRAM_DECODE=${DSV4F_ENGRAM_DECODE:-lut}
 export DSV4F_ENGRAM_CACHE_MIB=${DSV4F_ENGRAM_CACHE_MIB:-32}

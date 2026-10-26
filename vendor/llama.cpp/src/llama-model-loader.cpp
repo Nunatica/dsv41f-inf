@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 #include "direct-weights.h"
+#include "model-format.h"
+#include "gguf-compat.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -575,6 +577,15 @@ llama_model_loader::llama_model_loader(
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        const auto dsv_format=dsv4f_format(fname);
+        if(arch_name=="deepseek41") {
+            if(dsv_format==dsv4f_model_format::unknown)
+                throw std::runtime_error("unsupported V4.1 filename: use the exact dsx-2.6bit or UD-Q4_K_XL first filename");
+            if(dsv_format==dsv4f_model_format::ud_q4_k_xl) {
+                dsv4f_native_metadata(metadata);
+                LLAMA_LOG_INFO("[dsv4f-format] exact filename selected native UD-Q4_K_XL metadata\n");
+            }
+        } else if(dsv_format!=dsv4f_model_format::unknown)throw std::runtime_error("V4.1 filename/architecture mismatch");
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
@@ -598,9 +609,12 @@ llama_model_loader::llama_model_loader(
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        if(dsv_format==dsv4f_model_format::ud_q4_k_xl && n_split!=9)
+            throw std::runtime_error("UD-Q4_K_XL requires exactly nine declared shards");
 
         // Load additional GGML contexts
         if (n_split > 1) {
+            bool external_engram=false;
             // make sure the main file is loaded first
             uint16_t idx = 0;
             const std::string kv_split_no = llm_kv(LLM_KV_SPLIT_NO);
@@ -626,6 +640,13 @@ llama_model_loader::llama_model_loader(
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
                 const char * fname_split = splits[idx].c_str();
+                if(dsv_format==dsv4f_model_format::ud_q4_k_xl && idx==7 && !std::filesystem::exists(fname_split)) {
+                    const char * dir=std::getenv("DSV4F_ENGRAM_DIR");
+                    if(!dir || !*dir)throw std::runtime_error("missing Engram shard requires DSV4F_ENGRAM_DIR with original FP8 tables");
+                    external_engram=true;
+                    LLAMA_LOG_INFO("[dsv4f-format] skipping missing Engram shard 8/9; original FP8 tables required from %s\n",dir);
+                    continue;
+                }
 
                 struct gguf_init_params split_params = {
                     /*.no_alloc = */ true,
@@ -648,6 +669,7 @@ llama_model_loader::llama_model_loader(
                     }
                 }
 
+                const uint16_t file_idx=files.size();
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 if (dsv4f_direct_weights_enabled() && !files.back()->has_direct_io()) {
                     throw std::runtime_error("GGUF shard does not support O_DIRECT");
@@ -663,7 +685,7 @@ llama_model_loader::llama_model_loader(
                     }
                     n_elements += ggml_nelements(cur);
                     n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), file_idx, ctx_gguf.get(), cur));
                 }
             }
 
@@ -672,7 +694,7 @@ llama_model_loader::llama_model_loader(
             // sanity check
             {
                 const int n_tensors_loaded = (int) weights_map.size();
-                if (n_tensors != n_tensors_loaded) {
+                if (n_tensors != n_tensors_loaded+(external_engram?1:0)) {
                     throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
                 }
             }

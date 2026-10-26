@@ -296,7 +296,17 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
             const int slot=eit-m.engram_layers.begin();
             in->engr[slot]=in->engram_async->tensor(ctx0,x,slot,kv_dev);
         }
-        if(eit!=m.engram_layers.end()) {auto * kv=ggml_mul_mat(ctx0,m.W(l,"engram_kv.weight"),in->engr[eit-m.engram_layers.begin()]);auto * key=ggml_view_3d(ctx0,kv,D,H,N,D*4,kv->nb[1],0);auto * val=ggml_view_3d(ctx0,kv,D,1,N,D*4,kv->nb[1],D*H*4);auto * dot=ggml_scale(ctx0,ggml_sum_rows(ctx0,ggml_mul(ctx0,ggml_mul(ctx0,ggml_rms_norm(ctx0,x,m.eps),ggml_mul(ctx0,m.W(l,"engram_q_norm.weight"),m.W(l,"engram_k_norm.weight"))),ggml_rms_norm(ctx0,ggml_cont(ctx0,key),m.eps))),1.f/sqrtf(D));auto * gate=ggml_sigmoid(ctx0,ggml_mul(ctx0,ggml_sgn(ctx0,dot),ggml_sqrt(ctx0,ggml_clamp(ctx0,ggml_abs(ctx0,dot),1e-6f,INFINITY))));x=ggml_add(ctx0,x,ggml_mul(ctx0,ggml_repeat(ctx0,ggml_cont(ctx0,val),x),gate));}
+        if(eit!=m.engram_layers.end()) {
+            auto * kv=ggml_mul_mat(ctx0,m.W(l,"engram_kv.weight"),in->engr[eit-m.engram_layers.begin()]);
+            auto * key=ggml_view_3d(ctx0,kv,D,H,N,D*4,kv->nb[1],0);
+            auto * val=ggml_view_3d(ctx0,kv,D,1,N,D*4,kv->nb[1],D*H*4);
+            // Native UD files store the product of the two RMSNorm scales.
+            auto * scales=m.weights.count("blk."+std::to_string(l)+".engram_gate.weight")?
+                m.W(l,"engram_gate.weight"):ggml_mul(ctx0,m.W(l,"engram_q_norm.weight"),m.W(l,"engram_k_norm.weight"));
+            auto * dot=ggml_scale(ctx0,ggml_sum_rows(ctx0,ggml_mul(ctx0,ggml_mul(ctx0,ggml_rms_norm(ctx0,x,m.eps),scales),ggml_rms_norm(ctx0,ggml_cont(ctx0,key),m.eps))),1.f/sqrtf(D));
+            auto * gate=ggml_sigmoid(ctx0,ggml_mul(ctx0,ggml_sgn(ctx0,dot),ggml_sqrt(ctx0,ggml_clamp(ctx0,ggml_abs(ctx0,dot),1e-6f,INFINITY))));
+            x=ggml_add(ctx0,x,ggml_mul(ctx0,ggml_repeat(ctx0,ggml_cont(ctx0,val),x),gate));
+        }
         ggml_tensor * ap,*ao,*ac;mixes(x,l,"attn",&ap,&ao,&ac);
         auto * xn=norm(ggml_dsv4_hc_pre(ctx0,x,previous),m.W(l,"attn_norm.weight"));
         auto * qr=norm(ggml_mul_mat(ctx0,m.W(l,"attn_q_a.weight"),xn),m.W(l,"attn_q_a_norm.weight"));
