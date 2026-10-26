@@ -262,6 +262,154 @@ void release(const void * ptr) {
     auto it=c.leases.find(ptr);if(it==c.leases.end())return;
     auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);if(!--e.users)c.changed.notify_all();
 }
+
+struct batch_read {
+    uintptr_t key;
+    std::shared_ptr<load> request;
+    int fd;
+    uint64_t offset;
+    size_t delta,bytes,required;
+};
+void read_batch(const batch_read * reads,size_t count) {
+    if(!count)return;
+#if defined(__linux__) && defined(__NR_io_setup) && defined(__NR_io_submit) && defined(__NR_io_getevents) && defined(__NR_io_destroy)
+    struct aio_state {
+        aio_context_t context=0;
+        aio_state(){if(syscall(__NR_io_setup,128,&context)<0)context=0;}
+        void drain(){if(context){syscall(__NR_io_destroy,context);context=0;}}
+        ~aio_state(){drain();}
+    };
+    thread_local aio_state aio;
+    if(aio.context && count>1 && count<=128) {
+        std::vector<iocb> blocks(count);std::vector<iocb*> pointers(count);
+        std::vector<io_event> events(count);
+        for(size_t i=0;i<count;++i) {
+            auto & b=blocks[i];b.aio_data=i;b.aio_lio_opcode=IOCB_CMD_PREAD;b.aio_fildes=reads[i].fd;
+            b.aio_buf=(uintptr_t)reads[i].request->storage->data;b.aio_nbytes=reads[i].bytes;
+            b.aio_offset=reads[i].offset;pointers[i]=&b;
+        }
+        size_t submitted=0;
+        while(submitted<count) {
+            const long n=syscall(__NR_io_submit,aio.context,count-submitted,pointers.data()+submitted);
+            if(n>0){submitted+=size_t(n);continue;}
+            if(n<0 && errno==EINTR)continue;
+            break; // Drain submitted work, then pread any unsubmitted requests.
+        }
+        size_t completed=0;
+        while(completed<submitted) {
+            const long n=syscall(__NR_io_getevents,aio.context,1,submitted-completed,events.data()+completed,nullptr);
+            if(n>0){completed+=size_t(n);continue;}
+            if(n<0 && errno==EINTR)continue;
+            const int error=errno;
+            aio.drain(); // Never free a cache allocation while the kernel owns it.
+            throw std::runtime_error(std::string("expert batch completion failed: ")+std::strerror(error));
+        }
+        for(size_t k=0;k<submitted;++k) {
+            const auto & event=events[k];const size_t i=event.data;
+            if(i>=count || event.res<0 || uint64_t(event.res)<reads[i].required)
+                throw std::runtime_error(event.res<0?std::string("expert batch O_DIRECT read failed: ")+std::strerror(int(-event.res)):"truncated expert batch payload");
+        }
+        if(submitted) {
+            static std::once_flag announced;std::call_once(announced,[&]{
+                std::fprintf(stderr,"[dsv4f-ram-batch] reader=linux-aio depth=%zu destination=cache\n",submitted);
+            });
+            for(size_t i=submitted;i<count;++i)
+                read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
+            return;
+        }
+    }
+#endif
+    for(size_t i=0;i<count;++i)
+        read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
+}
+
+void acquire_many(const void * const * pointers,const size_t * sizes,const void ** output,size_t count) {
+    if(!count)return;
+    // Preserve the lock-held diagnostic mode, and keep single-plane calls cheap.
+    if(count==1 || !unlocked_io()) {
+        size_t held=0;
+        try{for(;held<count;++held)output[held]=acquire(pointers[held],sizes[held]);}
+        catch(...){while(held)release(output[--held]);throw;}
+        return;
+    }
+    struct ticket {const void * pointer=nullptr;std::shared_ptr<load> request;};
+    std::vector<ticket> tickets(count);std::vector<batch_read> reads;reads.reserve(count);
+    auto & c=pool();std::unique_lock<std::mutex> lock(c.mutex);
+    const uint64_t cap=c.limit();
+    auto rollback=[&] {
+        for(auto & t:tickets) {
+            if(t.request && !t.request->done){GGML_ASSERT(t.request->users);--t.request->users;continue;}
+            const void * p=t.request?t.request->pointer:t.pointer;
+            auto it=c.leases.find(p);
+            if(it!=c.leases.end()){auto & e=c.entries.at(it->second);GGML_ASSERT(e.users);--e.users;}
+        }
+        c.changed.notify_all();
+    };
+    auto fail=[&](const batch_read & r,const std::exception_ptr & error) {
+        r.request->error=error;r.request->storage.reset();r.request->done=true;
+        c.reserved-=r.bytes;c.loads.erase(r.key);r.request->ready.notify_all();
+    };
+    try {
+        for(size_t i=0;i<count;++i) {
+            const auto key=(uintptr_t)pointers[i];const size_t n=sizes[i];
+            auto s=c.sources.upper_bound(key);
+            if(s==c.sources.begin()){tickets[i].pointer=pointers[i];continue;}
+            --s;source * owner=s->second;
+            if(key-s->first>=owner->address->bytes){tickets[i].pointer=pointers[i];continue;}
+            if(owner->closing)throw std::runtime_error("direct weight source is closing");
+            auto sp=owner->spans.upper_bound(key);
+            if(sp==owner->spans.begin())throw std::runtime_error("invalid direct weight address");
+            --sp;const auto & span=sp->second;const size_t local=key-span.begin;
+            if(local>=span.bytes || n!=span.expert || local%span.expert || n>span.bytes-local)
+                throw std::runtime_error("batch weights must be complete expert planes");
+            auto it=c.entries.find(key);
+            if(it!=c.entries.end()) {
+                ++it->second.users;++c.hits;c.ages.splice(c.ages.end(),c.ages,it->second.age);
+                tickets[i].pointer=it->second.pointer;continue;
+            }
+            auto loading=c.loads.find(key);
+            if(loading!=c.loads.end()) {
+                tickets[i].request=loading->second;++loading->second->users;++c.hits;continue;
+            }
+            const uint64_t offset=span.offset+local;
+            const size_t delta=offset%alignment,total=rounded(delta+n);
+            if(total>cap)throw std::runtime_error("RAM budget has no room for a batched expert plane");
+            while(c.used>cap-total || c.reserved>cap-total-c.used) {
+                auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
+                if(victim==c.ages.end())throw std::runtime_error("RAM expert batch is exhausted by active leases");
+                c.erase(c.entries.find(*victim));
+            }
+            auto request=std::make_shared<load>();request->storage=std::make_unique<region>(total);request->owner=owner;
+            c.loads.emplace(key,request);c.reserved+=total;tickets[i].request=request;
+            reads.push_back({key,request,span.fd,offset-delta,delta,total,delta+n});
+        }
+    } catch(...) {
+        const auto error=std::current_exception();for(const auto & r:reads)fail(r,error);
+        rollback();throw;
+    }
+    std::exception_ptr error;
+    lock.unlock();
+    try {for(size_t i=0;i<reads.size();i+=128)read_batch(reads.data()+i,std::min<size_t>(128,reads.size()-i));}
+    catch(...){error=std::current_exception();}
+    lock.lock();
+    for(const auto & r:reads) {
+        if(error){fail(r,error);continue;}
+        const void * p=(char*)r.request->storage->data+r.delta;c.ages.push_back(r.key);
+        entry e;e.storage=std::move(r.request->storage);e.pointer=p;e.users=r.request->users;
+        e.owner=r.request->owner;e.age=std::prev(c.ages.end());
+        c.entries.emplace(r.key,std::move(e));c.leases.emplace(p,r.key);
+        c.reserved-=r.bytes;c.used+=r.bytes;++c.reads;c.bytes+=r.bytes;
+        r.request->pointer=p;r.request->done=true;c.loads.erase(r.key);r.request->ready.notify_all();
+        if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
+    }
+    if(error){rollback();std::rethrow_exception(error);}
+    for(auto & t:tickets)if(t.request) {
+        t.request->ready.wait(lock,[&]{return t.request->done;});
+        if(t.request->error){rollback();std::rethrow_exception(t.request->error);}
+    }
+    for(size_t i=0;i<count;++i)output[i]=tickets[i].request?tickets[i].request->pointer:tickets[i].pointer;
+    c.changed.notify_all();
+}
 void free_buffer(ggml_backend_buffer_t buffer) {
     auto * owner=(source*)buffer->context;
     auto & c=pool();
@@ -396,6 +544,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     at=0;for(const auto & t:tensors){ggml_backend_tensor_alloc(b,t.tensor,(char*)owner->address->data+at);at+=rounded(ggml_nbytes(t.tensor));}
     c.sources.emplace((uintptr_t)owner->address->data,owner.get());
     ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;ggml_dsv4f_host_weights.prefetch=prefetch;
+    ggml_dsv4f_host_weights.acquire_many=acquire_many;
     std::fprintf(stderr,"[dsv4f-ram] O_DIRECT expert source: %.2f GiB on SSD, process budget %.2f GiB, cache ceiling %.2f GiB, io_lock=%s\n",bytes/double(1ull<<30),dsv4f_ram_budget()/double(1ull<<30),c.limit()/double(1ull<<30),unlocked_io()?"released":"held");
     owner.release();return b;
 }

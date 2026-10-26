@@ -141,6 +141,9 @@ struct ggml_dsv4f_host_weights_api {
     // Non-blocking hint. The direct-weight backend may populate its RAM cache
     // in the background; resident backends leave this null.
     void (*prefetch)(const void *, size_t);
+    // All-or-nothing batch of complete expert-plane leases. Cold planes can
+    // read concurrently into their final RAM-cache allocations (no bounce).
+    void (*acquire_many)(const void * const *, const size_t *, const void **, size_t);
 };
 #ifdef __cplusplus
 extern "C" {

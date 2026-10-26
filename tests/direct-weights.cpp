@@ -61,6 +61,37 @@ int main() {
         ggml_dsv4f_host_lease lease((char*)t->data+13*plane,plane);
         require(!std::memcmp(lease.data,expected.data()+offset+13*plane,plane),"prefetched expert bytes");
     }
+    require(ggml_dsv4f_host_weights.acquire_many,"batch lease API");
+    {
+        // Mix cold planes, a duplicate key, an ordinary resident pointer and a
+        // concurrent single-plane consumer. Each returned pointer is a lease.
+        const void * pointers[10];size_t sizes[10];const void * outputs[10]{};
+        for(int i=0;i<8;++i){pointers[i]=(char*)t->data+(20+i)*plane;sizes[i]=plane;}
+        pointers[8]=pointers[0];sizes[8]=plane;pointers[9]=expected.data();sizes[9]=16;
+        std::atomic<bool> ok{true};
+        std::thread consumer([&]{
+            try{ggml_dsv4f_host_lease lease(pointers[0],plane);if(std::memcmp(lease.data,expected.data()+offset+20*plane,plane))ok=false;}
+            catch(...){ok=false;}
+        });
+        ggml_dsv4f_host_weights.acquire_many(pointers,sizes,outputs,10);
+        consumer.join();require(ok,"single/batch coalescing");
+        for(int i=0;i<8;++i)require(!std::memcmp(outputs[i],expected.data()+offset+(20+i)*plane,plane),"batch expert bytes");
+        require(outputs[8]==outputs[0] && outputs[9]==expected.data(),"batch duplicate/resident pointers");
+        for(const void * p:outputs)ggml_dsv4f_host_weights.release(p);
+    }
+    {
+        // A validation or budget failure must roll back the complete batch,
+        // including previously reserved cold loads and cache-hit refcounts.
+        const void * pointers[16];size_t sizes[16];const void * outputs[16]{};
+        for(int i=0;i<16;++i){pointers[i]=(char*)t->data+(32+i)*plane;sizes[i]=plane;}
+        sizes[1]=plane+1;bool failed=false;
+        try{ggml_dsv4f_host_weights.acquire_many(pointers,sizes,outputs,2);}catch(const std::runtime_error &){failed=true;}
+        require(failed,"invalid batch accepted");sizes[1]=plane;failed=false;
+        try{ggml_dsv4f_host_weights.acquire_many(pointers,sizes,outputs,16);}catch(const std::runtime_error &){failed=true;}
+        require(failed,"over-budget batch accepted");
+        ggml_dsv4f_host_weights.acquire_many(pointers,sizes,outputs,8);
+        for(int i=0;i<8;++i){require(!std::memcmp(outputs[i],expected.data()+offset+(32+i)*plane,plane),"batch rollback recovery");ggml_dsv4f_host_weights.release(outputs[i]);}
+    }
     // A live lease survives many evictions and is shared by simultaneous readers.
     {
         ggml_dsv4f_host_lease first(t->data,plane);
@@ -110,6 +141,13 @@ int main() {
             !std::memcmp(d.data(),expected.data()+offset+3*plane-11,d.size()),"batched direct chunks");
     require(ftruncate(fd,16)==0,"truncate fixture");rejected=false;
     try{dsv4f_direct_read(direct,got.data(),plane,offset);}catch(const std::runtime_error &){rejected=true;}
-    require(rejected,"truncation accepted");close(direct);close(fd);unlink(path);
+    require(rejected,"truncation accepted");
+    auto * bad_ctx=ggml_init({1<<20,nullptr,true});auto * bad=ggml_new_tensor_3d(bad_ctx,GGML_TYPE_F32,128,128,2);
+    auto * bad_buffer=dsv4f_direct_weights_buffer({{bad,fd,offset}});
+    const void * invalid[]={bad->data,(char*)bad->data+plane};const size_t invalid_sizes[]={plane,plane};const void * invalid_output[2]{};
+    rejected=false;
+    try{ggml_dsv4f_host_weights.acquire_many(invalid,invalid_sizes,invalid_output,2);}catch(const std::runtime_error &){rejected=true;}
+    require(rejected,"batch truncation accepted");ggml_backend_buffer_free(bad_buffer);ggml_free(bad_ctx);
+    close(direct);close(fd);unlink(path);
     std::puts("PASS: direct SSD bytes, bounded eviction, concurrent leases, EOF, no file page cache");
 }
