@@ -131,9 +131,14 @@ int main(int argc,char ** argv) {
         char temp[]="/tmp/dsv4f-engram-XXXXXX";const auto dir=std::filesystem::path(mkdtemp(temp));
         struct cleanup {std::filesystem::path p;~cleanup(){std::filesystem::remove_all(p);}} cleanup{dir};
         shard(dir/"fixture.safetensors",*m);
-        dsv4f_engram::options base;dsv4f_engram reference(*m,dir.string(),base);
+        dsv4f_engram::options base;base.batch_io=false;dsv4f_engram reference(*m,dir.string(),base);
         std::vector<int32_t> history;for(int t=0;t<64;++t)for(int n=0;n<4;++n)history.push_back(t%4==0?-1:t%4==1?10:(t*7-n+32)%32);
         std::vector<std::vector<float>> expected(2);for(int slot=0;slot<2;++slot)reference.read(slot,history,64,expected[slot]);
+        {auto o=base;o.lut=true;o.batch_io=true;dsv4f_engram batched(*m,dir.string(),o);
+         std::vector<int32_t> one(history.begin(),history.begin()+4);
+         for(int slot=0;slot<2;++slot){std::vector<float>a,b;dsv4f_engram::stats sa,sb;reference.read(slot,one,1,a,&sa);batched.read(slot,one,1,b,&sb);
+             require(a.size()==b.size()&&!std::memcmp(a.data(),b.data(),a.size()*4),"batched O_DIRECT row bit parity");
+             require(sa.reads==sb.reads&&sa.bytes==sb.bytes,"batched O_DIRECT accounting");}}
         prefetch_test(reference);
         for(int mode=0;mode<5;++mode) {
             auto opt=base;opt.lut=mode!=0;opt.dedup=mode==2||mode==4;opt.cache_bytes=mode==3?4096:mode==4?1<<20:0;

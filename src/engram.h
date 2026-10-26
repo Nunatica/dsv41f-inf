@@ -14,7 +14,7 @@ class dsv4f_engram {
     std::unique_ptr<state> impl;
 public:
     struct options {
-        bool lut=false, dedup=false, profile=false;
+        bool lut=false, dedup=false, profile=false, batch_io=true;
         size_t cache_bytes=0;
         std::string trace;
     };

@@ -93,6 +93,12 @@ int main() {
     // Source removal must leave the resident path usable.
     {ggml_dsv4f_host_lease ordinary(expected.data(),16);require(ordinary.data==expected.data(),"resident fallback");}
     const int direct=open(path,O_RDONLY|O_DIRECT);require(direct>=0,"direct fd");
+    std::vector<unsigned char> a(257),c(819),d(33);
+    const dsv4f_direct_request batch[]={{direct,a.data(),a.size(),offset+17},{direct,c.data(),c.size(),offset+plane+91},{direct,d.data(),d.size(),offset+3*plane-11}};
+    dsv4f_direct_read_many(batch,3);
+    require(!std::memcmp(a.data(),expected.data()+offset+17,a.size()) &&
+            !std::memcmp(c.data(),expected.data()+offset+plane+91,c.size()) &&
+            !std::memcmp(d.data(),expected.data()+offset+3*plane-11,d.size()),"batched direct chunks");
     require(ftruncate(fd,16)==0,"truncate fixture");rejected=false;
     try{dsv4f_direct_read(direct,got.data(),plane,offset);}catch(const std::runtime_error &){rejected=true;}
     require(rejected,"truncation accepted");close(direct);close(fd);unlink(path);

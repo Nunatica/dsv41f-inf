@@ -19,7 +19,11 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/aio_abi.h>
+#endif
 
 namespace {
 constexpr size_t alignment=4096;
@@ -240,6 +244,63 @@ void dsv4f_direct_read(int fd,void * output,size_t n,uint64_t off) {
     if(!scratch || scratch->bytes<count)scratch=std::make_unique<region>(count);
     read_aligned(fd,scratch->data,count,off-delta,delta+n);
     std::memcpy(output,(char*)scratch->data+delta,n);
+}
+void dsv4f_direct_read_many(const dsv4f_direct_request * requests,size_t count) {
+    if(!count)return;
+    if(count==1){dsv4f_direct_read(requests[0].fd,requests[0].output,requests[0].bytes,requests[0].offset);return;}
+#if defined(__linux__) && defined(__NR_io_setup) && defined(__NR_io_submit) && defined(__NR_io_getevents) && defined(__NR_io_destroy)
+    struct aio_state {
+        aio_context_t context=0;
+        aio_state(){if(syscall(__NR_io_setup,128,&context)<0)context=0;}
+        ~aio_state(){if(context)syscall(__NR_io_destroy,context);}
+    };
+    thread_local aio_state aio;
+    if(aio.context && count<=128) {
+        size_t total=0;
+        std::vector<size_t> positions(count),deltas(count),sizes(count);
+        for(size_t i=0;i<count;++i) {
+            deltas[i]=requests[i].offset%alignment;sizes[i]=rounded(deltas[i]+requests[i].bytes);
+            positions[i]=total;if(total>SIZE_MAX-sizes[i])throw std::runtime_error("direct I/O batch size overflow");total+=sizes[i];
+        }
+        thread_local std::unique_ptr<region> batch_storage;
+        if(!batch_storage || batch_storage->bytes<total)batch_storage=std::make_unique<region>(total);
+        auto * storage=batch_storage.get();
+        std::vector<iocb> blocks(count);std::vector<iocb*> pointers(count);
+        for(size_t i=0;i<count;++i) {
+            auto & b=blocks[i];b.aio_data=i;b.aio_lio_opcode=IOCB_CMD_PREAD;b.aio_fildes=requests[i].fd;
+            b.aio_buf=(uintptr_t)((char*)storage->data+positions[i]);b.aio_nbytes=sizes[i];
+            b.aio_offset=requests[i].offset-deltas[i];pointers[i]=&b;
+        }
+        size_t submitted=0;int submit_error=0;
+        while(submitted<count) {
+            const long n=syscall(__NR_io_submit,aio.context,count-submitted,pointers.data()+submitted);
+            if(n>0){submitted+=size_t(n);continue;}
+            if(n<0 && errno==EINTR)continue;
+            submit_error=n<0?errno:EIO;break;
+        }
+        if(submitted) {
+            std::vector<io_event> events(submitted);size_t completed=0;
+            while(completed<submitted) {
+                const long n=syscall(__NR_io_getevents,aio.context,1,submitted-completed,events.data()+completed,nullptr);
+                if(n>0){completed+=size_t(n);continue;}
+                if(n<0 && errno==EINTR)continue;
+                throw std::runtime_error(std::string("O_DIRECT batch completion failed: ")+std::strerror(errno));
+            }
+            for(const auto & event:events) {
+                const size_t i=event.data;
+                if(i>=count || event.res<0 || uint64_t(event.res)<deltas[i]+requests[i].bytes)
+                    throw std::runtime_error(event.res<0?std::string("O_DIRECT batch read failed: ")+std::strerror(int(-event.res)):"truncated direct I/O batch payload");
+            }
+            if(submit_error || submitted!=count)
+                throw std::runtime_error(std::string("O_DIRECT batch submit failed: ")+std::strerror(submit_error?submit_error:EIO));
+            for(size_t i=0;i<count;++i)std::memcpy(requests[i].output,(char*)storage->data+positions[i]+deltas[i],requests[i].bytes);
+            static std::once_flag native_log;std::call_once(native_log,[&]{std::fprintf(stderr,"[dsv4f-ram] O_DIRECT batch reader: linux-aio depth=%zu\n",count);});
+            return;
+        }
+    }
+#endif
+    static std::once_flag fallback_log;std::call_once(fallback_log,[]{std::fprintf(stderr,"[dsv4f-ram] O_DIRECT batch reader unavailable; using sequential pread\n");});
+    for(size_t i=0;i<count;++i)dsv4f_direct_read(requests[i].fd,requests[i].output,requests[i].bytes,requests[i].offset);
 }
 ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct_tensor> & tensors) {
     auto owner=std::make_unique<source>();size_t bytes=0;

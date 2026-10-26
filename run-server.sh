@@ -27,8 +27,10 @@ export DSV4F_ENGRAM_DIR="${DSV4F_ENGRAM_DIR:-$ROOT/models}"
 export DSV4F_ENGRAM_DECODE=${DSV4F_ENGRAM_DECODE:-lut}
 export DSV4F_ENGRAM_CACHE_MIB=${DSV4F_ENGRAM_CACHE_MIB:-32}
 export DSV4F_ENGRAM_DEDUP=${DSV4F_ENGRAM_DEDUP:-0}
+export DSV4F_ENGRAM_BATCH_IO=${DSV4F_ENGRAM_BATCH_IO:-1}
 case "$DSV4F_ENGRAM_DECODE" in baseline|lut) ;; *) echo 'DSV4F_ENGRAM_DECODE must be baseline or lut.' >&2; exit 1;; esac
 case "$DSV4F_ENGRAM_DEDUP" in 0|1) ;; *) echo 'DSV4F_ENGRAM_DEDUP must be 0 or 1.' >&2; exit 1;; esac
+case "$DSV4F_ENGRAM_BATCH_IO" in 0|1) ;; *) echo 'DSV4F_ENGRAM_BATCH_IO must be 0 or 1.' >&2; exit 1;; esac
 if [[ ! $DSV4F_ENGRAM_CACHE_MIB =~ ^[0-9]{1,4}$ ]] || ((10#$DSV4F_ENGRAM_CACHE_MIB > 4096)); then
     echo 'DSV4F_ENGRAM_CACHE_MIB must be an integer in 0..4096.' >&2; exit 1
 fi
