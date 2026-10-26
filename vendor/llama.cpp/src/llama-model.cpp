@@ -1918,7 +1918,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             std::vector<dsv4f_direct_tensor> tensors;
             for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
                 const auto & w=ml.require_weight(t->name);
-                tensors.push_back({t,ml.files.at(w.idx)->file_id(),w.offs});
+                tensors.push_back({t,ml.files.at(w.idx)->file_id(),w.offs,w.idx});
             }
             bufs.emplace_back(dsv4f_direct_weights_buffer(tensors));
         } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {

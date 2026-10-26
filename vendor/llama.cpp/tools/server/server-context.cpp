@@ -13,6 +13,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h"
+#include "direct-weights.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1561,6 +1562,15 @@ private:
                 return false;
             }
             server_vram_snapshot("ready");
+        }
+
+        // Contexts and warmup have allocated the runtime's host buffers. Fill
+        // only the remaining RAM allowance before publishing server readiness.
+        try {
+            dsv4f_preload_experts();
+        } catch (const std::exception & e) {
+            SRV_ERR("expert RAM preload failed: %s\n", e.what());
+            return false;
         }
 
         // propagate new defaults back to caller

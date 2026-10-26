@@ -81,15 +81,19 @@ In budgeted mode, the engine keeps its existing dynamic VRAM expert cache. Exper
 
 In budgeted mode, the RAM cache grows into the budget left after measured process RSS and a safety reserve. SSD latency therefore affects cold reads and cache misses. The full GGUF no longer needs to fit in RAM. These settings are in MiB:
 
+Startup expert preload is **off by default** (`DSV4F_RAM_PRELOAD=0`). Set `DSV4F_RAM_PRELOAD=1` with a positive RAM budget to preload expert planes into the RAM cache after context allocation and warmup, before the server becomes ready. It reads shards and tensor offsets in ascending file order through O_DIRECT, stopping when the next plane would exceed the current cache allowance (including alignment). Existing cached experts are reused, and preload never evicts earlier entries to scan the rest of the model. The process budget, runtime RSS, `DSV4F_RAM_RESERVE_MIB`, and optional `DSV4F_RAM_CACHE_MIB` all constrain the preload. Progress and the final loaded amount appear under `[dsv4f-ram-preload]`; startup takes longer to perform these reads. With `DSV4F_RAM_BUDGET_MIB=0`, the original resident loader remains in use and this preload step does nothing even if enabled.
+
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
 | `DSV4F_RAM_BUDGET_MIB` | `184320` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
+| `DSV4F_RAM_PRELOAD` | `0` | `1`: preload experts at startup when the RAM budget is positive; `0`: disabled. |
 | `DSV4F_RAM_RESERVE_MIB` | `4096` | Headroom left outside the expert cache for runtime growth. |
 | `DSV4F_RAM_CACHE_MIB` | automatic | Optional additional ceiling for the expert RAM cache. |
 | `DSV4F_EXPERT_CACHE_MIB` | `14336` | Existing aggregate VRAM expert-cache ceiling. |
 
 ```bash
 ./run-server.sh                          # Tiered mode, 180 GiB RAM ceiling
+DSV4F_RAM_PRELOAD=1 ./run-server.sh       # Optional startup expert preload
 DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stays on SSD
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```

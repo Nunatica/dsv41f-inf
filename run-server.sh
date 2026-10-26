@@ -7,6 +7,8 @@ export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-184320}
 export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-4096}
 export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
 case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
+export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-0}
+case "$DSV4F_RAM_PRELOAD" in 0|1) ;; *) echo 'DSV4F_RAM_PRELOAD must be 0 or 1.' >&2; exit 1;; esac
 for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
     value=${!name}
     if [[ ! $value =~ ^[0-9]{1,10}$ ]] || ((10#$value > 16777216)); then
@@ -255,6 +257,7 @@ fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
     echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
+    echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'
     exit 0

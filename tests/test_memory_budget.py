@@ -65,6 +65,7 @@ class MemoryBudgetTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RAM budget: 184320 MiB; SSD payload I/O: O_DIRECT', result.stdout)
+        self.assertIn('Expert RAM preload: 0', result.stdout)
         self.assertIn('--load-mode dio', result.stdout)
         self.assertIn('--lazy-mode off', result.stdout)
         self.assertIn('--no-host', result.stdout)
@@ -85,3 +86,12 @@ class MemoryBudgetTest(unittest.TestCase):
         self.assertIn('RAM budget: 163840 MiB; SSD payload I/O: O_DIRECT', tiered.stdout)
         self.assertIn('--load-mode dio', tiered.stdout)
         self.assertIn('--no-host', tiered.stdout)
+
+        preload = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
+                                 env={**env, 'DSV4F_RAM_PRELOAD': '1'}, capture_output=True, text=True)
+        self.assertEqual(preload.returncode, 0, preload.stderr)
+        self.assertIn('Expert RAM preload: 1', preload.stdout)
+        invalid = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
+                                 env={**env, 'DSV4F_RAM_PRELOAD': '2'}, capture_output=True, text=True)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn('DSV4F_RAM_PRELOAD must be 0 or 1', invalid.stderr)

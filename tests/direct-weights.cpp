@@ -36,6 +36,34 @@ int main() {
     auto * ctx=ggml_init({1<<20,nullptr,true});require(ctx,"context");
     auto * t=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,128,128,count);
     auto * b=dsv4f_direct_weights_buffer({{t,fd,offset}});
+    unsetenv("DSV4F_RAM_PRELOAD");
+    auto preload=dsv4f_preload_experts();
+    require(!preload.planes && !preload.read_bytes,"default performed preload");
+    setenv("DSV4F_RAM_PRELOAD","0",1);
+    preload=dsv4f_preload_experts();
+    ggml_dsv4f_host_weights_stats disabled{};
+    ggml_dsv4f_host_weights.statistics(&disabled);
+    require(!preload.planes && !disabled.reads && !disabled.resident_bytes,"disabled preload read or cached weights");
+    setenv("DSV4F_RAM_PRELOAD","1",1);
+    // Startup must keep the first fitting prefix, without reading the entire
+    // model into a rolling LRU that would leave only the last experts cached.
+    const size_t allocated_plane=plane+4096,fitting=(1<<20)/allocated_plane;
+    preload=dsv4f_preload_experts();
+    require(preload.budget_limited && preload.planes==fitting,"preload fitting prefix");
+    require(preload.resident_bytes==fitting*allocated_plane && preload.read_bytes==preload.resident_bytes,"preload accounting");
+    ggml_dsv4f_host_weights_stats preloaded{},reused{};
+    ggml_dsv4f_host_weights.statistics(&preloaded);
+    for(size_t i=0;i<fitting;++i) {
+        ggml_dsv4f_host_lease lease((char*)t->data+i*plane,plane);
+        require(!std::memcmp(lease.data,expected.data()+offset+i*plane,plane),"preloaded bytes");
+    }
+    preload=dsv4f_preload_experts();
+    ggml_dsv4f_host_weights.statistics(&reused);
+    require(!preload.read_bytes && reused.reads==preloaded.reads && reused.evictions==preloaded.evictions,"preload reread/evicted existing prefix");
+    setenv("DSV4F_RAM_BUDGET_MIB","0",1);
+    preload=dsv4f_preload_experts();
+    require(!preload.planes && !preload.read_bytes,"zero budget performed preload");
+    setenv("DSV4F_RAM_BUDGET_MIB","131072",1);
     // Cold loads for distinct experts may run concurrently. Requests for the
     // same cold expert coalesce onto one in-flight read and share its lease.
     for(bool same:{false,true}) {
@@ -145,12 +173,36 @@ int main() {
     for(size_t i=0;i<count;++i){ggml_dsv4f_host_lease decode((char*)t->data+i*plane,plane);}
     ggml_dsv4f_host_weights_stats after_decode{};ggml_dsv4f_host_weights.statistics(&after_decode);
     require(after_decode.evictions>previous.evictions,"decode did not restore ordinary LRU");
-    // The engine never faults weight file pages into the OS file cache.
+    ggml_backend_buffer_free(b);ggml_free(ctx);
+    // Descriptor/tensor name order can differ from on-disk order. Shard index
+    // takes precedence over offset, even with the later shard registered first.
+    {
+        auto * order_ctx=ggml_init({1<<20,nullptr,true});
+        auto * later=ggml_new_tensor_3d(order_ctx,GGML_TYPE_F32,128,1280,1);
+        auto * later_offset=ggml_new_tensor_3d(order_ctx,GGML_TYPE_F32,128,1280,1);
+        auto * earlier=ggml_new_tensor_3d(order_ctx,GGML_TYPE_F32,128,1280,1);
+        auto * order_buffer=dsv4f_direct_weights_buffer({{later,fd,offset,1},
+            {later_offset,fd,offset+plane*30,0},{earlier,fd,offset+plane*20,0}});
+        ggml_dsv4f_host_weights_stats before{},after{};
+        preload=dsv4f_preload_experts();
+        require(preload.planes==1 && preload.budget_limited,"preload shard order count");
+        ggml_dsv4f_host_weights.statistics(&before);
+        {ggml_dsv4f_host_lease lease(earlier->data,earlier->nb[2]);
+            require(!std::memcmp(lease.data,expected.data()+offset+plane*20,earlier->nb[2]),"preload earlier shard bytes");}
+        ggml_dsv4f_host_weights.statistics(&after);
+        require(after.reads==before.reads,"preload did not start with earlier shard");
+        setenv("DSV4F_RAM_CACHE_MIB","2",1);
+        preload=dsv4f_preload_experts();
+        require(preload.planes==3 && !preload.budget_limited,"all experts fit preload");
+        ggml_backend_buffer_free(order_buffer);ggml_free(order_ctx);
+        setenv("DSV4F_RAM_CACHE_MIB","1",1);
+    }
+    // The engine never faults weight file pages into the OS file cache,
+    // including during startup preload.
     std::vector<unsigned char> residency(file_pages);
     require(mincore(file_map,file_pages*4096,residency.data())==0,"mincore");
     for(size_t i=0;i<file_pages;++i)require(!(residency[i]&1) || (baseline[i]&1),"O_DIRECT populated the file page cache");
     munmap(file_map,file_pages*4096);
-    ggml_backend_buffer_free(b);ggml_free(ctx);
     // Consecutive unaligned direct chunks must keep the logical file cursor.
     {
         llama_file input(path,"rb",true);

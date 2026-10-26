@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -81,11 +82,12 @@ void read_aligned(int fd,void * dst,size_t n,uint64_t off,size_t required) {
 }
 struct source {
     std::unique_ptr<region> address;
-    struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;};
+    struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;uint32_t file_index;};
     std::map<uintptr_t,span> spans;
     std::vector<int> fds;
     bool closing=false;
     size_t prefetches=0;
+    uint64_t sequence=0;
     ~source(){for(int fd:fds)close(fd);}
 };
 struct load {
@@ -122,6 +124,7 @@ struct cache {
     uint64_t used=0,reserved=0,hits=0,reads=0,bytes=0,evictions=0;
     uint64_t transient_used=0,transient_reserved=0,transient_reads=0,transient_bytes=0;
     uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
+    uint64_t next_source=0;
     ~cache()=default;
     uint64_t limit() const {
         const uint64_t budget=dsv4f_ram_budget();
@@ -159,6 +162,7 @@ struct cache {
 // Outlives model/backend static teardown; it contains no allocations after model unload.
 cache & pool(){static auto * p=new cache;return *p;}
 const void * acquire(const void * ptr,size_t n);
+const void * acquire_impl(const void * ptr,size_t n,bool preload);
 void release(const void * ptr);
 void prefetch_worker() {
     auto & c=pool();
@@ -206,6 +210,9 @@ void prefetch(const void * ptr,size_t n) {
     c.prefetch_ready.notify_all();
 }
 const void * acquire(const void * ptr,size_t n) {
+    return acquire_impl(ptr,n,false);
+}
+const void * acquire_impl(const void * ptr,size_t n,bool preload) {
     auto & c=pool();std::unique_lock<std::mutex> lock(c.mutex);
     const auto key=(uintptr_t)ptr;
     auto s=c.sources.upper_bound(key);
@@ -235,6 +242,9 @@ const void * acquire(const void * ptr,size_t n) {
     const uint64_t offset=span.offset+local;
     const size_t delta=offset%alignment,total=rounded(delta+n);
     const uint64_t cap=c.limit();
+    // Startup fills only unused room. Never scan/evict the already loaded
+    // prefix just to replace it with later weights when the cache is full.
+    if(preload && (total>cap || c.used>cap-total || c.reserved>cap-total-c.used))return nullptr;
     if(total>cap)throw std::runtime_error("RAM budget has no room for an expert plane; reduce context/batch or reserve");
     while(c.used>cap-total || c.reserved>cap-total-c.used) {
         auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
@@ -531,6 +541,68 @@ void get_tensor(ggml_backend_buffer_t,const ggml_tensor * t,void * output,size_t
 }
 uint64_t dsv4f_ram_budget(){return env_mib("DSV4F_RAM_BUDGET_MIB",0);}
 bool dsv4f_direct_weights_enabled(){return dsv4f_ram_budget()!=0;}
+dsv4f_preload_result dsv4f_preload_experts() {
+    dsv4f_preload_result result;
+    const char * enabled=std::getenv("DSV4F_RAM_PRELOAD");
+    if(!enabled || !std::strcmp(enabled,"0"))return result;
+    if(std::strcmp(enabled,"1"))throw std::runtime_error("DSV4F_RAM_PRELOAD must be 0 or 1");
+    if(!dsv4f_direct_weights_enabled())return result;
+    auto & c=pool();
+    struct source_hold {
+        cache & c;
+        std::vector<source*> owners;
+        ~source_hold() {
+            std::lock_guard<std::mutex> lock(c.mutex);
+            for(auto * s:owners){GGML_ASSERT(s->prefetches);--s->prefetches;}
+            c.changed.notify_all();
+        }
+    } hold{c,{}};
+    struct ordered_span { uint64_t sequence;source::span span; };
+    std::vector<ordered_span> spans;
+    uint64_t initial_bytes=0;
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        for(const auto & item:c.sources) {
+            auto * s=item.second;if(s->closing)continue;
+            hold.owners.push_back(s);++s->prefetches;
+            for(const auto & item:s->spans)spans.push_back({s->sequence,item.second});
+        }
+        if(spans.empty())return result;
+        initial_bytes=c.bytes;
+        std::fprintf(stderr,"[dsv4f-ram-preload] begin: resident=%.2f GiB ceiling=%.2f GiB order=shard,offset O_DIRECT\n",
+            c.used/double(1ull<<30),c.limit()/double(1ull<<30));
+    }
+    std::sort(spans.begin(),spans.end(),[](const ordered_span & a,const ordered_span & b) {
+        return std::tie(a.sequence,a.span.file_index,a.span.offset)<std::tie(b.sequence,b.span.file_index,b.span.offset);
+    });
+    const auto start=std::chrono::steady_clock::now();auto progress=start;
+    for(const auto & item:spans) {
+        const auto & span=item.span;
+        if(!span.expert || span.bytes%span.expert)throw std::runtime_error("invalid expert geometry for startup preload");
+        for(size_t at=0;at<span.bytes;at+=span.expert) {
+            const void * p=acquire_impl((const void*)(span.begin+at),span.expert,true);
+            if(!p){result.budget_limited=true;break;}
+            release(p);++result.planes;
+            const auto now=std::chrono::steady_clock::now();
+            if(now-progress>=std::chrono::seconds(5)) {
+                std::lock_guard<std::mutex> lock(c.mutex);
+                std::fprintf(stderr,"[dsv4f-ram-preload] planes=%llu resident=%.2f GiB read=%.2f GiB\n",
+                    (unsigned long long)result.planes,c.used/double(1ull<<30),(c.bytes-initial_bytes)/double(1ull<<30));
+                progress=now;
+            }
+        }
+        if(result.budget_limited)break;
+    }
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        result.read_bytes=c.bytes-initial_bytes;result.resident_bytes=c.used;
+        std::fprintf(stderr,"[dsv4f-ram-preload] complete: planes=%llu read=%.2f GiB resident=%.2f GiB ceiling=%.2f GiB stop=%s elapsed=%.2f s\n",
+            (unsigned long long)result.planes,result.read_bytes/double(1ull<<30),result.resident_bytes/double(1ull<<30),
+            c.limit()/double(1ull<<30),result.budget_limited?"budget":"all-experts",
+            std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+    }
+    return result;
+}
 void dsv4f_direct_read(int fd,void * output,size_t n,uint64_t off) {
     if(!n)return;
     const size_t delta=off%alignment;
@@ -612,7 +684,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
             owner->fds.push_back(fd);opened[t.fd]=fd;
         }
         const auto key=(uintptr_t)owner->address->data+at;
-        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset});
+        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset,t.file_index});
         at+=rounded(ggml_nbytes(t.tensor));
     }
     auto & c=pool();
@@ -621,6 +693,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     auto * b=ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(),iface,owner.get(),owner->address->bytes);
     at=0;for(const auto & t:tensors){ggml_backend_tensor_alloc(b,t.tensor,(char*)owner->address->data+at);at+=rounded(ggml_nbytes(t.tensor));}
     c.sources.emplace((uintptr_t)owner->address->data,owner.get());
+    owner->sequence=c.next_source++;
     ggml_dsv4f_host_weights.acquire=acquire;ggml_dsv4f_host_weights.release=release;ggml_dsv4f_host_weights.prefetch=prefetch;
     ggml_dsv4f_host_weights.acquire_many=acquire_many;
     ggml_dsv4f_host_weights.acquire_prefill=acquire_prefill;ggml_dsv4f_host_weights.statistics=statistics;
