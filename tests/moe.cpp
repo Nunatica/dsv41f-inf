@@ -4,6 +4,7 @@
 #include "ggml-backend-moe-cache.h"
 #include "ggml-cpu.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,10 @@
 #include <random>
 #include <thread>
 #include <vector>
+
+static std::atomic<size_t> host_acquires{0},host_releases{0};
+static const void * count_acquire(const void * data,size_t) { ++host_acquires;return data; }
+static void count_release(const void *) { ++host_releases; }
 
 static bool check(ggml_backend_t gpu, ggml_type gt, ggml_type ut, ggml_type dt, float limit) {
     auto * ctx = ggml_init({64*1024*1024, nullptr, false});
@@ -48,11 +53,16 @@ static bool check(ggml_backend_t gpu, ggml_type gt, ggml_type ut, ggml_type dt, 
     std::vector<float> gold((float *)ref->data,(float *)ref->data+ne);
     auto * fused=dsv4f_moe(ctx,x,ids,w,g,u,d,limit);
     auto * test=ggml_new_graph(ctx);ggml_build_forward_expand(test,fused);
+    const auto saved_host=ggml_dsv4f_host_weights;
+    host_acquires=0;host_releases=0;
+    ggml_dsv4f_host_weights={count_acquire,count_release};
     if(ggml_graph_compute_with_ctx(ctx,test,4)!=GGML_STATUS_SUCCESS)std::abort();
+    ggml_dsv4f_host_weights=saved_host;
+    const auto acquire_count=host_acquires.load(),release_count=host_releases.load();
     float cpu_error=0;
     for(int i=0;i<ne;++i)cpu_error=std::max(cpu_error,std::abs(gold[i]-((float *)fused->data)[i]));
-    bool ok=cpu_error<1e-4;
-    printf("%s/%s/%s limit=%g CPU max_error=%g\n",ggml_type_name(gt),ggml_type_name(ut),ggml_type_name(dt),limit,cpu_error);
+    bool ok=cpu_error<1e-4 && acquire_count==3*used && release_count==3*used;
+    printf("%s/%s/%s limit=%g CPU max_error=%g host_leases=%zu/%zu\n",ggml_type_name(gt),ggml_type_name(ut),ggml_type_name(dt),limit,cpu_error,acquire_count,release_count);
     // The GPU service calls a separate CPU entry point. Exercise worker
     // synchronization and reused scratch with changing inputs and hit masks.
     float service_error=0;
@@ -123,6 +133,7 @@ int main() {
     setenv("GGML_CUDA_MOE_CACHE","0",1);
     setenv("DSV4F_EXPERT_CACHE_MIB","64",1);
     setenv("DSV4F_GPU_JOIN","1",1);
+    setenv("DSV4F_CPU_EXPERT_LEASE","1",1);
     ggml_backend_load_all();ggml_cpu_init();
     if(!ggml_dsv4f_experts.dispatch){fprintf(stderr,"GPU backend is required for complete expert parity tests\n");return 2;}
     auto * gpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);

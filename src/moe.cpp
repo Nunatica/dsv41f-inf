@@ -61,7 +61,7 @@ void write_cpu_trace(const ggml_tensor * gate, const ggml_tensor * up, const ggm
 
 struct cpu_options {
     int chunk=32,rows=1;
-    bool contiguous=false,physical=false;
+    bool contiguous=false,physical=false,expert_lease=true;
     cpu_options() {
         auto number=[](const char * name,int fallback,int maximum) {
             const char * v=std::getenv(name);if(!v)return fallback;char * end=nullptr;const auto n=std::strtol(v,&end,10);
@@ -77,6 +77,10 @@ struct cpu_options {
         if(const char * v=std::getenv("DSV4F_CPU_AFFINITY")) {
             if(!std::strcmp(v,"physical"))physical=true;
             else if(std::strcmp(v,"none"))throw std::runtime_error("DSV4F_CPU_AFFINITY must be none or physical");
+        }
+        if(const char * v=std::getenv("DSV4F_CPU_EXPERT_LEASE")) {
+            if(!std::strcmp(v,"0"))expert_lease=false;
+            else if(std::strcmp(v,"1"))throw std::runtime_error("DSV4F_CPU_EXPERT_LEASE must be 0 or 1");
         }
         if(rows>1 && !dsv4f_mxfp4_rows_supported()) {
             std::fprintf(stderr,"[dsv4f-cpu] multi-row AVX2 unavailable; using reference dot product\n");rows=1;
@@ -175,7 +179,7 @@ public:
             if(int(topology.size())>=n)cpus.assign(topology.begin(),topology.begin()+n);
             else std::fprintf(stderr,"[dsv4f-cpu] physical affinity unavailable for %d workers (%zu eligible cores); using scheduler\n",n,topology.size());
         }
-        std::fprintf(stderr,"[dsv4f-cpu] workers=%d affinity=%s schedule=%s chunk=%d dot_rows=%d dot_isa=%s cpus=",n,cpus.empty()?"none":"physical",options().contiguous?"static":"dynamic",options().chunk,options().rows,dsv4f_mxfp4_rows_isa());
+        std::fprintf(stderr,"[dsv4f-cpu] workers=%d affinity=%s schedule=%s chunk=%d dot_rows=%d dot_isa=%s expert_lease=%s cpus=",n,cpus.empty()?"none":"physical",options().contiguous?"static":"dynamic",options().chunk,options().rows,dsv4f_mxfp4_rows_isa(),options().expert_lease?"expert":"row");
         for(int cpu:cpus)std::fprintf(stderr,"%d,",cpu);
         std::fprintf(stderr,"\n");
         for (int i = 1; i < n; ++i) threads.emplace_back([this,i] {
@@ -239,10 +243,8 @@ public:
     }
 };
 
-void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * ag,const void * au,
-                  int eid,int start,int end,int ne,float limit,float * output) {
-    ggml_dsv4f_host_lease gate_lease((const char*)gate->data+eid*gate->nb[2],gate->nb[2]);
-    ggml_dsv4f_host_lease up_lease((const char*)up->data+eid*up->nb[2],up->nb[2]);
+void gate_up_rows_data(const ggml_tensor * gate,const ggml_tensor * up,const void * gate_data,const void * up_data,
+                       const void * ag,const void * au,int start,int end,int ne,float limit,float * output) {
     const auto * tg=ggml_get_type_traits_cpu(gate->type),*tu=ggml_get_type_traits_cpu(up->type);
     const int tile=options().rows;
     const bool tiled=tile>1 && gate->type==GGML_TYPE_MXFP4 && up->type==GGML_TYPE_MXFP4 &&
@@ -250,7 +252,7 @@ void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * a
     int r=start;
     if(tiled) {
       const auto full=dsv4f_mxfp4_kernel_for(tile),tail=dsv4f_mxfp4_kernel_for(2);
-      const char * gb=(const char*)gate_lease.data,*ub=(const char*)up_lease.data;
+      const char * gb=(const char*)gate_data,*ub=(const char*)up_data;
       for(;r<end;) {
         const int count=std::min(tile/2,end-r);const void * streams[4];float values[4];
         for(int i=0;i<count;++i){streams[2*i]=gb+(r+i)*gate->nb[1];streams[2*i+1]=ub+(r+i)*up->nb[1];}
@@ -259,21 +261,85 @@ void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * a
         r+=count;
       }
     }
-    for(;r<end;++r){float g,u;tg->vec_dot(ne,&g,0,(const char*)gate_lease.data+r*gate->nb[1],0,ag,0,1);tu->vec_dot(ne,&u,0,(const char*)up_lease.data+r*up->nb[1],0,au,0,1);g=std::fmin(g,limit);u=std::fmax(-limit,std::fmin(u,limit));output[r]=(g/(1.f+std::exp(-g)))*u;}
+    for(;r<end;++r){float g,u;tg->vec_dot(ne,&g,0,(const char*)gate_data+r*gate->nb[1],0,ag,0,1);tu->vec_dot(ne,&u,0,(const char*)up_data+r*up->nb[1],0,au,0,1);g=std::fmin(g,limit);u=std::fmax(-limit,std::fmin(u,limit));output[r]=(g/(1.f+std::exp(-g)))*u;}
 }
-void down_rows(const ggml_tensor * down,const void * hq,int eid,int start,int end,int nf,float * output) {
-    ggml_dsv4f_host_lease down_lease((const char*)down->data+eid*down->nb[2],down->nb[2]);
+void gate_up_rows(const ggml_tensor * gate,const ggml_tensor * up,const void * ag,const void * au,
+                  int eid,int start,int end,int ne,float limit,float * output) {
+    ggml_dsv4f_host_lease gate_lease((const char*)gate->data+eid*gate->nb[2],gate->nb[2]);
+    ggml_dsv4f_host_lease up_lease((const char*)up->data+eid*up->nb[2],up->nb[2]);
+    gate_up_rows_data(gate,up,gate_lease.data,up_lease.data,ag,au,start,end,ne,limit,output);
+}
+void down_rows_data(const ggml_tensor * down,const void * down_data,const void * hq,int start,int end,int nf,float * output) {
     const auto * td=ggml_get_type_traits_cpu(down->type);int r=start;
     const int tile=options().rows;
     if(tile>1 && down->type==GGML_TYPE_MXFP4 && td->vec_dot_type==GGML_TYPE_Q8_0 && nf%32==0) {
-        const auto full=dsv4f_mxfp4_kernel_for(tile);const char * base=(const char*)down_lease.data;
+        const auto full=dsv4f_mxfp4_kernel_for(tile);const char * base=(const char*)down_data;
         for(;r<end;) {
             const int count=std::min(tile,end-r);const void * streams[4];
             for(int i=0;i<count;++i)streams[i]=base+(r+i)*down->nb[1];
             (count==tile?full:dsv4f_mxfp4_kernel_for(count))(nf,streams,hq,output+r);r+=count;
         }
     }
-    for(;r<end;++r)td->vec_dot(nf,output+r,0,(const char*)down_lease.data+r*down->nb[1],0,hq,0,1);
+    for(;r<end;++r)td->vec_dot(nf,output+r,0,(const char*)down_data+r*down->nb[1],0,hq,0,1);
+}
+void down_rows(const ggml_tensor * down,const void * hq,int eid,int start,int end,int nf,float * output) {
+    ggml_dsv4f_host_lease down_lease((const char*)down->data+eid*down->nb[2],down->nb[2]);
+    down_rows_data(down,down_lease.data,hq,start,end,nf,output);
+}
+
+class host_lease_batch {
+    const void * held[128];
+    size_t count=0;
+public:
+    host_lease_batch() = default;
+    host_lease_batch(const host_lease_batch &) = delete;
+    host_lease_batch & operator=(const host_lease_batch &) = delete;
+    ~host_lease_batch() {
+        if (ggml_dsv4f_host_weights.release)
+            while(count) ggml_dsv4f_host_weights.release(held[--count]);
+    }
+    const void * acquire(const void * data,size_t size) {
+        GGML_ASSERT(count<128);
+        const void * actual=ggml_dsv4f_host_weights.acquire ? ggml_dsv4f_host_weights.acquire(data,size) : data;
+        held[count++]=actual;
+        return actual;
+    }
+};
+
+void gate_up_experts(workers & lane,const ggml_tensor * gate,const ggml_tensor * up,
+                     const void * ag,const void * au,const int32_t * ids,const int * misses,int nm,
+                     int ne,int nf,int chunk,int gc,float limit,float * h) {
+    if (!options().expert_lease) {
+        lane.run(nm*gc,[&](int task){const int m=task/gc,r0=task%gc*chunk,eid=ids[misses[m]];
+            gate_up_rows(gate,up,ag,au,eid,r0,std::min(nf,r0+chunk),ne,limit,h+size_t(m)*nf);});
+        return;
+    }
+    host_lease_batch leases;
+    const void * gate_data[64],* up_data[64];
+    for(int m=0;m<nm;++m) {
+        const int eid=ids[misses[m]];
+        gate_data[m]=leases.acquire((const char*)gate->data+eid*gate->nb[2],gate->nb[2]);
+        up_data[m]=leases.acquire((const char*)up->data+eid*up->nb[2],up->nb[2]);
+    }
+    lane.run(nm*gc,[&](int task){const int m=task/gc,r0=task%gc*chunk;
+        gate_up_rows_data(gate,up,gate_data[m],up_data[m],ag,au,r0,std::min(nf,r0+chunk),ne,limit,h+size_t(m)*nf);});
+}
+
+void down_experts(workers & lane,const ggml_tensor * down,const void * hq,const int32_t * ids,
+                  const int * misses,int nm,int ne,int nf,size_t hs,int chunk,int dc,float * out) {
+    if (!options().expert_lease) {
+        lane.run(nm*dc,[&](int task){const int m=task/dc,r0=task%dc*chunk,eid=ids[misses[m]];
+            down_rows(down,(const char*)hq+m*hs,eid,r0,std::min(ne,r0+chunk),nf,out+size_t(m)*ne);});
+        return;
+    }
+    host_lease_batch leases;
+    const void * down_data[64];
+    for(int m=0;m<nm;++m) {
+        const int eid=ids[misses[m]];
+        down_data[m]=leases.acquire((const char*)down->data+eid*down->nb[2],down->nb[2]);
+    }
+    lane.run(nm*dc,[&](int task){const int m=task/dc,r0=task%dc*chunk;
+        down_rows_data(down,down_data[m],(const char*)hq+m*hs,r0,std::min(ne,r0+chunk),nf,out+size_t(m)*ne);});
 }
 
 // Called only by the device service thread. Scratch stays resident across layers.
@@ -307,13 +373,11 @@ void cpu_experts(const ggml_tensor * gate, const ggml_tensor * up, const ggml_te
     const size_t hs=ggml_row_size(td->vec_dot_type,nf);a.hq.resize(size_t(nm)*hs);
     const int chunk=options().chunk,gc=(nf+chunk-1)/chunk,dc=(ne+chunk-1)/chunk;
     const auto t1 = stamp();
-    lane.run(nm*gc,[&](int task){const int m=task/gc,r0=task%gc*chunk,eid=ids[misses[m]];
-        gate_up_rows(gate,up,a.ag.data(),a.au.data(),eid,r0,std::min(nf,r0+chunk),ne,limit,a.h.data()+size_t(m)*nf);});
+    gate_up_experts(lane,gate,up,a.ag.data(),a.au.data(),ids,misses,nm,ne,nf,chunk,gc,limit,a.h.data());
     const auto t2 = stamp();
     for(int m=0;m<nm;++m)qd->from_float(a.h.data()+size_t(m)*nf,a.hq.data()+m*hs,nf);
     const auto t3 = stamp();
-    lane.run(nm*dc,[&](int task){const int m=task/dc,r0=task%dc*chunk,eid=ids[misses[m]];
-        down_rows(down,a.hq.data()+m*hs,eid,r0,std::min(ne,r0+chunk),nf,a.out.data()+size_t(m)*ne);});
+    down_experts(lane,down,a.hq.data(),ids,misses,nm,ne,nf,hs,chunk,dc,a.out.data());
     const auto t4 = stamp();
     std::fill_n(result,ne,0.0f);
     for(int m=0;m<nm;++m)for(int r=0;r<ne;++r)result[r]+=a.out[size_t(m)*ne+r]*prob[misses[m]];
@@ -403,17 +467,11 @@ void compute(ggml_tensor * dst, int ith, int, void *) {
     const int chunk = options().chunk;
     const int gc = (nf + chunk - 1)/chunk, dc = (ne + chunk - 1)/chunk;
     const auto t3 = stamp();
-    lane.run(nm*gc, [&](int task) {
-        const int m = task/gc, r0 = task%gc*chunk, eid = selected[misses[m]];
-        gate_up_rows(gate,up,ag.data(),au.data(),eid,r0,std::min(nf,r0+chunk),ne,limit,h.data()+size_t(m)*nf);
-    });
+    gate_up_experts(lane,gate,up,ag.data(),au.data(),selected.data(),misses.data(),nm,ne,nf,chunk,gc,limit,h.data());
     const auto t4 = stamp();
     for (int m = 0; m < nm; ++m) qd->from_float(h.data() + size_t(m)*nf, hq.data() + m*hs, nf);
     const auto t5 = stamp();
-    lane.run(nm*dc, [&](int task) {
-        const int m = task/dc, r0 = task%dc*chunk, eid = selected[misses[m]];
-        down_rows(down,hq.data()+m*hs,eid,r0,std::min(ne,r0+chunk),nf,out.data()+size_t(m)*ne);
-    });
+    down_experts(lane,down,hq.data(),selected.data(),misses.data(),nm,ne,nf,hs,chunk,dc,out.data());
     const auto t6 = stamp();
     auto * result = (float *)dst->data;
     std::fill(result, result + ne, 0.0f);

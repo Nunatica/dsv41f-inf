@@ -147,8 +147,10 @@ export DSV4F_CPU_SCHEDULE=${DSV4F_CPU_SCHEDULE:-dynamic}
 export DSV4F_CPU_ROW_CHUNK=${DSV4F_CPU_ROW_CHUNK:-32}
 export DSV4F_CPU_MXFP4_ROWS=${DSV4F_CPU_MXFP4_ROWS:-1}
 export DSV4F_CPU_MXFP4_ISA=${DSV4F_CPU_MXFP4_ISA:-auto}
+export DSV4F_CPU_EXPERT_LEASE=${DSV4F_CPU_EXPERT_LEASE:-1}
 case "$DSV4F_CPU_AFFINITY" in none|physical) ;; *) echo 'DSV4F_CPU_AFFINITY must be none or physical.' >&2; exit 1;; esac
 case "$DSV4F_CPU_SCHEDULE" in dynamic|static) ;; *) echo 'DSV4F_CPU_SCHEDULE must be dynamic or static.' >&2; exit 1;; esac
+case "$DSV4F_CPU_EXPERT_LEASE" in 0|1) ;; *) echo 'DSV4F_CPU_EXPERT_LEASE must be 0 or 1.' >&2; exit 1;; esac
 export DSV4F_HC_WARP=${DSV4F_HC_WARP:-1}
 export DSV4F_HC_FULL=${DSV4F_HC_FULL:-1}
 export DSV4F_HC_POST_FULL=${DSV4F_HC_POST_FULL:-1}
