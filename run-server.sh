@@ -4,7 +4,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # Zero keeps the original resident loader; a positive process-tree budget enables tiering.
 #export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-0}
 export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-184320}
-export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-4096}
+export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-1024}
 export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
 case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
 export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-0}
@@ -38,7 +38,8 @@ case "$DSV4F_ENGRAM_BATCH_IO" in 0|1) ;; *) echo 'DSV4F_ENGRAM_BATCH_IO must be 
 if [[ ! $DSV4F_ENGRAM_CACHE_MIB =~ ^[0-9]{1,4}$ ]] || ((10#$DSV4F_ENGRAM_CACHE_MIB > 4096)); then
     echo 'DSV4F_ENGRAM_CACHE_MIB must be an integer in 0..4096.' >&2; exit 1
 fi
-export CTX_SIZE=${CTX_SIZE:-262144}
+#export CTX_SIZE=${CTX_SIZE:-262144}
+export CTX_SIZE=${CTX_SIZE:-65536}
 export DSV4F_KV_RESIDENT=${DSV4F_KV_RESIDENT:-65536}
 #export DSV4F_KV_RESIDENT=${DSV4F_KV_RESIDENT:-0}
 if [[ ! $DSV4F_KV_RESIDENT =~ ^[0-9]{1,10}$ ]] ||
