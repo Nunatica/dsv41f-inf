@@ -122,8 +122,6 @@ After installing the dependencies and placing the model files:
 | dsv41f-inf (2.6bpw, 128 GiB budget, cold test) | 74.03 | 14.39 |
 | llama.cpp | - | - |
 
-These historical measurements used resident weights (equivalent to `DSV4F_RAM_BUDGET_MIB=0`) on the target system with `PROMPT_TEST.md`. Direct-SSD performance depends on cache misses and SSD throughput.
-
 ## Credits
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [Xolotl](https://github.com/Indras-Mirror/Xolotl)
