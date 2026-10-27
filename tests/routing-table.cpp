@@ -17,6 +17,16 @@ static json read(const std::string & path){std::ifstream f(path);json j;f>>j;ret
 static void write(const std::string & path,const json & j){std::ofstream f(path);f<<j.dump();}
 static int drains=0;
 static void drain(){++drains;}
+static int warm_starts=0;
+static void * warm_row=nullptr;
+static size_t warm_start(){
+    ++warm_starts;
+    const auto before=ggml_dsv4f_routing_count(warm_row,63);
+    const int32_t id=63;const float weight=1;
+    ggml_dsv4f_routing_observe(warm_row,&id,&weight,1);
+    require(ggml_dsv4f_routing_count(warm_row,63)==before,"VRAM preload happens before recording begins");
+    return 1;
+}
 
 int main() {
     const auto original=std::filesystem::current_path();
@@ -37,7 +47,9 @@ int main() {
     const int32_t ids[]={63,0,1,511};const float weights[]={1,0,1,1};
     ggml_dsv4f_routing_observe(row,ids,weights,4);
     require(!ggml_dsv4f_routing_count(row,63),"warmup excluded");
+    ggml_dsv4f_experts.gpu_warm_start=warm_start;
     ggml_dsv4f_experts.gpu_drain=drain;dsv4f_routing_start();require(drains==1,"warmup observations drained");
+    require(warm_starts==0,"no file skips VRAM preload");
     std::vector<std::thread> threads;
     for(int i=0;i<8;++i)threads.emplace_back([&]{
         for(int n=0;n<128;++n)ggml_dsv4f_routing_observe(row,ids,weights,4);
@@ -52,7 +64,9 @@ int main() {
     ggml_dsv4f_experts.gpu_drain=nullptr;
     auto saved=read(path);require(saved["experts"][group]["63"]==observed,"JSON counters and model filename");
     require(saved["experts"][group]["511"]==observed_last,"512-expert geometry");
-    dsv4f_routing_init("Example-00002-of-00009.gguf");row=ggml_dsv4f_routing_bind(gate);dsv4f_routing_start();
+    dsv4f_routing_init("Example-00002-of-00009.gguf");row=ggml_dsv4f_routing_bind(gate);warm_row=row;dsv4f_routing_start();
+    require(warm_starts==1,"loaded positive history triggers VRAM preload");
+    ggml_dsv4f_experts.gpu_warm_start=nullptr;
     require(ggml_dsv4f_routing_count(row,63)==observed,"restart uses first-shard history even from another entry shard");
 
     // Only the hottest high-ID expert fits ahead of the physical prefix.
@@ -79,7 +93,9 @@ int main() {
     require(ggml_dsv4f_routing_count(row,63)==observed,"weight copies do not count as demand");
     ggml_backend_buffer_free(buffer);close(fd);
 
+    ggml_dsv4f_experts.gpu_warm_start=warm_start;
     setenv("DSV4F_ADAPTIVE_ROUTING","0",1);dsv4f_routing_init(model);dsv4f_routing_start();
+    require(warm_starts==1,"OFF skips VRAM preload");
     require(!ggml_dsv4f_routing.bind && !ggml_dsv4f_routing.count,"OFF clears all hooks");
     require(dsv4f_routing_save() && read(path)==saved,"OFF leaves routing file unchanged");
     dsv4f_routing_init("Disabled.gguf");require(dsv4f_routing_save() && !std::filesystem::exists("models/Disabled.routing.json"),"OFF creates no file");
@@ -89,6 +105,10 @@ int main() {
     {std::ofstream f(path);f<<"{bad JSON";}
     dsv4f_routing_init(model);row=ggml_dsv4f_routing_bind(gate);
     require(!ggml_dsv4f_routing_count(row,63),"corrupt file ignored safely");
+    dsv4f_routing_start();require(warm_starts==1,"corrupt history skips VRAM preload");
+    write(path,{{"version",1},{"model","Example-00001-of-00009"},{"experts",{{group,{{"63",0}}}}}});
+    dsv4f_routing_init(model);dsv4f_routing_start();require(warm_starts==1,"zero history skips VRAM preload");
+    ggml_dsv4f_experts.gpu_warm_start=nullptr;
     saved["model"]="Different";write(path,saved);dsv4f_routing_init(model);
     require(!ggml_dsv4f_routing_count(ggml_dsv4f_routing_bind(gate),63),"model identity checked");
     saved["model"]="Example-00001-of-00009";saved["experts"][group]["63"]=-1;write(path,saved);dsv4f_routing_init(model);

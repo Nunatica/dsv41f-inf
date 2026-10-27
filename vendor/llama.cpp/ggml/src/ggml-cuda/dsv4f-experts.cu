@@ -305,5 +305,6 @@ extern "C" void ggml_dsv4f_experts_register() {
     if(cudaGetDeviceCount(&count)!=cudaSuccess || count<1) { (void)cudaGetLastError(); return; }
     ggml_dsv4f_experts={dispatch,collect,finish,invalidate,offer,finalize,
         ggml_dsv4f_service_supported,ggml_dsv4f_service_compute,ggml_dsv4f_service_finalize,ggml_dsv4f_service_statistics,
-        ggml_dsv4f_service_resize,ggml_dsv4f_trim_workspace,[]()->size_t{return ggml_dsv4f_allocated_cache_bytes.load();},ggml_dsv4f_service_drain};
+        ggml_dsv4f_service_resize,ggml_dsv4f_trim_workspace,[]()->size_t{return ggml_dsv4f_allocated_cache_bytes.load();},ggml_dsv4f_service_drain,
+        ggml_dsv4f_service_warm_start};
 }

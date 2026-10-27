@@ -23,6 +23,7 @@ void ggml_dsv4f_service_invalidate(const void * base, size_t bytes);
 void ggml_dsv4f_service_statistics(uint64_t *, uint64_t *, uint64_t *);
 bool ggml_dsv4f_service_resize(bool decode);
 void ggml_dsv4f_service_drain();
+size_t ggml_dsv4f_service_warm_start();
 // Call before growing physical GPU allocations, outside graph capture when
 // reclamation is needed. False means even surrendering the cache cannot fit.
 bool ggml_dsv4f_reserve_vram(int device, size_t bytes, bool allow_reclaim = true);

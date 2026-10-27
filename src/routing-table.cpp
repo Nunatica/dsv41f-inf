@@ -31,6 +31,7 @@ struct table {
     std::atomic<bool> recording{false};
     std::string model,path;
     bool enabled=false;
+    bool loaded_history=false;
 };
 table & history(){static auto * t=new table;return *t;}
 std::string row_name(const std::string & name) {
@@ -64,7 +65,7 @@ intptr_t count(const void * handle,int id) {
 void dsv4f_routing_init(const std::string & model_path) {
     auto & t=history();std::lock_guard<std::mutex> saving(t.save_mutex);
     std::lock_guard<std::mutex> lock(t.mutex);
-    t.recording=false;ggml_dsv4f_routing={};t.rows.clear();t.enabled=false;
+    t.recording=false;ggml_dsv4f_routing={};t.rows.clear();t.enabled=false;t.loaded_history=false;
     const char * env=std::getenv("DSV4F_ADAPTIVE_ROUTING");
     if(env && !std::strcmp(env,"0"))return;
     if(env && std::strcmp(env,"1"))throw std::runtime_error("DSV4F_ADAPTIVE_ROUTING must be 0 or 1");
@@ -84,6 +85,7 @@ void dsv4f_routing_init(const std::string & model_path) {
             const auto & experts=data.at("experts");
             if(experts.size()>4096)throw std::runtime_error("too many routing rows");
             std::map<std::string,std::unique_ptr<row>> loaded;
+            bool has_counts=false;
             const std::regex valid_name("blk\\.[0-9]+\\.ffn_exps(\\.[a-z0-9_]+)?\\.weight");
             for(auto it=experts.begin();it!=experts.end();++it) {
                 if(!std::regex_match(it.key(),valid_name) || !it.value().is_object())throw std::runtime_error("invalid routing row");
@@ -96,10 +98,12 @@ void dsv4f_routing_init(const std::string & model_path) {
                     if(c.value().is_number_unsigned()?c.value().get<uint64_t>()>uint64_t(INTPTR_MAX):c.value().get<int64_t>()<0)
                         throw std::runtime_error("expert counter must be in 0..INTPTR_MAX");
                     p->counts[eid]=c.value().get<intptr_t>();
+                    has_counts|=p->counts[eid]>0;
                 }
                 loaded.emplace(it.key(),std::move(p));
             }
             t.rows=std::move(loaded);
+            t.loaded_history=has_counts;
             std::fprintf(stderr,"[dsv4f-routing] loaded %zu rows from %s\n",t.rows.size(),t.path.c_str());
         }
     } catch(const std::exception & e) {
@@ -109,6 +113,8 @@ void dsv4f_routing_init(const std::string & model_path) {
     std::fprintf(stderr,"[dsv4f-routing] enabled: %s\n",t.path.c_str());
 }
 void dsv4f_routing_start(){
+    if(history().enabled && history().loaded_history && ggml_dsv4f_experts.gpu_warm_start)
+        ggml_dsv4f_experts.gpu_warm_start();
     if(history().enabled && ggml_dsv4f_experts.gpu_drain)ggml_dsv4f_experts.gpu_drain();
     history().recording.store(history().enabled,std::memory_order_relaxed);
 }

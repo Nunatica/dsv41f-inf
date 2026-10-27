@@ -112,6 +112,9 @@ struct ggml_dsv4f_expert_api {
     void (*gpu_trim_workspace)(ggml_backend_t backend);
     size_t (*cache_bytes)(void); // Aggregate over all expert format classes.
     void (*gpu_drain)(void); // Wait for host route observations at response boundaries.
+    // Startup boundary only, after warmup: seed existing GPU cache slots from
+    // routing history. Returns copies made, without counting them as routes.
+    size_t (*gpu_warm_start)(void);
 };
 typedef void (*ggml_dsv4f_cpu_fn)(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *,
                                  const float *, const int32_t *, const float *, int, uint64_t, float, float *);

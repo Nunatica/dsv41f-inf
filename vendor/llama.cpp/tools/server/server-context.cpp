@@ -1577,7 +1577,7 @@ private:
             dsv4f_preload_experts();
             dsv4f_routing_start();
         } catch (const std::exception & e) {
-            SRV_ERR("expert RAM preload failed: %s\n", e.what());
+            SRV_ERR("expert startup preload failed: %s\n", e.what());
             return false;
         }
 
