@@ -21,6 +21,7 @@ struct ggml_moe_cache_api ggml_moe_cache = {};
 struct ggml_dsv4f_expert_api ggml_dsv4f_experts = {};
 ggml_dsv4f_cpu_fn ggml_dsv4f_cpu_experts = nullptr;
 struct ggml_dsv4f_host_weights_api ggml_dsv4f_host_weights = {};
+struct ggml_dsv4f_routing_api ggml_dsv4f_routing = {};
 
 #include <assert.h>
 #include <limits.h>

@@ -1,6 +1,7 @@
 #include "direct-weights.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-dsv4f-routing.h"
 #include "ggml-cpu.h"
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +12,8 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <list>
 #include <map>
@@ -33,6 +36,38 @@
 namespace {
 constexpr size_t alignment=4096;
 constexpr uint64_t MiB=1ull<<20;
+uint64_t process_rss() {
+    unsigned long pages=0,resident=0;
+    if(FILE * f=std::fopen("/proc/self/statm","r")) {
+        const int n=std::fscanf(f,"%lu %lu",&pages,&resident);std::fclose(f);
+        if(n==2)return uint64_t(resident)*uint64_t(sysconf(_SC_PAGESIZE));
+    }
+    throw std::runtime_error("cannot read process RAM usage");
+}
+// Check every cgroup ancestor: charged GPU/shared/file memory and the
+// supervisor are part of the hard limit too, even when absent from our RSS.
+// Only used at large runtime-allocation boundaries, not on expert reads.
+uint64_t runtime_headroom(uint64_t budget,uint64_t reserve) {
+    const auto available=[&](uint64_t limit,uint64_t used) {
+        return used<limit && reserve<limit-used?limit-used-reserve:0;
+    };
+    uint64_t result=available(budget,process_rss());
+    std::ifstream groups("/proc/self/cgroup");std::string line;
+    while(std::getline(groups,line))if(line.compare(0,3,"0::")==0) {
+        auto path=std::filesystem::path("/sys/fs/cgroup")/std::filesystem::path(line.substr(3)).relative_path();
+        for(;;path=path.parent_path()) {
+            std::ifstream max_file(path/"memory.max"),current_file(path/"memory.current");
+            std::string maximum;uint64_t current=0;
+            if(max_file>>maximum && maximum!="max" && current_file>>current) {
+                try {result=std::min(result,available(std::stoull(maximum),current));}
+                catch(const std::exception &){throw std::runtime_error("invalid cgroup RAM limit");}
+            }
+            if(path=="/sys/fs/cgroup" || path==path.root_path())break;
+        }
+        break;
+    }
+    return result;
+}
 uint64_t env_mib(const char * name,uint64_t fallback) {
     const char * v=std::getenv(name);
     if(!v)return fallback;
@@ -82,7 +117,7 @@ void read_aligned(int fd,void * dst,size_t n,uint64_t off,size_t required) {
 }
 struct source {
     std::unique_ptr<region> address;
-    struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;uint32_t file_index;};
+    struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;uint32_t file_index;void * routing;};
     std::map<uintptr_t,span> spans;
     std::vector<int> fds;
     bool closing=false;
@@ -97,6 +132,8 @@ struct load {
     size_t users=1;
     bool done=false;
     bool transient=false;
+    void * routing=nullptr;
+    int expert=0;
     std::exception_ptr error;
     std::condition_variable ready;
 };
@@ -107,6 +144,8 @@ struct entry {
     size_t bytes=0;
     source * owner=nullptr;
     bool transient=false;
+    void * routing=nullptr;
+    int expert=0;
     std::list<uintptr_t>::iterator age;
 };
 struct cache {
@@ -126,24 +165,32 @@ struct cache {
     uint64_t transient_used=0,transient_reserved=0,transient_reads=0,transient_bytes=0;
     uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
     uint64_t next_source=0;
+    uint64_t runtime_reserved=0;
     ~cache()=default;
     uint64_t limit() const {
         const uint64_t budget=dsv4f_ram_budget();
-        const uint64_t reserve=env_mib("DSV4F_RAM_RESERVE_MIB",4096*MiB);
+        const uint64_t reserve=env_mib("DSV4F_RAM_RESERVE_MIB",1024*MiB);
         if(budget<=reserve)throw std::runtime_error("RAM budget must exceed DSV4F_RAM_RESERVE_MIB");
         uint64_t ceiling=std::min(env_mib("DSV4F_RAM_CACHE_MIB",budget-reserve),budget-reserve);
         // Account for actual process RSS (KV/history, Engram, GPU host buffers, stacks, etc.).
         // mmap/munmap for cache entries returns evicted memory immediately to the OS.
-        unsigned long pages=0,resident=0;
-        if(FILE * f=std::fopen("/proc/self/statm","r")) {
-            const int n=std::fscanf(f,"%lu %lu",&pages,&resident);std::fclose(f);
-            if(n==2) {
-                const uint64_t rss=uint64_t(resident)*uint64_t(sysconf(_SC_PAGESIZE));
-                const uint64_t other=rss>used?rss-used:0;
-                ceiling=std::min(ceiling,budget-reserve>other?budget-reserve-other:0);
-            }
-        }
+        const uint64_t rss=process_rss(),other=rss>used?rss-used:0;
+        const uint64_t room=budget-reserve>other?budget-reserve-other:0;
+        ceiling=std::min(ceiling,room>runtime_reserved?room-runtime_reserved:0);
         return ceiling;
+    }
+    std::list<uintptr_t>::iterator victim(bool resident_only=false) {
+        auto best=ages.end();uint64_t low=UINT64_MAX;size_t rank=0;
+        for(auto it=ages.begin();it!=ages.end();++it) {
+            const auto & e=entries.at(*it);
+            if(e.users || (resident_only && e.transient))continue;
+            if(!ggml_dsv4f_routing.count)return it; // Preserve ordinary LRU when disabled.
+            const uint64_t score=rank+8*ggml_dsv4f_routing_bonus(ggml_dsv4f_routing_count(e.routing,e.expert));
+            if(!score)return it; // No later LRU rank can improve on zero.
+            if(score<low){low=score;best=it;}
+            if(++rank==128)break;
+        }
+        return best;
     }
     void erase(std::map<uintptr_t,entry>::iterator it) {
         if(it->second.transient)transient_used-=it->second.storage->bytes;
@@ -248,7 +295,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
     if(preload && (total>cap || c.used>cap-total || c.reserved>cap-total-c.used))return nullptr;
     if(total>cap)throw std::runtime_error("RAM budget has no room for an expert plane; reduce context/batch or reserve");
     while(c.used>cap-total || c.reserved>cap-total-c.used) {
-        auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
+        auto victim=c.victim();
         if(victim==c.ages.end())throw std::runtime_error("RAM expert cache is exhausted by active leases");
         c.erase(c.entries.find(*victim));
     }
@@ -257,7 +304,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
         read_aligned(span.fd,storage->data,total,offset-delta,delta+n);
         const void * output=(char*)storage->data+delta;
         c.ages.push_back(key);
-        entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.bytes=n;e.owner=owner;e.age=std::prev(c.ages.end());
+        entry e;e.storage=std::move(storage);e.pointer=output;e.users=1;e.bytes=n;e.owner=owner;e.routing=span.routing;e.expert=int(local/span.expert);e.age=std::prev(c.ages.end());
         c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
         if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
         return output;
@@ -275,7 +322,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
     }
     const void * output=(char*)request->storage->data+delta;
     c.ages.push_back(key);
-    entry e;e.storage=std::move(request->storage);e.pointer=output;e.users=request->users;e.bytes=n;e.owner=owner;e.age=std::prev(c.ages.end());
+    entry e;e.storage=std::move(request->storage);e.pointer=output;e.users=request->users;e.bytes=n;e.owner=owner;e.routing=span.routing;e.expert=int(local/span.expert);e.age=std::prev(c.ages.end());
     c.entries.emplace(key,std::move(e));c.leases.emplace(output,key);c.used+=total;++c.reads;c.bytes+=total;
     request->pointer=output;request->done=true;c.loads.erase(key);
     if(c.reads%4096==0)std::fprintf(stderr,"[dsv4f-ram] resident=%.2f MiB hit=%llu reads=%llu direct_mib=%.2f evictions=%llu\n",c.used/double(MiB),(unsigned long long)c.hits,(unsigned long long)c.reads,c.bytes/double(MiB),(unsigned long long)c.evictions);
@@ -383,7 +430,7 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
         // Reclaim only when existing residency exceeds the new allowance
         // (e.g. first prefill after decode, a smaller budget, larger group/KV).
         while(c.used-c.transient_used+c.reserved-c.transient_reserved>resident_cap) {
-            auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){const auto & e=c.entries.at(k);return !e.transient && !e.users;});
+            auto victim=c.victim(true);
             if(victim==c.ages.end())break;
             c.erase(c.entries.find(*victim));
         }
@@ -429,12 +476,12 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
             if(total>cap)throw std::runtime_error("RAM budget has no room for a batched expert plane");
             while(c.used>cap-total || c.reserved>cap-total-c.used) {
                 if(!scan) {
-                    auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){return c.entries.at(k).users==0;});
+                    auto victim=c.victim();
                     if(victim==c.ages.end())throw std::runtime_error("RAM expert batch is exhausted by active leases");
                     c.erase(c.entries.find(*victim));
                 } else {
                     if(c.used-c.transient_used+c.reserved-c.transient_reserved>resident_cap) {
-                        auto victim=std::find_if(c.ages.begin(),c.ages.end(),[&](uintptr_t k){const auto & e=c.entries.at(k);return !e.transient && !e.users;});
+                        auto victim=c.victim(true);
                         if(victim!=c.ages.end()){c.erase(c.entries.find(*victim));continue;}
                     }
                     // Previous groups' copy callbacks can free transient space.
@@ -456,6 +503,7 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
                 tickets[i].request=loading->second;++loading->second->users;++c.hits;continue;
             }
             auto request=std::make_shared<load>();request->storage=std::make_unique<region>(total);request->owner=owner;
+            request->routing=span.routing;request->expert=int(local/span.expert);
             request->transient=scan && c.used-c.transient_used+c.reserved-c.transient_reserved+total>resident_cap;
             c.loads.emplace(key,request);c.reserved+=total;tickets[i].request=request;
             if(request->transient)c.transient_reserved+=total;
@@ -474,7 +522,7 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
         if(error){fail(r,error);continue;}
         const void * p=(char*)r.request->storage->data+r.delta;c.ages.push_back(r.key);
         entry e;e.storage=std::move(r.request->storage);e.pointer=p;e.users=r.request->users;e.bytes=r.required-r.delta;
-        e.owner=r.request->owner;e.age=std::prev(c.ages.end());e.transient=r.request->transient;
+        e.owner=r.request->owner;e.routing=r.request->routing;e.expert=r.request->expert;e.age=std::prev(c.ages.end());e.transient=r.request->transient;
         c.entries.emplace(r.key,std::move(e));c.leases.emplace(p,r.key);
         c.reserved-=r.bytes;c.used+=r.bytes;++c.reads;c.bytes+=r.bytes;
         if(r.request->transient){c.transient_reserved-=r.bytes;c.transient_used+=r.bytes;++c.transient_reads;c.transient_bytes+=r.bytes;}
@@ -559,6 +607,41 @@ void get_tensor(ggml_backend_buffer_t,const ggml_tensor * t,void * output,size_t
 }
 uint64_t dsv4f_ram_budget(){return env_mib("DSV4F_RAM_BUDGET_MIB",0);}
 bool dsv4f_direct_weights_enabled(){return dsv4f_ram_budget()!=0;}
+dsv4f_ram_reservation::dsv4f_ram_reservation(uint64_t requested) {
+    const uint64_t budget=dsv4f_ram_budget();
+    if(!budget || !requested){acquired=true;return;}
+    const uint64_t reserve=env_mib("DSV4F_RAM_RESERVE_MIB",1024*MiB);
+    if(budget<=reserve || requested>budget-reserve)return;
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    if(c.runtime_reserved>budget-reserve-requested)return;
+    const uint64_t pending=requested+c.runtime_reserved;
+    if(c.reserved>budget-reserve-pending)return;
+    const uint64_t needed=pending+c.reserved;
+    uint64_t reclaimed=0;
+    for(;;) {
+        const uint64_t room=runtime_headroom(budget,reserve);
+        if(room>=needed)break;
+        const uint64_t deficit=needed-room;uint64_t freed=0;
+        while(freed<deficit) {
+            const auto victim=c.victim();
+            if(victim==c.ages.end()) {
+                std::fprintf(stderr,"[dsv4f-ram-reserve] denied: request=%.2f MiB reclaimed=%.2f MiB; no idle experts\n",
+                    requested/double(MiB),reclaimed/double(MiB));
+                return;
+            }
+            const auto entry=c.entries.find(*victim);freed+=entry->second.storage->bytes;c.erase(entry);
+        }
+        reclaimed+=freed;
+    }
+    c.runtime_reserved+=requested;bytes=requested;acquired=true;
+    std::fprintf(stderr,"[dsv4f-ram-reserve] request=%.2f MiB reclaimed=%.2f MiB reserve=%.2f MiB\n",
+        requested/double(MiB),reclaimed/double(MiB),reserve/double(MiB));
+}
+dsv4f_ram_reservation::~dsv4f_ram_reservation() {
+    if(!bytes)return;
+    auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
+    GGML_ASSERT(c.runtime_reserved>=bytes);c.runtime_reserved-=bytes;c.changed.notify_all();
+}
 dsv4f_preload_result dsv4f_preload_experts() {
     dsv4f_preload_result result;
     const char * enabled=std::getenv("DSV4F_RAM_PRELOAD");
@@ -587,29 +670,33 @@ dsv4f_preload_result dsv4f_preload_experts() {
         }
         if(spans.empty())return result;
         initial_bytes=c.bytes;
-        std::fprintf(stderr,"[dsv4f-ram-preload] begin: resident=%.2f GiB ceiling=%.2f GiB order=shard,offset O_DIRECT\n",
-            c.used/double(1ull<<30),c.limit()/double(1ull<<30));
+        std::fprintf(stderr,"[dsv4f-ram-preload] begin: resident=%.2f GiB ceiling=%.2f GiB order=%s O_DIRECT\n",
+            c.used/double(1ull<<30),c.limit()/double(1ull<<30),ggml_dsv4f_routing.count?"routing-count,shard,offset":"shard,offset");
     }
     std::sort(spans.begin(),spans.end(),[](const ordered_span & a,const ordered_span & b) {
         return std::tie(a.sequence,a.span.file_index,a.span.offset)<std::tie(b.sequence,b.span.file_index,b.span.offset);
     });
-    const auto start=std::chrono::steady_clock::now();auto progress=start;
+    struct plane {uintptr_t pointer;size_t bytes;intptr_t count;};
+    std::vector<plane> planes;
     for(const auto & item:spans) {
         const auto & span=item.span;
         if(!span.expert || span.bytes%span.expert)throw std::runtime_error("invalid expert geometry for startup preload");
-        for(size_t at=0;at<span.bytes;at+=span.expert) {
-            const void * p=acquire_impl((const void*)(span.begin+at),span.expert,true);
-            if(!p){result.budget_limited=true;break;}
-            release(p);++result.planes;
-            const auto now=std::chrono::steady_clock::now();
-            if(now-progress>=std::chrono::seconds(5)) {
-                std::lock_guard<std::mutex> lock(c.mutex);
-                std::fprintf(stderr,"[dsv4f-ram-preload] planes=%llu resident=%.2f GiB read=%.2f GiB\n",
-                    (unsigned long long)result.planes,c.used/double(1ull<<30),(c.bytes-initial_bytes)/double(1ull<<30));
-                progress=now;
-            }
+        for(size_t at=0;at<span.bytes;at+=span.expert)
+            planes.push_back({span.begin+at,span.expert,ggml_dsv4f_routing_count(span.routing,int(at/span.expert))});
+    }
+    std::stable_sort(planes.begin(),planes.end(),[](const plane & a,const plane & b){return a.count>b.count;});
+    const auto start=std::chrono::steady_clock::now();auto progress=start;
+    for(const auto & plane:planes) {
+        const void * p=acquire_impl((const void*)plane.pointer,plane.bytes,true);
+        if(!p){result.budget_limited=true;break;}
+        release(p);++result.planes;
+        const auto now=std::chrono::steady_clock::now();
+        if(now-progress>=std::chrono::seconds(5)) {
+            std::lock_guard<std::mutex> lock(c.mutex);
+            std::fprintf(stderr,"[dsv4f-ram-preload] planes=%llu resident=%.2f GiB read=%.2f GiB\n",
+                (unsigned long long)result.planes,c.used/double(1ull<<30),(c.bytes-initial_bytes)/double(1ull<<30));
+            progress=now;
         }
-        if(result.budget_limited)break;
     }
     {
         std::lock_guard<std::mutex> lock(c.mutex);
@@ -702,7 +789,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
             owner->fds.push_back(fd);opened[t.fd]=fd;
         }
         const auto key=(uintptr_t)owner->address->data+at;
-        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset,t.file_index});
+        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset,t.file_index,ggml_dsv4f_routing_bind(t.tensor)});
         at+=rounded(ggml_nbytes(t.tensor));
     }
     auto & c=pool();

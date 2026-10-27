@@ -65,15 +65,26 @@ class MemoryBudgetTest(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('RAM budget: 184320 MiB; SSD payload I/O: O_DIRECT', result.stdout)
-        self.assertIn('Expert RAM preload: 0', result.stdout)
+        self.assertIn('Expert RAM preload: 1', result.stdout)
+        self.assertIn('--cache-ram 0', result.stdout)
+        self.assertIn('Adaptive expert routing: 1', result.stdout)
         self.assertIn('--load-mode dio', result.stdout)
         self.assertIn('--lazy-mode off', result.stdout)
         self.assertIn('--no-host', result.stdout)
         self.assertIn('--batch-size 1024 --ubatch-size 1024', result.stdout)
-        for value in ('-1', '123.4', '4096'):
+        for value in ('-1', '123.4', '1024'):
             result = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                     env={**env, 'DSV4F_RAM_BUDGET_MIB': value}, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
+
+        routing_off = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
+                                     env={**env, 'DSV4F_ADAPTIVE_ROUTING': '0'}, capture_output=True, text=True)
+        self.assertEqual(routing_off.returncode, 0, routing_off.stderr)
+        self.assertIn('Adaptive expert routing: 0', routing_off.stdout)
+        routing_invalid = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
+                                         env={**env, 'DSV4F_ADAPTIVE_ROUTING': '2'}, capture_output=True, text=True)
+        self.assertNotEqual(routing_invalid.returncode, 0)
+        self.assertIn('DSV4F_ADAPTIVE_ROUTING must be 0 or 1', routing_invalid.stderr)
 
         legacy = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                 env={**env, 'DSV4F_RAM_BUDGET_MIB': '0'}, capture_output=True, text=True)

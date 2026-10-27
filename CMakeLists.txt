@@ -13,6 +13,7 @@ add_subdirectory(vendor/llama.cpp)
 set(DSV4F_PROJECT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gguf-compat.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/direct-weights.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/routing-table.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41-mtp.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/moe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/route.cpp"
@@ -180,6 +181,19 @@ set_tests_properties(gpu-hc-post-pre-fusion-parity PROPERTIES SKIP_RETURN_CODE 7
 add_executable(dsv4f-service-test tests/service.cpp src/moe.cpp src/mxfp4.cpp)
 target_include_directories(dsv4f-service-test PRIVATE src vendor/llama.cpp/ggml/src)
 target_link_libraries(dsv4f-service-test PRIVATE ggml ggml-cpu)
+foreach(route_case IN ITEMS cache zero-cache cpu)
+    set(route_cache_arg "")
+    set(route_cpu_env "")
+    if(NOT route_case STREQUAL "cache")
+        set(route_cache_arg zero-cache)
+    endif()
+    if(route_case STREQUAL "cpu")
+        set(route_cpu_env ";DSV4F_TEST_ROUTE_CPU=1")
+    endif()
+    add_test(NAME adaptive-routing-service-${route_case} COMMAND dsv4f-service-test callback ${route_cache_arg})
+    set_tests_properties(adaptive-routing-service-${route_case} PROPERTIES TIMEOUT 120
+        ENVIRONMENT "DSV4F_TEST_ADAPTIVE_ROUTING=1;DSV4F_TEST_ROUTE_PUBLISH=1;DSV4F_SKIP_NO_MISS=1;DSV4F_MTP=0${route_cpu_env}")
+endforeach()
 add_test(NAME gpu-service-poll-parity COMMAND dsv4f-service-test poll)
 add_test(NAME gpu-service-callback-parity COMMAND dsv4f-service-test callback)
 add_test(NAME gpu-service-poll-zero-cache COMMAND dsv4f-service-test poll zero-cache)
@@ -429,6 +443,16 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(v41-mtp-manifest PROPERTIES TIMEOUT 30)
 endif()
 
+add_executable(dsv4f-routing-table-test tests/routing-table.cpp)
+target_include_directories(dsv4f-routing-table-test PRIVATE src vendor/llama.cpp/ggml/src vendor/llama.cpp/vendor)
+target_link_libraries(dsv4f-routing-table-test PRIVATE llama ggml ggml-cpu)
+add_test(NAME adaptive-routing-table COMMAND dsv4f-routing-table-test)
+set_tests_properties(adaptive-routing-table PROPERTIES TIMEOUT 60 ENVIRONMENT "DSV4F_MTP=0")
+add_executable(dsv4f-prompt-cache-budget-test tests/prompt-cache-budget.cpp)
+target_include_directories(dsv4f-prompt-cache-budget-test PRIVATE src vendor/llama.cpp/tools/server vendor/llama.cpp/ggml/src)
+target_link_libraries(dsv4f-prompt-cache-budget-test PRIVATE server-context llama ggml ggml-cpu)
+add_test(NAME prompt-cache-ram-budget COMMAND dsv4f-prompt-cache-budget-test)
+set_tests_properties(prompt-cache-ram-budget PROPERTIES TIMEOUT 60 ENVIRONMENT "DSV4F_MTP=0")
 add_executable(dsv4f-direct-weights-test tests/direct-weights.cpp)
 target_include_directories(dsv4f-direct-weights-test PRIVATE src vendor/llama.cpp/ggml/src vendor/llama.cpp/src)
 target_link_libraries(dsv4f-direct-weights-test PRIVATE llama ggml ggml-cpu)
@@ -462,6 +486,9 @@ if(DSV4F_TEST_PYTHON)
     set(tiered_fixture "${tiered_fixture_base}.gguf")
     add_test(NAME tiered-prefill-fixture COMMAND "${DSV4F_TEST_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/make_v41_fixture.py" "${tiered_fixture}")
     set_tests_properties(tiered-prefill-fixture PROPERTIES FIXTURES_SETUP tiered_prefill_fixture TIMEOUT 60)
+    add_test(NAME adaptive-routing-server COMMAND "${DSV4F_TEST_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/routing-server.py" "$<TARGET_FILE:llama-server>" "${tiered_fixture}")
+    set_tests_properties(adaptive-routing-server PROPERTIES FIXTURES_REQUIRED tiered_prefill_fixture TIMEOUT 90
+        ENVIRONMENT "DSV4F_MTP=0")
     foreach(phase IN ITEMS 0 1 preloaded)
         set(budget_phase "DSV4F_PHASE_WORKSPACE=${phase}")
         if(phase STREQUAL "preloaded")

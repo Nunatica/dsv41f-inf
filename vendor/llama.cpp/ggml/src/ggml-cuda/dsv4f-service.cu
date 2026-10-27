@@ -3,6 +3,7 @@
 #include "dsv4f-memory.cuh"
 #include "ggml-backend-moe-cache.h"
 #include "../ggml-dsv4f-cache-policy.h"
+#include "../ggml-dsv4f-routing.h"
 #include "../ggml-dsv4f-timeline.h"
 #include "mmvq.cuh"
 #include "quantize.cuh"
@@ -190,7 +191,12 @@ __global__ void mxfp4_down_sum(const char * const * cache,size_t down_offset,con
     __syncthreads();if(threadIdx.x<4){float v=0;for(int e=0;e<nk;++e)if(plan[e]>=0)v+=weights[e]*parts[e][threadIdx.x];out[row0+threadIdx.x]=v;}
 }
 
-struct descriptor {ggml_tensor g,u,d;};
+struct descriptor {
+    ggml_tensor g,u,d;
+    void * routing;
+    descriptor(const ggml_tensor & gate,const ggml_tensor & up,const ggml_tensor & down):
+        g(gate),u(up),d(down),routing(ggml_dsv4f_routing_bind(&gate)){}
+};
 struct job {int slot,key,old_key;bool predicted=false;};
 // Host clocks only: callback entry proves the request is visible, but is NOT
 // the GPU publication timestamp. In particular, callback wait overlaps experts.
@@ -494,8 +500,8 @@ class service {
                 if(profile)idle_cpu_start=service_cpu_ns();
                 continue;
             }
-            descriptor layer;
-            {std::lock_guard<std::mutex> lock(mutex);layer=layers[r->layer];predict(*r);}
+            descriptor layer=[&]{std::lock_guard<std::mutex> lock(mutex);predict(*r);return layers[r->layer];}();
+            ggml_dsv4f_routing_observe(layer.routing,r->ids,r->weights,r->nk);
             if(profile)descriptor_time.add(service_ns()-seen);
             // kind=2 is cache telemetry only: do not clear an answer, acquire
             // the CPU lane, publish completion, or wake an answer waiter.
@@ -666,6 +672,13 @@ class service {
             if(end==value || *end || !std::isfinite(ratio) || ratio<1 || ratio>16)throw std::runtime_error("invalid DSV4F_CACHE_REPLACE_RATIO");
         }
         policy.configure(selected,43ULL*decay,ratio);
+        policy.history_context=this;
+        policy.history_score=[](void * context,int key)->uint64_t {
+            const auto & self=*(service *)context;
+            const size_t layer=key/MAX_EXPERTS;
+            return layer<self.layers.size()?ggml_dsv4f_routing_bonus(
+                ggml_dsv4f_routing_count(self.layers[layer].routing,key%MAX_EXPERTS)):0;
+        };
         std::fprintf(stderr,"[dsv4f-service] cache_policy=%s decay_tokens=%u replacement_ratio=%.3f\n",cache_mode,decay,ratio);
         if(const char * path=std::getenv("DSV4F_CACHE_TRACE")) {
             trace=std::fopen(path,"w");if(!trace)throw std::runtime_error("cannot open DSV4F_CACHE_TRACE");
@@ -797,6 +810,7 @@ public:
         reserve_temporary();
     }
     void drain() {
+        if(!host)return;
         CUDA_CHECK(cudaDeviceSynchronize());
         for(int i=0;i<RING;++i)while(host[i].consumed!=host[i].seq)std::this_thread::yield();
     }
@@ -1214,6 +1228,7 @@ void ggml_dsv4f_service_finalize(void * ctx,ggml_tensor * node){for_node(node).f
 void ggml_dsv4f_service_invalidate(const void * base,size_t bytes){for(auto & s:all_services())s.invalidate(base,bytes);}
 
 void ggml_dsv4f_service_statistics(uint64_t * r,uint64_t * h,uint64_t * a){*r=*h=*a=0;for(auto & s:all_services()){uint64_t rr,hh,aa;s.statistics(&rr,&hh,&aa);*r+=rr;*h+=hh;*a+=aa;}}
+void ggml_dsv4f_service_drain(){for(auto & s:all_services())s.drain();}
 bool ggml_dsv4f_service_resize(bool decode){bool changed=false;for(auto & s:all_services())changed=s.resize(decode)||changed;return changed;}
 bool ggml_dsv4f_prefill_cache_begin(const ggml_tensor * g, const ggml_tensor * u,
     const ggml_tensor * d, int nk, int group, std::vector<int> & active,

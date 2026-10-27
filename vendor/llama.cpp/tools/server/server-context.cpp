@@ -14,6 +14,7 @@
 #include "llama.h"
 #include "../../src/llama-ext.h"
 #include "direct-weights.h"
+#include "routing-table.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1234,6 +1235,12 @@ private:
         if (deferred_warmup) server_vram_snapshot("startup");
         const bool requested_warmup = params_base.warmup;
         if (deferred_warmup) params_base.warmup = false;
+        try {
+            dsv4f_routing_init(params_base.model.path);
+        } catch(const std::exception & e) {
+            SRV_ERR("adaptive expert routing initialization failed: %s\n",e.what());
+            return false;
+        }
         llama_init = common_init_from_params(params_base);
         params_base.warmup = requested_warmup;
 
@@ -1568,6 +1575,7 @@ private:
         // only the remaining RAM allowance before publishing server readiness.
         try {
             dsv4f_preload_experts();
+            dsv4f_routing_start();
         } catch (const std::exception & e) {
             SRV_ERR("expert RAM preload failed: %s\n", e.what());
             return false;
@@ -2339,6 +2347,7 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        dsv4f_routing_save();
         queue_results.send(std::move(res));
     }
 
@@ -2625,6 +2634,18 @@ private:
             }
         }
 
+        const size_t tgt_bytes = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const size_t dft_bytes = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0;
+        if (dft_bytes > SIZE_MAX - tgt_bytes) {
+            SLT_WRN(slot, "%s", "skipping oversized context checkpoint\n");
+            return;
+        }
+        dsv4f_ram_reservation ram(tgt_bytes + dft_bytes);
+        if (!ram) {
+            SLT_WRN(slot, "%s", "skipping context checkpoint: insufficient RAM budget\n");
+            return;
+        }
+
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
@@ -2662,6 +2683,10 @@ private:
         uint64_t n = 0;
         // check the size against the bytes left in the file before allocating, the size field may be corrupted
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
+            return false;
+        }
+        dsv4f_ram_reservation ram(n > buf.capacity() ? n : 0);
+        if (!ram) {
             return false;
         }
         buf.resize(n);

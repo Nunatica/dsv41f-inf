@@ -84,5 +84,18 @@ int main() {
     for(int i=0;i<4;++i)fractional.observe(&cold,1);for(int i=0;i<5;++i)fractional.observe(&fresh,1);
     require(fractional.select(&fresh,1,pending).index<0,"fractional margin strict boundary");
     fractional.observe(&fresh,1);require(fractional.select(&fresh,1,pending).index==0,"fractional margin exceeded");
+    for(auto kind:{policy::mode::legacy,policy::mode::scored,policy::mode::aged}) {
+        policy adaptive;adaptive.configure(kind,1000,1.25);adaptive.slots.resize(2);
+        std::unordered_map<int,uint64_t> history={{0,10},{1,0},{512,20}};
+        adaptive.history_context=&history;
+        adaptive.history_score=[](void * p,int key){return (*(std::unordered_map<int,uint64_t> *)p)[key];};
+        adaptive.publish(0,0);adaptive.publish(1,1);
+        int candidate=512;adaptive.observe(&candidate,1);
+        require(adaptive.select(&candidate,1,pending).index==1,"history protects a historically hot resident");
+        adaptive.protect(1);
+        require(adaptive.select(&candidate,1,pending).index==0,"historical score retains pin ownership");
+        adaptive.unprotect(1);adaptive.history_score=nullptr;
+        require(adaptive.select(&candidate,1,pending).index==0,"OFF restores original score and victim");
+    }
     std::puts("Cache policy admission, pending ownership, compaction, hysteresis and hot-set adaptation PASS");
 }

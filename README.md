@@ -76,8 +76,9 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
 | `DSV4F_RAM_BUDGET_MIB` | `184320` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
+| `DSV4F_ADAPTIVE_ROUTING` | `1` | Persist decode expert counters; use history for RAM preload and RAM/VRAM eviction. `0`: disable all routing history behavior. |
 | `DSV4F_RAM_PRELOAD` | `0` | `1`: preload experts at startup when the RAM budget is positive; `0`: disabled. |
-| `DSV4F_RAM_RESERVE_MIB` | `4096` | Headroom left outside the expert cache for runtime growth. |
+| `DSV4F_RAM_RESERVE_MIB` | `1024` | Headroom left outside the expert cache for runtime growth. |
 | `DSV4F_RAM_CACHE_MIB` | automatic | Optional additional ceiling for the expert RAM cache. |
 | `DSV4F_EXPERT_CACHE_MIB` | `14336` | Existing aggregate VRAM expert-cache ceiling. |
 
@@ -87,7 +88,15 @@ DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stay
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```
 
+Adaptive routing keeps plain `intptr_t` counters in memory (signed 64-bit on x86-64), saturating at `INTPTR_MAX`, attempting an increment for each nonzero decode-path expert selection, including CPU misses, GPU hits, and MTP verification tokens. Counter updates, eviction reads and snapshots use ordinary integer accesses without atomic operations or counter mutexes. These are approximate frequencies: concurrent updates may be lost and reads may be stale. Registry and file-lifecycle mutexes do not synchronize counter accesses. Startup warmup, bulk prefill, predicted routes and weight transfers do not increment the counters. Experts are identified by layer, format and local expert ID; gate/up/down projections share a counter. After each completed response, the engine drains route observations and atomically saves `models/<model filename without .gguf>.routing.json` relative to its working directory (the launcher uses the repository root). Split GGUF models use the **first shard filename**, keeping its shard suffix (for example, `models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.routing.json`). History loads before warmup and RAM preload on the next startup. Missing or invalid files start a fresh table; read/write errors are logged without failing a completed response.
+
+With `DSV4F_RAM_PRELOAD=1`, experts with larger counters load first; ties keep source/shard/offset order. VRAM eviction/admission adds `floor(log2(1 + counter))` to the existing frequency score and preserves decay, replacement margins and active leases. RAM eviction selects the smallest `LRU rank + 8 * floor(log2(1 + counter))` among the oldest 128 eligible idle planes, preserving lease protection and prefill streaming limits. This bounded historical prior favors previously useful experts while allowing the current workload to change residency. Set `DSV4F_ADAPTIVE_ROUTING=0` before launch to restore the original cache policies, physical preload order, and disable counter loading, collection and saving.
+
 Set the budget before starting a new server. The native engine also selects direct expert loading when this variable is positive; use the launcher (or supply a cgroup yourself) to enforce the total-process hard limit. `state/server.json` records the requested/effective budgets, tier mode and cgroup counters at readiness. An inherited tighter cgroup ceiling is also passed to the native RAM cache. With `DSV4F_RAM_BUDGET_MIB=0`, swap protection remains required and the previous full-model RAM availability check applies.
+
+The launcher defaults to `--cache-ram 0`: it reuses the current slot's KV/history prefix without allocating extra RAM snapshots of older requests. Pass `--cache-ram 8192` (MiB) explicitly to enable those snapshots. The fixed RAM reserve remains 1 GiB.
+
+Before storing a prompt/KV snapshot, the engine reclaims idle expert RAM for the target state, draft state and copied checkpoints. It checks both process RSS and ancestor cgroup charges, and temporarily reserves the reclaimed space against background expert loading until the allocations are resident. If it cannot make enough room without touching active leases, it skips that optional prompt cache entry and continues serving. This keeps the fixed reserve at 1 GiB; snapshot memory displaces expert weights only when needed, and experts can refill the space after snapshots are released.
 
 With a positive RAM budget, the launcher enables phase workspace reallocation and uses a prefill batch/ubatch of `1024`. The native context also caps tiered prefill at `1024`. Decode uses `DSV4F_DECODE_UBATCH` (default `256`) for both its batch and ubatch ceilings. Prefill automatically uses the VRAM expert cache for MXFP4, Q3, Q2 and PTQ experts, prioritizing experts absent from RAM and releasing their duplicate RAM copies after uploads complete. Overflow host reads use a bounded streaming window to preserve the RAM resident set. PTQ stays compressed in the cache and expands on the GPU for prefill.
 

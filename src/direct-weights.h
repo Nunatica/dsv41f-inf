@@ -7,6 +7,21 @@
 // Zero/unset keeps the original resident loader. Positive budgets enable Linux direct I/O.
 uint64_t dsv4f_ram_budget();
 bool dsv4f_direct_weights_enabled();
+// Temporarily reserve headroom for a runtime allocation by reclaiming idle
+// expert planes. Keeps background loaders from refilling the reclaimed space
+// until the allocation is resident. False means the optional allocation must
+// be skipped. A zero RAM budget makes this a successful no-op.
+class dsv4f_ram_reservation {
+public:
+    explicit dsv4f_ram_reservation(uint64_t bytes);
+    ~dsv4f_ram_reservation();
+    explicit operator bool() const {return acquired;}
+    dsv4f_ram_reservation(const dsv4f_ram_reservation &)=delete;
+    dsv4f_ram_reservation & operator=(const dsv4f_ram_reservation &)=delete;
+private:
+    uint64_t bytes=0;
+    bool acquired=false;
+};
 struct dsv4f_direct_tensor {
     ggml_tensor * tensor;
     int fd;
@@ -19,7 +34,8 @@ struct dsv4f_preload_result {
     bool budget_limited=false;
 };
 // Call after runtime buffers/warmup, before accepting requests. Fill remaining
-// cache space in source/shard/offset order without evicting existing entries.
+// cache space by descending routing count (source/shard/offset breaks ties),
+// without evicting existing entries. Disabled routing retains physical order.
 // Disabled unless DSV4F_RAM_PRELOAD=1; a zero RAM budget is also a no-op.
 // Payloads use the ordinary O_DIRECT cache path.
 dsv4f_preload_result dsv4f_preload_experts();

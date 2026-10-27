@@ -3,6 +3,7 @@
 #include "mxfp4.h"
 #include "ggml-cpu.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-dsv4f-routing.h"
 #include "cpu-profile-trace.h"
 #include <algorithm>
 #include <atomic>
@@ -412,6 +413,7 @@ void compute(ggml_tensor * dst, int ith, int, void *) {
                 prob[i]=*(const float*)((const char*)dst->src[2]->data+t*dst->src[2]->nb[2]+i*dst->src[2]->nb[1]);
                 GGML_ASSERT(ids[i]>=0 && ids[i]<dst->src[3]->ne[2]);
             }
+            if(dst->ne[1]<=4)ggml_dsv4f_routing_observe(ggml_dsv4f_routing_bind(dst->src[3]),ids,prob,nk);
             cpu_experts(dst->src[3],dst->src[4],dst->src[5],
                         (const float*)((const char*)dst->src[0]->data+t*dst->src[0]->nb[1]),
                         ids,prob,nk,0,limit,(float*)((char*)dst->data+t*dst->nb[1]));
@@ -451,6 +453,7 @@ void compute(ggml_tensor * dst, int ith, int, void *) {
         prob[i] = *(const float *)((const char *)weights->data + i*weights->nb[1]);
         GGML_ASSERT(selected[i] >= 0 && selected[i] < gate->ne[2]);
     }
+    ggml_dsv4f_routing_observe(ggml_dsv4f_routing_bind(gate),selected.data(),prob.data(),nk);
     const auto t1 = stamp();
     uint64_t hit_mask = 0;
     if (ggml_dsv4f_experts.dispatch) {

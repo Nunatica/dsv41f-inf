@@ -111,6 +111,7 @@ struct ggml_dsv4f_expert_api {
     bool (*gpu_resize)(bool decode);
     void (*gpu_trim_workspace)(ggml_backend_t backend);
     size_t (*cache_bytes)(void); // Aggregate over all expert format classes.
+    void (*gpu_drain)(void); // Wait for host route observations at response boundaries.
 };
 typedef void (*ggml_dsv4f_cpu_fn)(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *,
                                  const float *, const int32_t *, const float *, int, uint64_t, float, float *);
@@ -129,6 +130,16 @@ struct ggml_dsv4f_engram_transfer {
     ggml_backend_dev_t device;
 };
 GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
+
+// Optional process-local routing history, owned by the engine. Handles remain
+// valid until model unload. A row identifies a layer + expert format; projection
+// tensors share the same row. Observe actual routes once, never weight copies.
+struct ggml_dsv4f_routing_api {
+    void * (*bind)(const struct ggml_tensor *);
+    void (*observe)(void *, const int32_t *, const float *, int);
+    intptr_t (*count)(const void *, int);
+};
+GGML_BACKEND_API struct ggml_dsv4f_routing_api ggml_dsv4f_routing;
 
 #ifdef __cplusplus
 }

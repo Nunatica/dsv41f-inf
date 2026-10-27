@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 #include "dsv4f-service.cuh"
+#include "../ggml-dsv4f-routing.h"
 
 namespace {
 __global__ void activate(float * g, const float * u, int n, float limit) {
@@ -37,7 +38,7 @@ struct key {
     bool operator==(const key & b) const { return base == b.base && expert == b.expert; }
 };
 struct hash { size_t operator()(const key & k) const { return (size_t(k.base)>>6) ^ (size_t(k.expert)*0x9e3779b9); } };
-struct slot { key id{}; bool occupied=false, ready=false, pinned=false; uint64_t age=0; };
+struct slot { key id{}; bool occupied=false, ready=false, pinned=false; uint64_t age=0; void * routing=nullptr; };
 struct job { int si; const char * g; const char * u; const char * d; };
 class cache {
     std::mutex mu;
@@ -269,12 +270,14 @@ public:
                 int si=cursor++%slots.size();auto & s=slots[si];
                 if(!s.occupied){victim=si;break;}
                 if(!s.ready || s.pinned)continue;
-                uint64_t f=frequency[s.id];
+                uint64_t f=frequency[s.id]+ggml_dsv4f_routing_bonus(ggml_dsv4f_routing_count(s.routing,s.id.expert));
                 if(f<score || (f==score && s.age<age)){score=f;age=s.age;victim=si;}
             }
-            if(victim<0 || (slots[victim].occupied && frequency[k]<=score))continue;
+            void * routing=ggml_dsv4f_routing_bind(cg);
+            const uint64_t candidate=frequency[k]+ggml_dsv4f_routing_bonus(ggml_dsv4f_routing_count(routing,eid));
+            if(victim<0 || (slots[victim].occupied && candidate<=score))continue;
             auto & s=slots[victim];if(s.occupied)lookup.erase(s.id);
-            s={k,true,false,false,epoch};lookup[k]=victim;
+            s={k,true,false,false,epoch,routing};lookup[k]=victim;
             queue.push_back({victim,(const char *)cg->data+eid*gs,(const char *)cu->data+eid*us,(const char *)cd->data+eid*ds});
             cv.notify_one();break;
         }
@@ -302,5 +305,5 @@ extern "C" void ggml_dsv4f_experts_register() {
     if(cudaGetDeviceCount(&count)!=cudaSuccess || count<1) { (void)cudaGetLastError(); return; }
     ggml_dsv4f_experts={dispatch,collect,finish,invalidate,offer,finalize,
         ggml_dsv4f_service_supported,ggml_dsv4f_service_compute,ggml_dsv4f_service_finalize,ggml_dsv4f_service_statistics,
-        ggml_dsv4f_service_resize,ggml_dsv4f_trim_workspace,[]()->size_t{return ggml_dsv4f_allocated_cache_bytes.load();}};
+        ggml_dsv4f_service_resize,ggml_dsv4f_trim_workspace,[]()->size_t{return ggml_dsv4f_allocated_cache_bytes.load();},ggml_dsv4f_service_drain};
 }

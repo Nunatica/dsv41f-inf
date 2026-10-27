@@ -7,7 +7,9 @@ export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-184320}
 export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-1024}
 export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
 case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
-export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-0}
+export DSV4F_ADAPTIVE_ROUTING=${DSV4F_ADAPTIVE_ROUTING:-1}
+case "$DSV4F_ADAPTIVE_ROUTING" in 0|1) ;; *) echo 'DSV4F_ADAPTIVE_ROUTING must be 0 or 1.' >&2; exit 1;; esac
+export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-1}
 case "$DSV4F_RAM_PRELOAD" in 0|1) ;; *) echo 'DSV4F_RAM_PRELOAD must be 0 or 1.' >&2; exit 1;; esac
 for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
     value=${!name}
@@ -252,7 +254,7 @@ args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v
       --load-mode "$load_mode" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
       --batch-size "${BATCH_SIZE:-4096}" --ubatch-size "${UBATCH_SIZE:-4096}"
-      --flash-attn on --parallel 1 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
+      --flash-attn on --parallel 1 --cache-ram 0 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
       --jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning on --reasoning-budget 4096 --no-context-shift
       --alias dsv4f --ui --path "$ROOT/web")
 if [[ $DSV4F_MTP == 1 ]]; then
@@ -266,6 +268,7 @@ fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
     echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
+    echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
     echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'
