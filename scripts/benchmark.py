@@ -9,6 +9,7 @@ from pathlib import Path
 import statistics
 import time
 from urllib.request import Request, urlopen
+from reasoning import verify_off_reasoning
 
 def api_headers():
     key = os.environ.get('API_KEY', 'dummykey')
@@ -21,7 +22,7 @@ PROMPT = 'Explain story of the romance of three kingdoms.'
 def generate(url, tokens, prompt=PROMPT, *, cache_prompt=False):
     body = {'model': 'dsv4f', 'messages': [{'role': 'user', 'content': prompt}],
             'max_tokens': tokens, 'temperature': 0, 'seed': 42, 'cache_prompt': cache_prompt,
-            'chat_template_kwargs': {'enable_thinking': False}, 'reasoning_budget': 0,
+            'chat_template_kwargs': {'enable_thinking': False}, 'reasoning_budget_tokens': 0,
             'timings_per_token': True}
     request = Request(url+'/v1/chat/completions', data=json.dumps(body).encode(), headers=api_headers())
     start = time.monotonic()
@@ -29,8 +30,8 @@ def generate(url, tokens, prompt=PROMPT, *, cache_prompt=False):
         result = json.load(response)
     elapsed = time.monotonic()-start
     msg = result['choices'][0]['message']
-    if msg.get('reasoning_content'):
-        raise RuntimeError('Benchmark generated reasoning despite reasoning-off settings')
+    verify_off_reasoning(msg.get('reasoning_content'), allow_empty=True,
+                         allow_partial=result['choices'][0].get('finish_reason') == 'length')
     timing = result.get('timings')
     if not timing or not timing.get('prompt_per_second') or (tokens > 1 and not timing.get('predicted_per_second')):
         raise RuntimeError('Native server timings are absent')

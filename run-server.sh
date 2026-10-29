@@ -259,14 +259,16 @@ fi
 BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 
 #--jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning off --reasoning-budget 0 --no-context-shift
+#--jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning on --reasoning-budget 4096 --no-context-shift
 load_mode=none
 if ((ram_budget_mib)); then load_mode=dio; fi
+# Chat parsing forces Off to budget 0; -1 lets requests enable unlimited thinking.
 args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v q8_0
       --load-mode "$load_mode" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
       --batch-size "${BATCH_SIZE:-4096}" --ubatch-size "${UBATCH_SIZE:-4096}"
       --flash-attn on --parallel 1 --cache-ram 0 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
-      --jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning on --reasoning-budget 4096 --no-context-shift
+      --jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning off --reasoning-budget -1 --no-context-shift
       --alias dsv4f --ui --path "$ROOT/web")
 if [[ $DSV4F_MTP == 1 ]]; then
     args+=(--spec-type draft-mtp --spec-draft-n-max "$DSV4F_DRAFT_N_MAX"

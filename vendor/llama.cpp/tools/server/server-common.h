@@ -333,6 +333,9 @@ server_tokens tokenize_input_subprompt(
 // OAI utils
 //
 
+inline constexpr char DSV41F_REASONING_BUDGET_MESSAGE[] =
+    "... Reasoning budget is exceeded. It's time to answer now.";
+
 // global server parameters for chat formatting / parsing
 struct server_chat_params {
     bool use_jinja;

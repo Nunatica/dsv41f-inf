@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 from urllib.request import Request, urlopen
+from reasoning import verify_off_reasoning
 
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
@@ -67,6 +68,7 @@ assert health['status']=='ok' and result['context']>=1024
 assert result['memory']['VmSwap']==0 and result['memory_swap_max']=='0' and result['memory_swap_current']=='0'
 assert '--cache-type-k' in result['command'] and result['command'][result['command'].index('--cache-type-k')+1]=='q8_0'
 assert result['command'][result['command'].index('--cache-type-v')+1]=='q8_0'
-assert stream['done'] and stream['content'] and not stream['reasoning_content'] and stream['native_samples']>1,stream
+assert stream['done'] and stream['content'] and stream['native_samples']>1,stream
+verify_off_reasoning(stream['reasoning_content'])
 # V4.1 Engram tables use bounded row reads; report their disk I/O without rejecting it.
 print(json.dumps({k:result[k] for k in ['health','context','memory','vram_gib_min','vram_gib_max','read_bytes_delta','major_fault_delta','memory_swap_max']},ensure_ascii=False))

@@ -15,6 +15,7 @@ import signal
 import subprocess
 import time
 from urllib.request import Request, urlopen
+from reasoning import verify_off_reasoning
 
 from benchmark import PROMPT, api_headers
 from diagnose_engram_io import snapshot, summarize
@@ -71,7 +72,7 @@ def generate(state, seed, control=None, *, ignore_eos=False):
         control.write_text('0')
     result.update(wall_seconds=time.monotonic()-start, after=snapshot(state['pid']))
     assert result['after']['memory']['VmSwap'] == 0
-    assert not result['reasoning_content'], 'Unexpected reasoning'
+    verify_off_reasoning(result['reasoning_content'])
     points = result['points']
     result['segments'] = []
     for lo, hi in ((1, 128), (128, 256), (256, 512), (512, 768), (768, 1200)):

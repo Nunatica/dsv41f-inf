@@ -7,7 +7,7 @@ DSV4F_ADAPTIVE_PRUNING=30 DSV4F_RAM_BUDGET_MIB=0 MODEL=models/DeepSeek-V4.1-Flas
 DSV4F_ADAPTIVE_PRUNING=25 DSV4F_RAM_BUDGET_MIB=184320 MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ./run-server.sh
 ```
 
-`DSV4F_ADAPTIVE_PRUNING=N` accepts integers from `0` to `50`; `0` disables pruning. **N is a target percentage of the main model's total routed expert weight bytes to remove**, rather than a fixed percentage of experts in every layer. For example, `25` targets a 25% reduction in the combined gate/up/down weights across all main-model layers and quantization tiers. Shared experts, attention, Engram, KV caches, compute buffers and MTP drafter weights are excluded from this target. This replaces the earlier uniform per-layer expert-count interpretation; the same setting can now select a different set of experts.
+`DSV4F_ADAPTIVE_PRUNING=N` accepts integers from `0` to `50`; `0` disables pruning. **N is a target percentage of the main model's total routed expert weight bytes to remove**. For example, `25` targets a 25% reduction in the combined gate/up/down weights across all main-model layers and quantization tiers. Shared experts, attention, Engram, KV caches, compute buffers and MTP drafter weights are excluded from this target.
 
 At startup, pruning reads `models/<model stem>.routing.json`, maps format-local history IDs to global expert IDs, and computes each candidate's cost as:
 
@@ -22,7 +22,7 @@ The mask applies before top-k selection in both prefill and decode: pruned top-1
 
 The history file is read-only during pruning, and changing it requires a server restart. Missing, malformed, mismatched or incomplete history, invalid percentages, and simultaneous routing/pruning cause startup failure. With `DSV4F_RAM_BUDGET_MIB=0` and `--load-mode none`, resident weight tensors (including pinned buffers) contain only active expert planes: excluded planes are neither allocated nor read. Global routing IDs and history IDs stay unchanged; format-local IDs are packed for execution, and empty quantization tiers are omitted. The original GGUF stays unchanged. Tiered O_DIRECT and mmap loading retain their file layout and apply the routing mask; N describes the excluded weight set, not a guaranteed reduction in process RSS or a positive RAM-cache budget. The launcher uses the same selection rule for resident memory estimates. Startup logs report per-layer exclusions, historical call shares, and target/actual skipped bytes.
 
-For the differential policy, use **`DSV4F_ADAPTIVE_PRUNING=30` for dsx 2.6 bpw** and **`25` for UD-Q4_K_XL** as history-based starting points. If you want one setting for both models, start with **`25`**. The earlier recommendation to treat every value of `30` or higher as experimental was based on uniform per-layer pruning and no longer describes the differential selection rule.
+For the differential policy, use **`DSV4F_ADAPTIVE_PRUNING=30` for dsx 2.6 bpw** and **`25` for UD-Q4_K_XL** as history-based starting points. If you want one setting for both models, start with **`25`**.
 
 | Model | More conservative | Recommended starting point | Memory-priority candidate | Experimental range |
 | --- | ---: | ---: | ---: | ---: |
@@ -31,7 +31,7 @@ For the differential policy, use **`DSV4F_ADAPTIVE_PRUNING=30` for dsx 2.6 bpw**
 
 These ranges are judgments based on the currently collected histories, not measured quality thresholds. Use the memory-priority candidate when the additional savings matter, and compare output quality with pruning disabled before adopting it. Different workloads or more complete histories can change the appropriate setting; the difference between the two models' recommendations does not establish that one model inherently tolerates pruning better.
 
-Re-analysis of the locally collected routing histories on 2026-10-30 using the differential byte-target policy produced the following results. Both models have 40 layers and 384 routed experts per layer. The historical call share is the percentage of recorded expert selections belonging to the excluded set; the maximum per-layer share measures the same percentage within the most affected layer. These values replace the earlier uniform-pruning analysis.
+Analysis of the locally collected routing histories on 2026-10-30 using the differential byte-target policy produced the following results. Both models have 40 layers and 384 routed experts per layer. The historical call share is the percentage of recorded expert selections belonging to the excluded set; the maximum per-layer share measures the same percentage within the most affected layer.
 
 | Model | Memory target | Historical call share excluded | Maximum per-layer share excluded | Resident expert memory saved |
 | --- | ---: | ---: | ---: | ---: |
@@ -46,11 +46,11 @@ Re-analysis of the locally collected routing histories on 2026-10-30 using the d
 | UD-Q4_K_XL | 35% | 0.884% | 1.258% | 94.13 GiB |
 | UD-Q4_K_XL | 40% | 1.352% | 1.847% | 107.58 GiB |
 
-For **dsx 2.6 bpw**, `30` saves 49.60 GiB while excluding 0.129% of historical selections overall and at most 0.198% within any layer. Both call shares are below those of the earlier uniform `25` policy (0.162% overall and 1.598% in its most affected layer), despite saving more memory. Moving from `30` to `35` saves another 8.27 GiB, but the overall excluded share more than doubles to 0.275%. At `40`, it rises to 0.517%, which is why `30` is the balanced starting point and `35` is the memory-priority candidate.
+For **dsx 2.6 bpw**, `30` saves 49.60 GiB while excluding 0.129% of historical selections overall and at most 0.198% within any layer. Moving from `30` to `35` saves another 8.27 GiB, but the overall excluded share more than doubles to 0.275%. At `40`, it rises to 0.517%, which is why `30` is the balanced starting point and `35` is the memory-priority candidate.
 
 For **UD-Q4_K_XL**, `25` saves 67.24 GiB with a 0.304% overall excluded share and a 0.502% maximum per-layer share. Moving to `30` adds 13.45 GiB of savings, with those shares increasing to 0.543% and 0.813%. At `35`, the maximum per-layer share exceeds 1% (1.258%). This supports starting at `25`, considering `30` for memory savings, and reserving `35` or higher for explicit quality comparisons. The 1% figure is a history-coverage heuristic, not a proven quality boundary.
 
-At `25`, the 2.6 bpw history selects between 20 and 183 excluded experts per layer; layer 0 loses 20 experts rather than the previous 96. Compared with uniform 25% pruning, the new policy saves slightly more memory (41.33 vs. 40.82 GiB) while reducing the excluded overall historical call share from 0.162% to 0.047%. The selection rule is a greedy usage-per-byte heuristic, not a measured estimate of layer sensitivity or a guarantee of optimal output quality.
+At `25`, the 2.6 bpw history selects between 20 and 183 excluded experts per layer, including 20 in layer 0. The selection rule is a greedy usage-per-byte heuristic, not a measured estimate of layer sensitivity or a guarantee of optimal output quality.
 
 The memory savings above apply to resident expert weight tensors only. A positive RAM budget remains a configured ceiling. For UD-Q4_K_XL on the 192 GiB target system, `25` leaves 201.71 GiB of routed expert weights and `30` still leaves 188.26 GiB before other weights and runtime buffers, so use budgeted loading as shown above rather than assuming the recommended values allow full resident loading.
 

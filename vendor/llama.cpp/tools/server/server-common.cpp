@@ -10,6 +10,8 @@
 #include "server-common.h"
 
 #include <random>
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <fstream>
 #include <limits>
@@ -1414,8 +1416,60 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
-    if (body.contains("reasoning_effort")) {
+    // Scope the forced-decode Off policy to the DeepSeek V4.1 template.
+    const bool dsv41_effort = opt.use_jinja && common_chat_templates_source(opt.tmpls.get()).find(
+        "Reasoning Effort: 75 (range 1-100") != std::string::npos &&
+        common_chat_templates_source(opt.tmpls.get()).find("dsml_token") != std::string::npos;
+    bool dsv41_none = false;
+    if (dsv41_effort) {
+        // DeepSeek also accepts "thinking"; the web UI sends both aliases.
+        const auto thinking = inputs.chat_template_kwargs.find("thinking");
+        if (thinking != inputs.chat_template_kwargs.end()) {
+            const auto value = json::parse(thinking->second);
+            if (!value.is_boolean()) throw std::invalid_argument("thinking must be boolean");
+            inputs.enable_thinking = value.get<bool>();
+        }
+        json effort;
+        if (body.contains("reasoning_effort")) {
+            effort = body.at("reasoning_effort");
+        } else if (body.contains("reasoning") && body.at("reasoning").is_object()) {
+            effort = body.at("reasoning").value("effort", json());
+        }
+        if ((effort.is_null() || effort == "") && inputs.chat_template_kwargs.count("reasoning_effort")) {
+            effort = json::parse(inputs.chat_template_kwargs.at("reasoning_effort"));
+        }
+        if (!effort.is_null() && effort != "") {
+            std::string level;
+            if (effort == false) level = "none";
+            else if (effort.is_string()) level = effort.get<std::string>();
+            else throw std::invalid_argument("reasoning_effort must be none, low, high or max");
+            const auto begin = level.find_first_not_of(" \t\r\n");
+            level = begin == std::string::npos ? "" : level.substr(begin, level.find_last_not_of(" \t\r\n") - begin + 1);
+            std::transform(level.begin(), level.end(), level.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (level == "off" || level == "minimal" || level == "disabled" || level == "false") level = "none";
+            if (level == "medium") level = "high";
+            if (level == "xhigh" || level == "maximum") level = "max";
+            if (level != "none" && level != "low" && level != "high" && level != "max") {
+                throw std::invalid_argument("reasoning_effort must be none, low, high or max");
+            }
+            inputs.enable_thinking = level != "none";
+            inputs.chat_template_kwargs["reasoning_effort"] = json(level).dump();
+        }
+        // An explicit template Off flag takes precedence, as in Maya.
+        for (const char * key : {"enable_thinking", "thinking"}) {
+            if (chat_template_kwargs_object.contains(key) && chat_template_kwargs_object.at(key) == false) {
+                inputs.enable_thinking = false;
+            }
+        }
+        dsv41_none = !inputs.enable_thinking;
+        if (dsv41_none) inputs.chat_template_kwargs["reasoning_effort"] = json("low").dump();
+        // Keep the open thinking block and its parser. The budget sampler emits
+        // the message and closing tag through decode, counting completion tokens.
+        inputs.enable_thinking = true;
+        inputs.chat_template_kwargs["enable_thinking"] = "true";
+        inputs.chat_template_kwargs["thinking"] = "true";
+    } else if (body.contains("reasoning_effort")) {
+        // Other templates retain the existing Off behavior.
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
@@ -1442,11 +1496,14 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
+        if (dsv41_none) reasoning_budget = 0;
+
         if (!out_session.thinking_end_tags().empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
             llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+            llama_params["reasoning_budget_message"] = dsv41_none ? DSV41F_REASONING_BUDGET_MESSAGE :
+                json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
     }

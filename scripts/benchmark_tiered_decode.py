@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import time
 from urllib.request import Request, urlopen
+from reasoning import verify_off_reasoning
 
 from benchmark import PROMPT, api_headers, generate
 
@@ -49,7 +50,7 @@ def decode(state, tokens):
     body = dict(model='dsv4f', messages=[dict(role='user', content=PROMPT)],
                 max_tokens=tokens, temperature=0, seed=42, cache_prompt=False,
                 stream=True, stream_options=dict(include_usage=True), timings_per_token=True,
-                chat_template_kwargs=dict(enable_thinking=False), reasoning_budget=0)
+                chat_template_kwargs=dict(enable_thinking=False), reasoning_budget_tokens=0)
     result = dict(content='', reasoning_content='', before=snapshot(state))
     start = time.monotonic()
     with urlopen(Request(state['url']+'/v1/chat/completions', headers=api_headers(),
@@ -74,7 +75,7 @@ def decode(state, tokens):
             if item.get('usage'):
                 result['usage'] = item['usage']
     result.update(after=snapshot(state), wall_seconds=time.monotonic()-start)
-    assert not result['reasoning_content']
+    verify_off_reasoning(result['reasoning_content'])
     assert result['timings']['cache_n'] == 0
     result['decode_read_bytes'] = result['after']['io']['read_bytes']-result['decode_start']['io']['read_bytes']
     return result

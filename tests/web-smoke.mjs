@@ -52,7 +52,7 @@ globalThis.fetch=async (url,options={})=>{
   assert.equal(body.api_key,undefined);
   if(responseMode==='error')return Response.json({error:{message:'Test context exceeded'}},{status:400});
   if(responseMode==='stop')return new Response(new ReadableStream({start(stream){stream.enqueue(new TextEncoder().encode('data: '+JSON.stringify({choices:[{delta:{content:'Partial reply'}}],timings:{predicted_n:3,predicted_per_second:10}})+'\n\n'));options.signal.addEventListener('abort',()=>stream.error(new DOMException('Stopped','AbortError')));}}));
-  const chunks=[{choices:[{delta:{reasoning_content:body.reasoning_effort==='high'?'Thinking briefly.':''}}],timings:{predicted_n:2,predicted_per_second:15.5}}, {choices:[{delta:{content:'Hello!'},finish_reason:'stop'}],timings:{predicted_n:6,predicted_per_second:16.25},usage:{completion_tokens:6,prompt_tokens:10}}];
+  const chunks=[{choices:[{delta:{reasoning_content:body.reasoning_effort==='high'?'Thinking briefly.':"... Reasoning budget is exceeded. It's time to answer now."}}],timings:{predicted_n:2,predicted_per_second:15.5}}, {choices:[{delta:{content:'Hello!'},finish_reason:'stop'}],timings:{predicted_n:6,predicted_per_second:16.25},usage:{completion_tokens:6,prompt_tokens:10}}];
   return new Response(chunks.map(c=>'data: '+JSON.stringify(c)+'\r\n\r\n').join('')+'data: [DONE]\n\n');
  }
  throw Error(url);
@@ -74,7 +74,7 @@ window.innerWidth=800;windowEvents.get('resize')();assert.equal(document.documen
 window.innerWidth=1200;windowEvents.get('resize')();assert.equal(document.documentElement.style['--sidebar-width'],'464px');
 assert.equal($('chat-list').children[0].querySelector('.history-delete').textContent,'×');
 $('prompt').value='Hello test';await $('form').onsubmit({preventDefault(){}});await flush();
-assert.equal(requests[0].reasoning_effort,'none');assert.equal($('messages').children.length,2);assert.match($('messages').textContent,/16.25 tok\/s/);
+assert.equal(requests[0].reasoning_effort,'none');assert.equal($('messages').lastElementChild.querySelector('.reasoning').hidden,false);assert.match($('messages').textContent,/Reasoning budget is exceeded/);assert.equal($('messages').children.length,2);assert.match($('messages').textContent,/16.25 tok\/s/);
 assert.equal(document.scrollingElement.scrollTop,document.scrollingElement.scrollHeight);
 assert.match($('report-rows').textContent,/Hello test/);assert.equal(disk.get('dsv4f.chats.v1').chats[0].messages[1].state,'complete');
 $('new-chat').onclick();await flush();assert.equal($('chat-count').textContent,'2');
