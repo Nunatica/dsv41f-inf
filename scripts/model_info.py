@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Read GGUF headers without mapping weights or requiring NumPy."""
+import bisect
 import json
 import os
 from pathlib import Path
@@ -152,18 +153,70 @@ def inspect(path):
             'context_limit': meta.get('deepseek41.max_position_embeddings', meta.get('deepseek41.context_length')) if arch == 'deepseek41' else meta.get('deepseek4.context_length')}
 
 
-def resident_pruned_bytes(info, percentage, routing_dir='models'):
-    """Skipped-byte estimate for resident-loader RAM checks.
+def select_pruning(layers, percentage):
+    """Greedy normalized historical call-share cost per byte, matching native code.
 
-    Read only headers, the small format maps and routing history. GGUF spans
-    can include alignment padding: use exact block sizes for supported models,
-    or conservatively subtract maximum padding for unknown tensor types.
-    The native loader remains the authority on validation.
+    Each layer supplies counts, bytes, layer and top_k. Whole experts are
+    removed until ceil(total expert bytes * percentage / 100) is reached.
     """
-    if not percentage:
-        return 0
-    if not 1 <= percentage <= 50:
+    if type(percentage) is not int or not 0 <= percentage <= 50:
         raise ValueError('DSV4F_ADAPTIVE_PRUNING must be in 0..50')
+    if not percentage:
+        return [set() for _ in layers]
+    candidates, removed, active, seen = [], [], [], set()
+    total_bytes = 0
+    for slot, layer in enumerate(layers):
+        counts, weights = layer['counts'], layer['bytes']
+        ne, nk = len(counts), layer['top_k']
+        if (not 1 <= ne <= 512 or len(weights) != ne or not 1 <= nk <= ne
+                or layer['layer'] < 0 or layer['layer'] in seen
+                or any(type(c) is not int or not 0 <= c <= sys.maxsize for c in counts)
+                or any(type(w) is not int or w <= 0 for w in weights)):
+            raise ValueError('Invalid pruning layer/counts/bytes')
+        seen.add(layer['layer'])
+        calls = 0.0
+        for count in counts:
+            calls += float(count)
+        if not calls:
+            raise ValueError(f"Empty routing history for layer {layer['layer']}")
+        removed.append(set())
+        active.append(ne)
+        total_bytes += sum(weights)
+        for expert, (count, weight) in enumerate(zip(counts, weights)):
+            candidates.append((float(count) / calls / float(weight), layer['layer'], expert, slot, weight))
+    if not 0 < total_bytes <= 2**64-1:
+        raise ValueError('Invalid total expert byte size')
+    target = (total_bytes*percentage + 99)//100
+    choices = [sorted((w, i) for i, w in enumerate(l['bytes'])) for l in layers]
+    min_keep = [sum(w for w, _ in options[:l['top_k']]) for l, options in zip(layers, choices)]
+    retained_floor = sum(min_keep)
+    if total_bytes-retained_floor < target:
+        raise ValueError('Pruning cannot reach memory target while retaining top-k in every layer')
+    saved = 0
+    for _, _, expert, slot, weight in sorted(candidates):
+        if saved >= target:
+            break
+        if active[slot] <= layers[slot]['top_k']:
+            continue
+        choices[slot].remove((weight, expert))
+        next_keep = sum(w for w, _ in choices[slot][:layers[slot]['top_k']])
+        next_floor = retained_floor-min_keep[slot]+next_keep
+        if total_bytes-next_floor < target:
+            bisect.insort(choices[slot], (weight, expert))
+            continue
+        retained_floor, min_keep[slot] = next_floor, next_keep
+        removed[slot].add(expert)
+        active[slot] -= 1
+        saved += weight
+    if saved < target:
+        raise ValueError('Pruning cannot reach memory target while retaining top-k in every layer')
+    return removed
+
+
+def resident_pruning_plan(info, percentage, routing_dir='models'):
+    """Read headers, format maps and history; plan exact routed-weight savings."""
+    if not percentage:
+        return {'original_bytes': 0, 'skipped_bytes': 0, 'layers': []}
     stem = re.sub(r'-[0-9]{5}-of-([0-9]{5})$', r'-00001-of-\1', Path(info['model']).stem)
     table = Path(routing_dir) / (stem + '.routing.json')
     if table.stat().st_size > 64*1024*1024:
@@ -171,55 +224,70 @@ def resident_pruned_bytes(info, percentage, routing_dir='models'):
     data = json.loads(table.read_text())
     if data['version'] != 1 or data['model'] != stem:
         raise ValueError('Pruning history schema/model mismatch')
-    sources, layers, alignments = {}, {}, {}
-    geometry = {0: (1, 4), 1: (1, 2), 8: (32, 34), 11: (256, 110),
+    sources, layers = {}, {}
+    geometry = {0: (1, 4), 1: (1, 2), 8: (32, 34), 10: (256, 84), 11: (256, 110),
+                12: (256, 144), 13: (256, 176), 14: (256, 210),
                 39: (32, 17), 42: (64, 18), 143: (128, 28)}
+    top_k = None
     for path in info['shards']:
         meta, tensors, start = header(path)
-        alignments[path] = meta.get('general.alignment', 32)
-        for j, (name, shape, typ, offset) in enumerate(tensors):
-            end = tensors[j+1][3] if j+1 < len(tensors) else Path(path).stat().st_size-start
-            sources[name] = (path, start+offset, end-offset, shape, typ)
+        if top_k is None:
+            top_k = meta.get('deepseek41.num_experts_per_tok', meta.get('deepseek41.expert_used_count'))
+        for name, shape, typ, offset in tensors:
+            sources[name] = (path, start+offset, shape, typ)
             match = re.fullmatch(r'blk\.(\d+)\.ffn_gate_exps(?:\.[^.]+)?\.weight', name)
             if match:
                 layers.setdefault(int(match[1]), []).append(name)
-    skipped = 0
-    for layer, gates in layers.items():
+    if type(top_k) is not int:
+        raise ValueError('Missing expert top-k metadata for pruning')
+    plan = []
+    for layer, gates in sorted(layers.items()):
         map_name = f'blk.{layer}.ffn_exps_gu_type'
         if map_name in sources:
-            path, offset, _, shape, _ = sources[map_name]
+            path, offset, shape, _ = sources[map_name]
             with open(path, 'rb') as f:
                 f.seek(offset)
                 formats = struct.unpack('<' + 'i'*shape[0], f.read(4*shape[0]))
-            mappings = {gate: [i for i, typ in enumerate(formats) if typ == sources[gate][4]] for gate in gates}
+            mappings = {gate: [i for i, typ in enumerate(formats) if typ == sources[gate][3]] for gate in gates}
             count = len(formats)
         else:
             if len(gates) != 1:
                 raise ValueError('Missing expert format map')
-            count = sources[gates[0]][3][2]
+            count = sources[gates[0]][2][2]
             mappings = {gates[0]: list(range(count))}
-        counters = [0]*count
+        counters, weights, seen = [0]*count, [0]*count, set()
         for gate, global_ids in mappings.items():
-            if len(global_ids) != sources[gate][3][2]:
+            if len(global_ids) != sources[gate][2][2] or seen.intersection(global_ids):
                 raise ValueError('Expert format map/shape mismatch')
+            seen.update(global_ids)
             row = data['experts'].get(gate.replace('ffn_gate_exps', 'ffn_exps'), {})
-            for local, global_id in enumerate(global_ids):
-                value = row.get(str(local), 0)
-                if type(value) is not int or value < 0:
-                    raise ValueError('Invalid routing counter')
-                counters[global_id] = value
-        removed = set(sorted(range(count), key=lambda i: (counters[i], i))[:count*percentage//100])
-        for gate, global_ids in mappings.items():
-            excluded = sum(i in removed for i in global_ids)
+            if any(not k.isdecimal() or str(int(k)) != k or not 0 <= int(k) < len(global_ids)
+                   or type(v) is not int or not 0 <= v <= sys.maxsize for k, v in row.items()):
+                raise ValueError('Invalid routing counter')
+            plane = 0
             for role in ('gate', 'up', 'down'):
-                path, _, span, shape, typ = sources[gate.replace('ffn_gate_exps', f'ffn_{role}_exps')]
-                if typ in geometry:
-                    block, size = geometry[typ]
-                    plane = shape[0]//block*size*shape[1]
-                else:
-                    plane = max(0, span-alignments[path]+1)//shape[2]
-                skipped += plane*excluded
-    return skipped
+                _, _, shape, typ = sources[gate.replace('ffn_gate_exps', f'ffn_{role}_exps')]
+                if typ not in geometry or shape[0] % geometry[typ][0]:
+                    raise ValueError(f'Unsupported pruning tensor geometry: {typ}')
+                block, size = geometry[typ]
+                plane += shape[0]//block*size*shape[1]
+            for local, global_id in enumerate(global_ids):
+                counters[global_id] = row.get(str(local), 0)
+                weights[global_id] = plane
+        if len(seen) != count:
+            raise ValueError('Incomplete expert format map')
+        plan.append({'layer': layer, 'counts': counters, 'bytes': weights, 'top_k': top_k})
+    removed = select_pruning(plan, percentage)
+    for layer, excluded in zip(plan, removed):
+        layer['removed'] = sorted(excluded)
+        layer['skipped_bytes'] = sum(layer['bytes'][i] for i in excluded)
+        layer['excluded_call_share'] = sum(layer['counts'][i] for i in excluded)/sum(layer['counts'])
+    return {'original_bytes': sum(sum(l['bytes']) for l in plan),
+            'skipped_bytes': sum(l['skipped_bytes'] for l in plan), 'layers': plan}
+
+
+def resident_pruned_bytes(info, percentage, routing_dir='models'):
+    return resident_pruning_plan(info, percentage, routing_dir)['skipped_bytes']
 
 
 def inspect_mtp(path, manifest=None):

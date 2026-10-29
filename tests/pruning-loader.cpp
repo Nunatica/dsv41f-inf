@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 #include <unistd.h>
@@ -22,6 +23,7 @@ struct source_tier {int type;std::vector<int32_t> local;std::string names[3];siz
 static std::vector<std::vector<source_tier>> original;
 static std::vector<std::set<int>> removed;
 static size_t expected_active=0,expected_skipped=0;
+static int top_k=0;
 static std::string model_path;
 static gguf_context * file_info;
 static llama_model * load(bool compact,bool gpu,bool no_alloc=false) {
@@ -88,6 +90,7 @@ int main(int argc,char **argv) {
     setenv("DSV4F_ENGRAM_DIR",std::filesystem::path(model_path).replace_extension(".engram").c_str(),1);
     ggml_backend_load_all();
     auto * base=load(true,false,true);auto * model=dynamic_cast<llama_model_deepseek41*>(base);require(model,"fixture model");
+    top_k=model->hparams.n_expert_used(0);
     json history={{"version",1},{"model",std::filesystem::path(model_path).stem().string()},{"experts",json::object()}};
     std::vector<std::vector<int>> counts;
     for(const auto & layer:model->tiers) {
@@ -109,13 +112,26 @@ int main(int argc,char **argv) {
     {std::ofstream f(std::filesystem::path("models")/(std::filesystem::path(model_path).stem().string()+".routing.json"));f<<history;}
     for(int pct:{25,50}) {
         setenv("DSV4F_ADAPTIVE_PRUNING",std::to_string(pct).c_str(),1);removed.clear();expected_active=expected_skipped=0;
+        struct candidate {double score;size_t layer,id,bytes;};
+        std::vector<candidate> candidates;
+        size_t total=0,saved=0;std::vector<size_t> active;
         for(size_t l=0;l<counts.size();++l) {
-            std::vector<int> order;for(size_t i=0;i<counts[l].size();++i)order.push_back(i);
-            std::sort(order.begin(),order.end(),[&](int a,int b){return counts[l][a]<counts[l][b];});
-            removed.emplace_back(order.begin(),order.begin()+order.size()*pct/100);
-            for(const auto & e:original[l])for(size_t i=0;i<e.local.size();++i)if(e.local[i]>=0)
-                for(size_t plane:e.plane)(removed.back().count(i)?expected_skipped:expected_active)+=plane;
+            double calls=0;for(int n:counts[l])calls+=n;
+            removed.emplace_back();active.push_back(counts[l].size());
+            for(size_t i=0;i<counts[l].size();++i) {
+                size_t bytes=0;
+                for(const auto & e:original[l])if(e.local[i]>=0)for(size_t plane:e.plane)bytes+=plane;
+                candidates.push_back({double(counts[l][i])/calls/double(bytes),l,i,bytes});total+=bytes;
+            }
         }
+        std::sort(candidates.begin(),candidates.end(),[](const candidate & a,const candidate & b){return std::tie(a.score,a.layer,a.id)<std::tie(b.score,b.layer,b.id);});
+        const size_t target=(total*pct+99)/100;
+        // Keep the fixture top-k even when cheap candidates concentrate in one layer.
+        for(const auto & c:candidates)if(saved<target && active[c.layer]>size_t(top_k)) {
+            removed[c.layer].insert(c.id);--active[c.layer];saved+=c.bytes;
+        }
+        require(saved>=target,"reference reaches memory target");
+        expected_skipped=saved;expected_active=total-saved;
         for(bool gpu:{false,true}) {
             if(gpu && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))continue;
             for(const char * maps:{"0","1"})for(const char * pipeline:{"0","1"}) {

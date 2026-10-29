@@ -12,7 +12,15 @@ void dsv4f_routing_start();
 // Drains decode telemetry and atomically replaces models/<model stem>.routing.json.
 // Errors are logged; a completed response must still reach the client.
 bool dsv4f_routing_save();
-// Empty when disabled; otherwise 0 / -infinity in global expert ID order.
-// Each group pairs its gate tensor name with a global-to-local expert map.
-std::vector<float> dsv4f_pruning_mask(int layer, int n_experts, int n_used,
-    const std::vector<std::pair<std::string, std::vector<int32_t>>> & groups);
+struct dsv4f_pruning_group {
+    std::string gate_name;
+    std::vector<int32_t> local; // global-to-format-local expert IDs
+    uint64_t expert_bytes; // gate + up + down for one expert, without padding
+};
+struct dsv4f_pruning_layer {
+    int layer, n_experts, n_used;
+    std::vector<dsv4f_pruning_group> groups;
+};
+// Plan all layers together before changing tensor shapes. Empty when disabled;
+// otherwise one 0 / -infinity mask per input layer, in global expert ID order.
+std::vector<std::vector<float>> dsv4f_pruning_masks(const std::vector<dsv4f_pruning_layer> & layers);

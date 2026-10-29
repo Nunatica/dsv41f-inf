@@ -280,7 +280,7 @@ if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
     echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
     echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
-    echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING%"
+    echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING% routed expert memory target (differential per layer)"
     echo "Allocation/read pipeline: $DSV4F_LOAD_PIPELINE_MIB MiB (0: disabled)"
     echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"

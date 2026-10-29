@@ -1,4 +1,5 @@
 import os
+import random
 import json
 from pathlib import Path
 import struct
@@ -34,14 +35,67 @@ class PruningMemoryEstimateTest(unittest.TestCase):
             table = Path(temp) / 'Pruning.routing.json'
             table.write_text(json.dumps(history))
             info = {'model': str(path), 'shards': [str(path)]}
-            with patch.object(model_info, 'header', return_value=({}, tensors, 0)):
+            with patch.object(model_info, 'header', return_value=({'deepseek41.num_experts_per_tok': 2}, tensors, 0)):
                 self.assertEqual(model_info.resident_pruned_bytes(info, 0, temp), 0)
-                self.assertEqual(model_info.resident_pruned_bytes(info, 1, temp), 0)
-                self.assertEqual(model_info.resident_pruned_bytes(info, 25, temp), 3 * planes['q3_k'])
+                self.assertEqual(model_info.resident_pruned_bytes(info, 1, temp), 3 * planes['q3_k'])
+                self.assertEqual(model_info.resident_pruned_bytes(info, 25, temp), 6 * planes['q3_k'])
                 self.assertEqual(model_info.resident_pruned_bytes(info, 50, temp), 6 * planes['q3_k'] + 3 * planes['q2_0'])
                 del history['experts']['blk.0.ffn_exps.ptq1_0.weight']
                 table.write_text(json.dumps(history))
-                self.assertEqual(model_info.resident_pruned_bytes(info, 25, temp), 3 * planes['ptq1_0'])
+                self.assertEqual(model_info.resident_pruned_bytes(info, 25, temp), 6 * planes['ptq1_0'] + 3 * planes['q3_k'])
+
+
+class DifferentialPruningTest(unittest.TestCase):
+    def test_normalized_usage_and_byte_cost(self):
+        layers = [
+            {'layer': 0, 'counts': [10, 20, 30, 40], 'bytes': [10]*4, 'top_k': 1},
+            {'layer': 1, 'counts': [0, 1, 1, 998], 'bytes': [10]*4, 'top_k': 1}]
+        self.assertEqual(model_info.select_pruning(layers, 25), [set(), {0, 1}])
+        # Multiplying one layer's sample size must not change its ranking.
+        layers[0]['counts'] = [c*1000 for c in layers[0]['counts']]
+        self.assertEqual(model_info.select_pruning(layers, 25), [set(), {0, 1}])
+        # A larger plane can be cheaper per byte despite a higher count.
+        layers = [{'layer': 0, 'counts': [1, 2, 97], 'bytes': [10, 100, 100], 'top_k': 1}]
+        self.assertEqual(model_info.select_pruning(layers, 25), [{1}])
+        # Even at zero historical cost, top-k experts must survive per layer.
+        layers = [{'layer': l, 'counts': [0, 0, 0, 100], 'bytes': [10]*4, 'top_k': 3} for l in range(2)]
+        self.assertEqual(model_info.select_pruning(layers, 25), [{0}, {0}])
+        with self.assertRaises(ValueError):
+            model_info.select_pruning(layers, 50)
+        # Small cheap planes must not consume all removable slots when a
+        # larger plane is needed to reach an otherwise feasible byte target.
+        layers = [{'layer': 0, 'counts': [0, 0, 100], 'bytes': [1, 1, 100], 'top_k': 1}]
+        self.assertEqual(model_info.select_pruning(layers, 50), [{0, 2}])
+
+    def test_native_python_selection_parity(self):
+        binary = ROOT / 'build/bin/dsv4f-adaptive-pruning-test'
+        if not binary.exists():
+            self.skipTest('Build dsv4f-adaptive-pruning-test for native planner parity')
+        rng = random.Random(814)
+        cases = []
+        for case in range(100):
+            layers = []
+            for l in range(rng.randint(1, 5)):
+                n = rng.randint(4, 20)
+                counts = [rng.choice([0, 0, 1, 10, 100, 2**62]) for _ in range(n)]
+                counts[-1] = max(1, counts[-1])
+                layers.append({'layer': l*2, 'counts': counts,
+                    'bytes': [rng.choice([10, 17, 100, 2**30]) for _ in range(n)],
+                    'top_k': rng.randint(1, n)})
+            rng.shuffle(layers)
+            cases.append({'percentage': rng.choice([0, 1, 20, 25, 30, 50]), 'layers': layers})
+        expected = []
+        for case in cases:
+            try:
+                expected.append([sorted(ids) for ids in model_info.select_pruning(case['layers'], case['percentage'])])
+            except ValueError:
+                expected.append(None)
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp)/'cases.json'
+            source.write_text(json.dumps(cases))
+            result = subprocess.run([str(binary), str(source)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), expected)
 
 
 class AdaptivePruningLauncherTest(unittest.TestCase):

@@ -16,6 +16,7 @@
 #include <numeric>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 #include <unistd.h>
@@ -127,41 +128,104 @@ void dsv4f_routing_init(const std::string & model_path) {
     }
     if(t.pruning) {
         if(!t.loaded_history)throw std::runtime_error("adaptive pruning requires nonzero routing history: "+t.path);
-        std::fprintf(stderr,"[dsv4f-pruning] enabled: bottom %d%% per layer from %s (read-only)\n",t.pruning,t.path.c_str());
+        std::fprintf(stderr,"[dsv4f-pruning] enabled: target %d%% of routed expert weight bytes from %s (read-only)\n",t.pruning,t.path.c_str());
         return;
     }
     t.enabled=true;ggml_dsv4f_routing={bind,observe,count};
     std::fprintf(stderr,"[dsv4f-routing] enabled: %s\n",t.path.c_str());
 }
-std::vector<float> dsv4f_pruning_mask(int layer,int n_experts,int n_used,
-    const std::vector<std::pair<std::string,std::vector<int32_t>>> & groups) {
+std::vector<std::vector<float>> dsv4f_pruning_masks(const std::vector<dsv4f_pruning_layer> & layers) {
     auto & t=history();std::lock_guard<std::mutex> lock(t.mutex);
     if(!t.pruning)return {};
-    if(n_experts<1 || n_experts>max_experts || n_used<1 || n_used>n_experts)
-        throw std::runtime_error("adaptive pruning: invalid expert dimensions");
-    const int removed=n_experts*t.pruning/100;
-    if(n_experts-removed<n_used)throw std::runtime_error("adaptive pruning leaves fewer experts than top-k");
-    std::vector<intptr_t> counts(n_experts);
-    std::vector<bool> seen(n_experts);
-    bool has_counts=false;
-    for(const auto & group:groups) {
-        const auto name=row_name(group.first);const auto it=t.rows.find(name);
-        // Persistence omits all-zero rows, so an absent format has no calls.
-        if(int(group.second.size())!=n_experts)throw std::runtime_error("adaptive pruning: invalid expert mapping");
-        for(int id=0;id<n_experts;++id)if(group.second[id]>=0) {
-            const int local=group.second[id];
-            if(local>=max_experts || seen[id])throw std::runtime_error("adaptive pruning: invalid/duplicate expert ID");
-            seen[id]=true;counts[id]=it==t.rows.end()?0:it->second->counts[local];has_counts|=counts[id]>0;
+    struct candidate {size_t slot;int id;uint64_t bytes;double share,score;};
+    std::vector<candidate> candidates;
+    std::vector<std::vector<float>> masks;
+    std::vector<int> active;
+    std::vector<double> excluded_share(layers.size());
+    std::vector<uint64_t> layer_bytes(layers.size());
+    std::vector<std::multiset<std::pair<uint64_t,int>>> remaining(layers.size());
+    std::vector<uint64_t> min_keep(layers.size());
+    std::map<int,bool> layer_ids;
+    uint64_t total_bytes=0;
+    for(size_t slot=0;slot<layers.size();++slot) {
+        const auto & l=layers[slot];const int ne=l.n_experts;
+        if(ne<1 || ne>max_experts || l.n_used<1 || l.n_used>ne || l.layer<0 || !layer_ids.emplace(l.layer,true).second)
+            throw std::runtime_error("adaptive pruning: invalid/duplicate layer or expert dimensions");
+        std::vector<intptr_t> counts(ne);
+        std::vector<uint64_t> bytes(ne);
+        std::vector<bool> seen(ne);
+        double calls=0;
+        for(const auto & g:l.groups) {
+            const auto it=t.rows.find(row_name(g.gate_name));
+            if(int(g.local.size())!=ne || !g.expert_bytes)
+                throw std::runtime_error("adaptive pruning: invalid expert mapping/bytes");
+            std::vector<bool> locals(ne);
+            int nlocal=0;
+            for(int id=0;id<ne;++id)if(g.local[id]>=0) {
+                const int local=g.local[id];
+                if(local>=ne || seen[id] || locals[local])throw std::runtime_error("adaptive pruning: invalid/duplicate expert ID");
+                seen[id]=locals[local]=true;++nlocal;
+                counts[id]=it==t.rows.end()?0:it->second->counts[local];bytes[id]=g.expert_bytes;
+            }
+            for(int i=0;i<nlocal;++i)if(!locals[i])throw std::runtime_error("adaptive pruning: noncontiguous format-local IDs");
+            if(it!=t.rows.end())for(int i=nlocal;i<max_experts;++i)if(it->second->counts[i])
+                throw std::runtime_error("adaptive pruning: routing counter exceeds expert format size");
+        }
+        for(int id=0;id<ne;++id)calls+=double(counts[id]);
+        if(calls==0 || std::find(seen.begin(),seen.end(),false)!=seen.end())
+            throw std::runtime_error("adaptive pruning: incomplete/empty routing history for layer "+std::to_string(l.layer));
+        masks.emplace_back(ne,0.f);active.push_back(ne);
+        for(int id=0;id<ne;++id) {
+            if(bytes[id]>std::numeric_limits<uint64_t>::max()-total_bytes)
+                throw std::runtime_error("adaptive pruning: expert byte size overflow");
+            total_bytes+=bytes[id];
+            remaining[slot].insert({bytes[id],id});
+            const double share=double(counts[id])/calls;
+            candidates.push_back({slot,id,bytes[id],share,share/double(bytes[id])});
         }
     }
-    if(!has_counts || std::find(seen.begin(),seen.end(),false)!=seen.end())
-        throw std::runtime_error("adaptive pruning: incomplete/empty routing history for layer "+std::to_string(layer));
-    std::vector<int> order(n_experts);std::iota(order.begin(),order.end(),0);
-    std::sort(order.begin(),order.end(),[&](int a,int b){return counts[a]<counts[b] || (counts[a]==counts[b] && a<b);});
-    std::vector<float> mask(n_experts,0.f);
-    for(int i=0;i<removed;++i)mask[order[i]]=-std::numeric_limits<float>::infinity();
-    std::fprintf(stderr,"[dsv4f-pruning] layer %d: disabled %d/%d experts, active %d, top-k %d\n",layer,removed,n_experts,n_experts-removed,n_used);
-    return mask;
+    if(!total_bytes)throw std::runtime_error("adaptive pruning: no routed expert weights");
+    // Greedy historical call-share cost per byte. Binary64 arithmetic and
+    // layer/global-ID ties are mirrored by scripts/model_info.py.
+    std::sort(candidates.begin(),candidates.end(),[&](const candidate & a,const candidate & b){
+        if(a.score!=b.score)return a.score<b.score;
+        if(layers[a.slot].layer!=layers[b.slot].layer)return layers[a.slot].layer<layers[b.slot].layer;
+        return a.id<b.id;
+    });
+    const uint64_t target=total_bytes/100*t.pruning+(total_bytes%100*t.pruning+99)/100;
+    // Keep enough byte capacity available to meet the target. Otherwise a
+    // cheap small expert can consume the last removable slot in a layer and
+    // prevent a feasible target from being reached with a larger expert.
+    uint64_t retained_floor=0;
+    for(size_t i=0;i<layers.size();++i) {
+        auto it=remaining[i].begin();
+        for(int k=0;k<layers[i].n_used;++k,++it)min_keep[i]+=it->first;
+        retained_floor+=min_keep[i];
+    }
+    if(total_bytes-retained_floor<target)
+        throw std::runtime_error("adaptive pruning cannot reach memory target while retaining top-k in every layer");
+    uint64_t saved=0;
+    for(const auto & c:candidates) {
+        if(saved>=target)break;
+        if(active[c.slot]<=layers[c.slot].n_used)continue;
+        auto & choices=remaining[c.slot];choices.erase(choices.find({c.bytes,c.id}));
+        uint64_t next_keep=0;auto it=choices.begin();
+        for(int k=0;k<layers[c.slot].n_used;++k,++it)next_keep+=it->first;
+        const uint64_t next_floor=retained_floor-min_keep[c.slot]+next_keep;
+        if(total_bytes-next_floor<target){choices.insert({c.bytes,c.id});continue;}
+        retained_floor=next_floor;min_keep[c.slot]=next_keep;
+        masks[c.slot][c.id]=-std::numeric_limits<float>::infinity();--active[c.slot];
+        saved+=c.bytes;layer_bytes[c.slot]+=c.bytes;excluded_share[c.slot]+=c.share;
+    }
+    if(saved<target)throw std::runtime_error("adaptive pruning cannot reach memory target while retaining top-k in every layer");
+    for(size_t i=0;i<layers.size();++i) {
+        const auto & l=layers[i];
+        std::fprintf(stderr,"[dsv4f-pruning] layer %d: disabled %d/%d experts, active %d, top-k %d, skipped_bytes=%llu, historical_call_share=%.6f%%\n",
+            l.layer,l.n_experts-active[i],l.n_experts,active[i],l.n_used,(unsigned long long)layer_bytes[i],100*excluded_share[i]);
+    }
+    std::fprintf(stderr,"[dsv4f-pruning] memory target: original_bytes=%llu target_bytes=%llu skipped_bytes=%llu saved=%.6f%% (whole experts)\n",
+        (unsigned long long)total_bytes,(unsigned long long)target,(unsigned long long)saved,100*double(saved)/double(total_bytes));
+    return masks;
 }
 void dsv4f_routing_start(){
     if(history().enabled && history().loaded_history && ggml_dsv4f_experts.gpu_warm_start)

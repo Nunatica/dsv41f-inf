@@ -113,11 +113,15 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     // and generic prefill. Original GGUF biases and probability scores stay intact.
     size_t original_expert_bytes=0,active_expert_bytes=0;
     const bool compact_resident=!ml.use_mmap && !dsv4f_direct_weights_enabled();
+    std::vector<dsv4f_pruning_layer> pruning_layers;
     for(uint32_t l=0;l<hparams.n_layer();++l) {
-        std::vector<std::pair<std::string,std::vector<int32_t>>> groups;
-        for(const auto & e:tiers[l])groups.push_back({e.gate->name,e.local});
-        auto mask=dsv4f_pruning_mask(l,hparams.n_expert,hparams.n_expert_used(l),groups);
-        if(mask.empty())break;
+        dsv4f_pruning_layer layer{int(l),int(hparams.n_expert),int(hparams.n_expert_used(l)),{}};
+        for(const auto & e:tiers[l])layer.groups.push_back({e.gate->name,e.local,e.gate->nb[2]+e.up->nb[2]+e.down->nb[2]});
+        pruning_layers.push_back(std::move(layer));
+    }
+    const auto pruning_masks=dsv4f_pruning_masks(pruning_layers);
+    for(uint32_t l=0;l<pruning_masks.size();++l) {
+        const auto & mask=pruning_masks[l];
         if(compact_resident) {
             for(auto & e:tiers[l]) {
                 std::vector<int32_t> keep;

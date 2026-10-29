@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <unistd.h>
 using json=nlohmann::json;
@@ -16,11 +17,11 @@ static void require(bool v,const char * why){if(!v)throw std::runtime_error(why)
 template<class F> static void rejects(F f){bool failed=false;try{f();}catch(const std::exception &){failed=true;}require(failed,"expected rejection");}
 static const char * path="models/Pruning.routing.json";
 static void write(const json & j){std::ofstream f(path);f<<j.dump();}
-static const std::vector<std::pair<std::string,std::vector<int32_t>>> groups={
-    {"blk.0.ffn_gate_exps.q3_k.weight",{0,-1,1,-1,2,-1,3,-1}},
-    {"blk.0.ffn_gate_exps.ptq1_0.weight",{-1,0,-1,1,-1,2,-1,3}}};
+static const std::vector<dsv4f_pruning_group> groups={
+    {"blk.0.ffn_gate_exps.q3_k.weight",{0,-1,1,-1,2,-1,3,-1},10},
+    {"blk.0.ffn_gate_exps.ptq1_0.weight",{-1,0,-1,1,-1,2,-1,3},10}};
 static void init(){dsv4f_routing_init("Pruning.gguf");}
-static std::vector<float> mask(){return dsv4f_pruning_mask(0,8,3,groups);}
+static std::vector<float> mask(){auto m=dsv4f_pruning_masks({{0,8,3,groups}});return m.empty()?std::vector<float>{}:m.front();}
 
 static void router(ggml_backend_t backend,const std::vector<float> & mask,int nt,bool fused) {
     auto * ctx=ggml_init({2<<20,nullptr,true});require(ctx,"context");
@@ -61,9 +62,41 @@ static void router(ggml_backend_t backend,const std::vector<float> & mask,int nt
     }
     ggml_backend_buffer_free(buffer);ggml_free(ctx);
 }
-int main() {
+int main(int argc,char ** argv) {
+    json cases;
+    if(argc==2){std::ifstream input(argv[1]);input>>cases;}
+
     const auto original=std::filesystem::current_path();char temp[]="/tmp/dsv4f-pruning-XXXXXX";
     require(mkdtemp(temp),"temporary directory");std::filesystem::current_path(temp);std::filesystem::create_directory("models");
+    if(argc==2) {
+        json results=json::array();
+        setenv("DSV4F_ADAPTIVE_ROUTING","0",1);
+        for(const auto & test:cases) {
+            json data={{"version",1},{"model","Pruning"},{"experts",json::object()}};
+            std::vector<dsv4f_pruning_layer> layers;
+            for(const auto & item:test["layers"]) {
+                const std::vector<intptr_t> counts=item["counts"];
+                const std::vector<uint64_t> bytes=item["bytes"];
+                dsv4f_pruning_layer l{item["layer"],int(counts.size()),item["top_k"],{}};
+                for(size_t i=0;i<counts.size();++i) {
+                    auto name="blk."+std::to_string(l.layer)+".ffn_gate_exps.t"+std::to_string(i)+".weight";
+                    auto row=name;row.replace(row.find("ffn_gate_exps"),13,"ffn_exps");
+                    data["experts"][row]["0"]=counts[i];
+                    std::vector<int32_t> local(counts.size(),-1);local[i]=0;
+                    l.groups.push_back({name,local,bytes[i]});
+                }
+                layers.push_back(std::move(l));
+            }
+            write(data);setenv("DSV4F_ADAPTIVE_PRUNING",std::to_string(test["percentage"].get<int>()).c_str(),1);
+            try {
+                init();const auto masks=dsv4f_pruning_masks(layers);json result=json::array();
+                for(size_t l=0;l<layers.size();++l){json ids=json::array();if(!masks.empty())for(size_t i=0;i<masks[l].size();++i)if(masks[l][i]<0)ids.push_back(i);result.push_back(ids);}
+                results.push_back(result);
+            }catch(const std::exception &){results.push_back(nullptr);}
+        }
+        std::cout<<results.dump()<<std::endl;
+        std::filesystem::current_path(original);std::filesystem::remove_all(temp);return 0;
+    }
     setenv("DSV4F_ADAPTIVE_ROUTING","0",1);unsetenv("DSV4F_ADAPTIVE_PRUNING");init();require(mask().empty(),"default disabled");
     for(const char * v:{"-1","51","1.5","bad","","01","999999999999999999999"}){setenv("DSV4F_ADAPTIVE_PRUNING",v,1);rejects(init);}
     setenv("DSV4F_ADAPTIVE_PRUNING","25",1);setenv("DSV4F_ADAPTIVE_ROUTING","1",1);rejects(init);
@@ -78,11 +111,11 @@ int main() {
     write(data);std::vector<float> m;
     for(int pct=1;pct<=50;++pct) {
         setenv("DSV4F_ADAPTIVE_PRUNING",std::to_string(pct).c_str(),1);init();m=mask();
-        require(std::count_if(m.begin(),m.end(),[](float v){return v<0;})==8*pct/100,"floor percentage");
+        require(std::count_if(m.begin(),m.end(),[](float v){return v<0;})==(8*pct+99)/100,"whole expert rounding reaches byte target");
         if(pct==25)require(m[0]<0 && m[4]<0 && m[2]==0,"mixed-tier local to global mapping");
     }
     require(m[0]<0 && m[4]<0 && m[3]<0 && m[7]<0,"bottom half mapping");
-    rejects([]{dsv4f_pruning_mask(0,8,5,groups);});
+    rejects([]{dsv4f_pruning_masks({{0,8,5,groups}});});
     require(!ggml_dsv4f_routing.bind && !ggml_dsv4f_routing.observe,"no collection hooks");
     dsv4f_routing_start();require(dsv4f_routing_save(),"save no-op");
     {std::ifstream f(path);json saved;f>>saved;require(saved==data,"history remains unchanged");}
