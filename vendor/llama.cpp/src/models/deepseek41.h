@@ -12,6 +12,7 @@ struct llama_model_deepseek41 : public llama_model_base {
     std::map<std::string,ggml_tensor *> weights;
     struct experts { int type; ggml_tensor * gate,*up,*down; std::vector<int32_t> local; ggml_tensor * mapping = nullptr; };
     std::vector<std::vector<experts>> tiers;
+    std::vector<ggml_tensor *> pruning_bias;
     std::vector<int32_t> ratios, kv_sources, index_sources, engram_layers;
     std::vector<uint32_t> token_map;
     std::vector<uint32_t> primes, engram_rows;
@@ -26,6 +27,7 @@ struct llama_model_deepseek41 : public llama_model_base {
     std::vector<int32_t> dspark_layers;
     std::shared_ptr<dsv4f_engram> engram;
     ggml_tensor * W(int layer,const std::string & role) const;
+    ggml_tensor * routing_bias(int layer) const;
     struct graph : public llm_graph_context {
         graph(const llama_model_deepseek41 & model,const llm_graph_params & p);
     };

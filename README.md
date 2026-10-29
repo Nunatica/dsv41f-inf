@@ -76,8 +76,10 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
 | `DSV4F_RAM_BUDGET_MIB` | `184320` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
-| `DSV4F_ADAPTIVE_ROUTING` | `1` | Persist decode expert counters; use history for RAM/VRAM preload and eviction. `0`: disable all routing history behavior. |
+| `DSV4F_ADAPTIVE_ROUTING` | `0` (launcher) | `1`: persist decode expert counters and use history for RAM/VRAM preload and eviction. Mutually exclusive with pruning. The server binary defaults to `1` when unset. |
+| `DSV4F_ADAPTIVE_PRUNING` | `0` | `0`: disabled; `1`–`50`: exclude the least-used N% of routed experts in each layer using saved history. Requires `DSV4F_ADAPTIVE_ROUTING=0`. |
 | `DSV4F_RAM_PRELOAD` | `0` | `1`: preload experts at startup when the RAM budget is positive; `0`: disabled. |
+| `DSV4F_LOAD_PIPELINE_MIB` | `1024` | Overlap host allocation with disk reads for resident loading and RAM preload. `0`: sequential loading; range `0..65536` MiB. |
 | `DSV4F_RAM_RESERVE_MIB` | `1024` | Headroom left outside the expert cache for runtime growth. |
 | `DSV4F_RAM_CACHE_MIB` | automatic | Optional additional ceiling for the expert RAM cache. |
 | `DSV4F_EXPERT_CACHE_MIB` | `14336` | Existing aggregate VRAM expert-cache ceiling. |
@@ -87,6 +89,10 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stays on SSD
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```
+Resident loading (`DSV4F_RAM_BUDGET_MIB=0`) allocates host weights in batches and reads the previous batch while allocating the next. GPU uploads finish before this host pipeline starts. Each tensor remains contiguous; a tensor larger than the configured batch size is loaded as one batch. Pruned resident expert planes remain omitted.
+
+With `DSV4F_RAM_PRELOAD=1`, the same batch setting controls a two-stage preload pipeline: allocate/populate the next cache batch while the previous batch reads with O_DIRECT. Both resident and pending batches count against the RAM cache budget. Preload preserves historical priority/physical tie order and stops at the first plane that does not fit, without evicting the loaded prefix. Setting `DSV4F_LOAD_PIPELINE_MIB=0` restores sequential behavior for both paths.
+
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 
 ```bash
@@ -104,6 +110,19 @@ MTP defaults to off (`DSV4F_MTP=0`); keep it off for benchmarks unrelated to MTP
 `DSV4F_DRAFT_P_MIN=0..1` truncates them at the confidence threshold (default 0.25).
 
 MTP is disabled by default because it does not improve any speed for target system.
+
+### Adaptive expert pruning
+
+First collect representative decode history with `DSV4F_ADAPTIVE_ROUTING=1 DSV4F_ADAPTIVE_PRUNING=0`. Then restart with pruning enabled, for example:
+
+```bash
+DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=25 DSV4F_RAM_BUDGET_MIB=0 MODEL=models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf ./run-server.sh
+DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=25 DSV4F_RAM_BUDGET_MIB=184320 MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ./run-server.sh
+```
+
+Pruning reads `models/<model stem>.routing.json` at startup and disables `floor(experts_per_layer * N / 100)` experts per layer, across all quantization tiers. Counters in that file use tier-local IDs; these are mapped to global expert IDs before ranking. Unobserved experts have zero calls, and equal counts are resolved by pruning smaller global IDs first. The mask applies before top-k selection in both prefill and decode: pruned top-1/top-2/etc. candidates are skipped, the original top-k count is filled from active experts, and weights are normalized as configured by the model. Shared experts are unaffected.
+
+The history file is read-only during pruning, and changing it requires a server restart. Missing, malformed, mismatched or incomplete history, insufficient active experts, invalid percentages, and simultaneous routing/pruning cause startup failure. With `DSV4F_RAM_BUDGET_MIB=0` and `--load-mode none`, resident weight tensors (including pinned buffers) contain only active expert planes: excluded planes are neither allocated nor read. Global routing IDs and history IDs stay unchanged; format-local IDs are packed for execution, and empty quantization tiers are omitted. The original GGUF stays unchanged. Tiered O_DIRECT and mmap loading retain their file layout and apply the routing mask.
 
 ## Build and run
 

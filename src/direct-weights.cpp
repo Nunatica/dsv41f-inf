@@ -14,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <list>
 #include <map>
@@ -101,6 +102,16 @@ struct region {
         if(data==MAP_FAILED)throw std::runtime_error("cannot reserve direct I/O memory");
     }
     ~region(){if(data!=MAP_FAILED)munmap(data,bytes);}
+    void populate() {
+#if defined(MADV_POPULATE_WRITE)
+        if(madvise(data,bytes,MADV_POPULATE_WRITE)==0)return;
+        if(errno!=EINVAL && errno!=ENOSYS && errno!=EOPNOTSUPP)
+            throw std::runtime_error(std::string("cannot populate preload memory: ")+std::strerror(errno));
+#endif
+        // Materialize anonymous pages before the reader uses this batch.
+        auto * p=static_cast<volatile unsigned char *>(data);
+        for(size_t at=0;at<bytes;at+=alignment)p[at]=0;
+    }
 };
 void read_aligned(int fd,void * dst,size_t n,uint64_t off,size_t required) {
     // A short final sector is legal only when every requested payload byte arrived.
@@ -132,6 +143,7 @@ struct load {
     size_t users=1;
     bool done=false;
     bool transient=false;
+    bool populated=false;
     void * routing=nullptr;
     int expert=0;
     std::exception_ptr error;
@@ -166,6 +178,7 @@ struct cache {
     uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
     uint64_t next_source=0;
     uint64_t runtime_reserved=0;
+    uint64_t populated_reserved=0;
     ~cache()=default;
     uint64_t limit() const {
         const uint64_t budget=dsv4f_ram_budget();
@@ -174,7 +187,8 @@ struct cache {
         uint64_t ceiling=std::min(env_mib("DSV4F_RAM_CACHE_MIB",budget-reserve),budget-reserve);
         // Account for actual process RSS (KV/history, Engram, GPU host buffers, stacks, etc.).
         // mmap/munmap for cache entries returns evicted memory immediately to the OS.
-        const uint64_t rss=process_rss(),other=rss>used?rss-used:0;
+        const uint64_t rss=process_rss(),cache_rss=used+populated_reserved;
+        const uint64_t other=rss>cache_rss?rss-cache_rss:0;
         const uint64_t room=budget-reserve>other?budget-reserve-other:0;
         ceiling=std::min(ceiling,room>runtime_reserved?room-runtime_reserved:0);
         return ceiling;
@@ -394,6 +408,105 @@ void read_batch(const batch_read * reads,size_t count) {
         read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
 }
 
+struct preload_plane {uintptr_t pointer;size_t bytes;intptr_t count;};
+void preload_pipelined(const std::vector<preload_plane> & planes,dsv4f_preload_result & result,
+                      uint64_t batch_limit,uint64_t initial_bytes) {
+    auto & c=pool();
+    using batch=std::vector<batch_read>;
+    auto complete=[&](const std::shared_ptr<batch> & reads,std::exception_ptr error) {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        for(const auto & r:*reads) {
+            auto & request=*r.request;
+            if(request.populated){c.populated_reserved-=r.bytes;request.populated=false;}
+            c.reserved-=r.bytes;
+            if(error) {request.error=error;request.storage.reset();}
+            else {
+                const void * output=(char*)request.storage->data+r.delta;c.ages.push_back(r.key);
+                entry e;e.storage=std::move(request.storage);e.pointer=output;e.users=request.users;
+                e.bytes=r.required-r.delta;e.owner=request.owner;e.routing=request.routing;e.expert=request.expert;
+                e.age=std::prev(c.ages.end());c.entries.emplace(r.key,std::move(e));c.leases.emplace(output,r.key);
+                c.used+=r.bytes;++c.reads;c.bytes+=r.bytes;request.pointer=output;
+                c.release_locked(output); // Drop only the preload's own lease.
+            }
+            request.done=true;c.loads.erase(r.key);request.ready.notify_all();
+        }
+        c.changed.notify_all();
+    };
+    std::shared_ptr<batch> prepared;
+    std::future<size_t> reader;
+    const auto start=std::chrono::steady_clock::now();auto progress=start;
+    try {
+        size_t next=0,batches=0;
+        while(next<planes.size() && !result.budget_limited) {
+            prepared=std::make_shared<batch>();prepared->reserve(128);uint64_t allocated=0;
+            while(next<planes.size() && prepared->size()<128 && (prepared->empty() || allocated<batch_limit)) {
+                const auto plane=planes[next];
+                std::unique_lock<std::mutex> lock(c.mutex);
+                const auto key=plane.pointer;
+                auto it=c.entries.find(key);
+                if(it!=c.entries.end()) {
+                    ++c.hits;c.ages.splice(c.ages.end(),c.ages,it->second.age);++result.planes;++next;continue;
+                }
+                auto loading=c.loads.find(key);
+                if(loading!=c.loads.end()) {
+                    auto request=loading->second;++request->users;
+                    request->ready.wait(lock,[&]{return request->done;});
+                    if(request->error)std::rethrow_exception(request->error);
+                    ++c.hits;c.release_locked(request->pointer);++result.planes;++next;continue;
+                }
+                auto source_it=c.sources.upper_bound(key);
+                if(source_it==c.sources.begin())throw std::runtime_error("missing preload source");
+                auto * owner=std::prev(source_it)->second;
+                if(owner->closing)throw std::runtime_error("preload source is closing");
+                auto span_it=owner->spans.upper_bound(key);
+                if(span_it==owner->spans.begin())throw std::runtime_error("missing preload span");
+                const auto & span=std::prev(span_it)->second;
+                const size_t local=key-span.begin;
+                if(local>=span.bytes || plane.bytes!=span.expert || local%span.expert || plane.bytes>span.bytes-local)
+                    throw std::runtime_error("invalid preload expert plane");
+                const uint64_t offset=span.offset+local;
+                const size_t delta=offset%alignment,total=rounded(delta+plane.bytes);
+                const uint64_t cap=c.limit();
+                if(total>cap || c.used>cap-total || c.reserved>cap-total-c.used){result.budget_limited=true;break;}
+                if(!prepared->empty() && total>batch_limit-std::min(allocated,batch_limit))break;
+                auto request=std::make_shared<load>();request->owner=owner;request->routing=span.routing;
+                request->expert=int(local/span.expert);
+                c.loads.emplace(key,request);c.reserved+=total;
+                prepared->push_back({key,request,span.fd,offset-delta,delta,total,delta+plane.bytes});
+                lock.unlock();
+                // The preceding batch's reader is in flight while these pages
+                // are allocated/populated. Both batches count against the cap.
+                request->storage=std::make_unique<region>(total);request->storage->populate();
+                lock.lock();request->populated=true;c.populated_reserved+=total;
+                allocated+=total;++next;
+            }
+            if(reader.valid())result.planes+=reader.get();
+            if(!prepared->empty()) {
+                const auto work=prepared;
+                reader=std::async(std::launch::async,[&,work] {
+                    try {read_batch(work->data(),work->size());}
+                    catch(...){complete(work,std::current_exception());throw;}
+                    complete(work,nullptr);return work->size();
+                });
+                prepared.reset();++batches;
+            }
+            const auto now=std::chrono::steady_clock::now();
+            if(now-progress>=std::chrono::seconds(5)) {
+                std::lock_guard<std::mutex> lock(c.mutex);
+                std::fprintf(stderr,"[dsv4f-ram-preload] planes=%llu resident=%.2f GiB read=%.2f GiB pipeline_batches=%zu\n",
+                    (unsigned long long)result.planes,c.used/double(1ull<<30),(c.bytes-initial_bytes)/double(1ull<<30),batches);
+                progress=now;
+            }
+        }
+        if(reader.valid())result.planes+=reader.get();
+    } catch(...) {
+        const auto error=std::current_exception();
+        if(reader.valid())try{reader.get();}catch(...){}
+        if(prepared && !prepared->empty())complete(prepared,error);
+        throw;
+    }
+}
+
 void acquire_many_impl(const void * const * pointers,const size_t * sizes,const void ** output,size_t count,bool scan) {
     if(!count)return;
     // Preserve the lock-held diagnostic mode, and keep single-plane calls cheap.
@@ -607,6 +720,11 @@ void get_tensor(ggml_backend_buffer_t,const ggml_tensor * t,void * output,size_t
 }
 uint64_t dsv4f_ram_budget(){return env_mib("DSV4F_RAM_BUDGET_MIB",0);}
 bool dsv4f_direct_weights_enabled(){return dsv4f_ram_budget()!=0;}
+uint64_t dsv4f_load_pipeline_bytes() {
+    const uint64_t bytes=env_mib("DSV4F_LOAD_PIPELINE_MIB",1024*MiB);
+    if(bytes>65536*MiB)throw std::runtime_error("DSV4F_LOAD_PIPELINE_MIB must be an integer in 0..65536");
+    return bytes;
+}
 dsv4f_ram_reservation::dsv4f_ram_reservation(uint64_t requested) {
     const uint64_t budget=dsv4f_ram_budget();
     if(!budget || !requested){acquired=true;return;}
@@ -676,17 +794,20 @@ dsv4f_preload_result dsv4f_preload_experts() {
     std::sort(spans.begin(),spans.end(),[](const ordered_span & a,const ordered_span & b) {
         return std::tie(a.sequence,a.span.file_index,a.span.offset)<std::tie(b.sequence,b.span.file_index,b.span.offset);
     });
-    struct plane {uintptr_t pointer;size_t bytes;intptr_t count;};
-    std::vector<plane> planes;
+    std::vector<preload_plane> planes;
     for(const auto & item:spans) {
         const auto & span=item.span;
         if(!span.expert || span.bytes%span.expert)throw std::runtime_error("invalid expert geometry for startup preload");
         for(size_t at=0;at<span.bytes;at+=span.expert)
             planes.push_back({span.begin+at,span.expert,ggml_dsv4f_routing_count(span.routing,int(at/span.expert))});
     }
-    std::stable_sort(planes.begin(),planes.end(),[](const plane & a,const plane & b){return a.count>b.count;});
+    std::stable_sort(planes.begin(),planes.end(),[](const preload_plane & a,const preload_plane & b){return a.count>b.count;});
     const auto start=std::chrono::steady_clock::now();auto progress=start;
-    for(const auto & plane:planes) {
+    const uint64_t batch_limit=dsv4f_load_pipeline_bytes();
+    if(batch_limit && unlocked_io()) {
+        std::fprintf(stderr,"[dsv4f-ram-preload] pipelined allocation/read: batch=%.0f MiB, max_planes=128, depth=2\n",batch_limit/double(MiB));
+        preload_pipelined(planes,result,batch_limit,initial_bytes);
+    } else for(const auto & plane:planes) {
         const void * p=acquire_impl((const void*)plane.pointer,plane.bytes,true);
         if(!p){result.budget_limited=true;break;}
         release(p);++result.planes;

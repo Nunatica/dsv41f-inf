@@ -7,6 +7,9 @@
 // Zero/unset keeps the original resident loader. Positive budgets enable Linux direct I/O.
 uint64_t dsv4f_ram_budget();
 bool dsv4f_direct_weights_enabled();
+// Shared resident/preload allocation-read pipeline batch ceiling; 0 disables.
+// At least one tensor/plane is processed, even when larger than the ceiling.
+uint64_t dsv4f_load_pipeline_bytes();
 // Temporarily reserve headroom for a runtime allocation by reclaiming idle
 // expert planes. Keeps background loaders from refilling the reclaimed space
 // until the allocation is resident. False means the optional allocation must
@@ -37,7 +40,9 @@ struct dsv4f_preload_result {
 // cache space by descending routing count (source/shard/offset breaks ties),
 // without evicting existing entries. Disabled routing retains physical order.
 // Disabled unless DSV4F_RAM_PRELOAD=1; a zero RAM budget is also a no-op.
-// Payloads use the ordinary O_DIRECT cache path.
+// Payloads use the ordinary O_DIRECT cache path. A nonzero
+// DSV4F_LOAD_PIPELINE_MIB overlaps the next batch's population with reads;
+// both pending batches count against the cache ceiling.
 dsv4f_preload_result dsv4f_preload_experts();
 // Aligned O_DIRECT payload read, including unaligned tensor/row offsets and the last file sector.
 void dsv4f_direct_read(int fd, void * output, size_t bytes, uint64_t offset);

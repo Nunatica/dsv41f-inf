@@ -152,6 +152,76 @@ def inspect(path):
             'context_limit': meta.get('deepseek41.max_position_embeddings', meta.get('deepseek41.context_length')) if arch == 'deepseek41' else meta.get('deepseek4.context_length')}
 
 
+def resident_pruned_bytes(info, percentage, routing_dir='models'):
+    """Skipped-byte estimate for resident-loader RAM checks.
+
+    Read only headers, the small format maps and routing history. GGUF spans
+    can include alignment padding: use exact block sizes for supported models,
+    or conservatively subtract maximum padding for unknown tensor types.
+    The native loader remains the authority on validation.
+    """
+    if not percentage:
+        return 0
+    if not 1 <= percentage <= 50:
+        raise ValueError('DSV4F_ADAPTIVE_PRUNING must be in 0..50')
+    stem = re.sub(r'-[0-9]{5}-of-([0-9]{5})$', r'-00001-of-\1', Path(info['model']).stem)
+    table = Path(routing_dir) / (stem + '.routing.json')
+    if table.stat().st_size > 64*1024*1024:
+        raise ValueError('Routing history exceeds 64 MiB')
+    data = json.loads(table.read_text())
+    if data['version'] != 1 or data['model'] != stem:
+        raise ValueError('Pruning history schema/model mismatch')
+    sources, layers, alignments = {}, {}, {}
+    geometry = {0: (1, 4), 1: (1, 2), 8: (32, 34), 11: (256, 110),
+                39: (32, 17), 42: (64, 18), 143: (128, 28)}
+    for path in info['shards']:
+        meta, tensors, start = header(path)
+        alignments[path] = meta.get('general.alignment', 32)
+        for j, (name, shape, typ, offset) in enumerate(tensors):
+            end = tensors[j+1][3] if j+1 < len(tensors) else Path(path).stat().st_size-start
+            sources[name] = (path, start+offset, end-offset, shape, typ)
+            match = re.fullmatch(r'blk\.(\d+)\.ffn_gate_exps(?:\.[^.]+)?\.weight', name)
+            if match:
+                layers.setdefault(int(match[1]), []).append(name)
+    skipped = 0
+    for layer, gates in layers.items():
+        map_name = f'blk.{layer}.ffn_exps_gu_type'
+        if map_name in sources:
+            path, offset, _, shape, _ = sources[map_name]
+            with open(path, 'rb') as f:
+                f.seek(offset)
+                formats = struct.unpack('<' + 'i'*shape[0], f.read(4*shape[0]))
+            mappings = {gate: [i for i, typ in enumerate(formats) if typ == sources[gate][4]] for gate in gates}
+            count = len(formats)
+        else:
+            if len(gates) != 1:
+                raise ValueError('Missing expert format map')
+            count = sources[gates[0]][3][2]
+            mappings = {gates[0]: list(range(count))}
+        counters = [0]*count
+        for gate, global_ids in mappings.items():
+            if len(global_ids) != sources[gate][3][2]:
+                raise ValueError('Expert format map/shape mismatch')
+            row = data['experts'].get(gate.replace('ffn_gate_exps', 'ffn_exps'), {})
+            for local, global_id in enumerate(global_ids):
+                value = row.get(str(local), 0)
+                if type(value) is not int or value < 0:
+                    raise ValueError('Invalid routing counter')
+                counters[global_id] = value
+        removed = set(sorted(range(count), key=lambda i: (counters[i], i))[:count*percentage//100])
+        for gate, global_ids in mappings.items():
+            excluded = sum(i in removed for i in global_ids)
+            for role in ('gate', 'up', 'down'):
+                path, _, span, shape, typ = sources[gate.replace('ffn_gate_exps', f'ffn_{role}_exps')]
+                if typ in geometry:
+                    block, size = geometry[typ]
+                    plane = shape[0]//block*size*shape[1]
+                else:
+                    plane = max(0, span-alignments[path]+1)//shape[2]
+                skipped += plane*excluded
+    return skipped
+
+
 def inspect_mtp(path, manifest=None):
     """Inspect a DSpark raw binary + JSON index without reading weight data."""
     manifest = Path(manifest) if manifest else Path(path).with_suffix('.json')

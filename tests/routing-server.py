@@ -19,7 +19,7 @@ environment.update(DSV4F_MTP='0', DSV4F_CPU_THREADS='4', DSV4F_RAM_BUDGET_MIB='0
 
 
 @contextlib.contextmanager
-def running(directory, enabled):
+def running(directory, enabled, pruning=0):
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
@@ -31,7 +31,8 @@ def running(directory, enabled):
             '--threads', '4', '--threads-batch', '4', '--batch-size', '64', '--ubatch-size', '32',
             '--flash-attn', 'on', '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0',
             '--host', '127.0.0.1', '--port', str(port),
-        ], cwd=directory, env={**environment, 'DSV4F_ADAPTIVE_ROUTING': str(enabled)},
+        ], cwd=directory, env={**environment, 'DSV4F_ADAPTIVE_ROUTING': str(enabled),
+                              'DSV4F_ADAPTIVE_PRUNING': str(pruning)},
             stdout=log, stderr=log)
         try:
             for _ in range(200):
@@ -93,4 +94,16 @@ with tempfile.TemporaryDirectory(prefix='dsv4f-routing-server-') as temporary:
         disabled = json.loads(complete(url))
         assert disabled['content'] == first['content'], 'cache history must preserve generated output'
         assert path.read_bytes() == contents, 'OFF must leave routing history untouched'
-print('Routing response persistence, streaming, restart, warmup exclusion and OFF PASS')
+    with running(directory, 0, 25) as url:
+        pruned = json.loads(complete(url))
+        assert pruned['tokens_predicted'] == 4
+        assert path.read_bytes() == contents, 'pruning must leave history untouched'
+    # These errors must stop the binary before any model loading or serving.
+    for routing, pruning, message in [(1, '25', 'cannot both be enabled'),
+                                      (0, '51', 'integer in 0..50'),
+                                      (0, '-1', 'integer in 0..50')]:
+        result = subprocess.run([str(server), '--model', str(model)], cwd=directory,
+            env={**environment, 'DSV4F_ADAPTIVE_ROUTING': str(routing),
+                 'DSV4F_ADAPTIVE_PRUNING': pruning}, capture_output=True, timeout=15)
+        assert result.returncode != 0 and message.encode() in result.stderr, result.stderr
+print('Routing persistence, streaming, restart, OFF, pruning and startup rejection PASS')

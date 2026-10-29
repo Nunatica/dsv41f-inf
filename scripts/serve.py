@@ -12,7 +12,7 @@ import threading
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
-from model_info import inspect, inspect_mtp, swap_protected
+from model_info import inspect, inspect_mtp, swap_protected, resident_pruned_bytes
 from memory_budget import budget_bytes, memory_state, effective_budget
 
 
@@ -45,7 +45,11 @@ def main():
     child_env = os.environ.copy()
     if budget:
         child_env['DSV4F_RAM_BUDGET_MIB'] = str(budget // (1 << 20))
-    resident_bytes = info['model_bytes'] + info.get('mtp', {}).get('model_bytes', 0)
+    pruning = int(os.environ.get('DSV4F_ADAPTIVE_PRUNING', '0'))
+    skipped_bytes = resident_pruned_bytes(info, pruning) if not budget else 0
+    info['resident_expert_bytes'] = info['expert_bytes'] - skipped_bytes
+    info['pruned_expert_bytes'] = skipped_bytes
+    resident_bytes = info['model_bytes'] - skipped_bytes + info.get('mtp', {}).get('model_bytes', 0)
     if not budget and mem['MemAvailable'] < resident_bytes + 2*(1<<30):
         raise RuntimeError(f"Need at least {(resident_bytes/(1<<30)+2):.1f} GiB available RAM for resident loading")
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -92,15 +96,15 @@ def main():
                 except (URLError, TimeoutError, ValueError):
                     ready = False
                 if ready:
-                    if not budget and status.get('VmRSS', 0) < info['expert_bytes']*0.97:
-                        raise RuntimeError(f"Resident RSS {status.get('VmRSS',0)/(1<<30):.2f} GiB is smaller than routed weights {info['expert_bytes']/(1<<30):.2f} GiB")
+                    if not budget and status.get('VmRSS', 0) < info['resident_expert_bytes']*0.97:
+                        raise RuntimeError(f"Resident RSS {status.get('VmRSS',0)/(1<<30):.2f} GiB is smaller than active routed weights {info['resident_expert_bytes']/(1<<30):.2f} GiB")
                     verified = True
                     state = {**info, 'pid': child.pid, 'supervisor_pid': os.getpid(), 'url': url,
                              'log': str(logfile), 'command': cmd, 'memory': status,
                              'memory_budget_bytes': budget, 'requested_memory_budget_bytes': requested_budget, 'memory_tiers': 'vram/ram/direct-ssd' if budget else 'resident',
                              'cgroup': memory_state(),
                              'engine_options': {k: child_env[k] for k in (
-                                 'DSV4F_RAM_BUDGET_MIB', 'DSV4F_RAM_RESERVE_MIB', 'DSV4F_RAM_CACHE_MIB', 'DSV4F_RAM_UNLOCK_IO', 'DSV4F_RAM_PRELOAD',
+                                 'DSV4F_RAM_BUDGET_MIB', 'DSV4F_RAM_RESERVE_MIB', 'DSV4F_RAM_CACHE_MIB', 'DSV4F_RAM_UNLOCK_IO', 'DSV4F_RAM_PRELOAD', 'DSV4F_LOAD_PIPELINE_MIB', 'DSV4F_ADAPTIVE_ROUTING', 'DSV4F_ADAPTIVE_PRUNING',
                                  'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_VRAM_GUARD_MIB', 'DSV4F_EXPERT_CACHE_MIB',
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',

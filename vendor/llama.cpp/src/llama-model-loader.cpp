@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <future>
@@ -1422,6 +1423,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+void llama_model_loader::compact_experts(ggml_tensor * tensor, const std::vector<int32_t> & keep) {
+    if (use_mmap || lazy.has(tensor) || dsv4f_direct_weights_enabled() || tensor->data ||
+        tensor->ne[3] != 1 || !ggml_is_contiguous(tensor) || expert_slices.count(tensor->name)) {
+        throw std::runtime_error("expert compaction requires unallocated resident tensors");
+    }
+    const auto & source = require_weight(tensor->name);
+    if (ggml_nbytes(source.tensor) != ggml_nbytes(tensor)) {
+        throw std::runtime_error("expert compaction source shape mismatch");
+    }
+    int32_t previous = -1;
+    for (int32_t id : keep) {
+        if (id <= previous || id >= tensor->ne[2]) throw std::runtime_error("invalid retained expert plane");
+        previous = id;
+    }
+    expert_slices.emplace(tensor->name, keep);
+    tensor->ne[2] = keep.size();
+    tensor->nb[3] = tensor->nb[2] * keep.size();
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1475,7 +1495,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        const auto slices = expert_slices.find(it.first);
+        size_data += slices == expert_slices.end() ? ggml_nbytes(it.second.tensor) :
+            slices->second.size() * it.second.tensor->nb[2];
     }
 }
 
@@ -1654,6 +1676,7 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    size_t compact_read_bytes = 0, compact_skipped_bytes = 0;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1671,7 +1694,32 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
-        if (from_mapping) {
+        const auto slices = expert_slices.find(cur->name);
+        if (slices != expert_slices.end()) {
+            // Never read a discarded plane, even through a full-tensor staging
+            // buffer. The packed tensor has already reduced buffer allocation.
+            const auto & keep = slices->second;
+            const auto & file = files.at(weight->idx);
+            const size_t plane = weight->tensor->nb[2];
+            compact_skipped_bytes += ggml_nbytes(weight->tensor) - n_size;
+            const bool host = cur->buffer && ggml_backend_buffer_is_host(cur->buffer);
+            std::vector<uint8_t> staging(host || keep.empty() ? 0 : plane);
+            for (size_t first = 0; first < keep.size();) {
+                size_t last = first + 1;
+                if (host) {
+                    while (last < keep.size() && keep[last] == keep[last-1] + 1) ++last;
+                }
+                const size_t bytes = (last-first) * plane;
+                void * destination = host ? (uint8_t *) cur->data + first*plane : staging.data();
+                file->seek(weight->offs + size_t(keep[first])*plane, SEEK_SET);
+                file->read_raw(destination, bytes);
+                compact_read_bytes += bytes;
+                if (check_tensors && !ggml_validate_row_data(cur->type, destination, bytes))
+                    throw std::runtime_error(format("tensor '%s' has invalid retained expert data", cur->name));
+                if (!host) ggml_backend_tensor_set(cur, destination, first*plane, bytes);
+                first = last;
+            }
+        } else if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
@@ -1781,6 +1829,9 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
+    if (compact_read_bytes || compact_skipped_bytes) {
+        LLAMA_LOG_INFO("[dsv4f-pruning] resident expert load: read_bytes=%zu skipped_bytes=%zu\n", compact_read_bytes, compact_skipped_bytes);
+    }
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
@@ -1826,6 +1877,118 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+void llama_model_loader::read_host_tensor(ggml_tensor * tensor) {
+    const auto & weight=require_weight(tensor->name);
+    const auto & file=files.at(weight.idx);
+    const auto slices=expert_slices.find(tensor->name);
+    if(slices==expert_slices.end()) {
+        file->seek(weight.offs,SEEK_SET);
+        file->read_raw(tensor->data,ggml_nbytes(tensor));
+        if(check_tensors && !ggml_validate_row_data(tensor->type,tensor->data,ggml_nbytes(tensor)))
+            throw std::runtime_error(format("tensor '%s' has invalid data",tensor->name));
+        return;
+    }
+    const auto & keep=slices->second;
+    const size_t plane=weight.tensor->nb[2];
+    for(size_t first=0;first<keep.size();) {
+        size_t last=first+1;
+        while(last<keep.size() && keep[last]==keep[last-1]+1)++last;
+        const size_t bytes=(last-first)*plane;
+        auto * destination=(char *)tensor->data+first*plane;
+        file->seek(weight.offs+size_t(keep[first])*plane,SEEK_SET);
+        file->read_raw(destination,bytes);
+        if(check_tensors && !ggml_validate_row_data(tensor->type,destination,bytes))
+            throw std::runtime_error(format("tensor '%s' has invalid retained expert data",tensor->name));
+        first=last;
+    }
+}
+
+bool llama_model_loader::load_host_data_pipelined(
+        ggml_context * ctx,
+        ggml_backend_buffer_type_t buft,
+        std::vector<ggml_backend_buffer_ptr> & buffers,
+        size_t batch_size,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data) {
+    GGML_ASSERT(!use_mmap && !no_alloc && !files.empty() && batch_size > 0 && size_data > 0);
+    GGML_ASSERT(ggml_backend_buft_is_host(buft));
+
+    std::vector<ggml_tensor *> tensors;
+    for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(!lazy.has(t) && !t->view_src && !t->data);
+        if (ggml_nbytes(t)) tensors.push_back(t);
+    }
+    // Sequential reads within each shard also avoid seeking between layers.
+    std::stable_sort(tensors.begin(), tensors.end(), [this](auto * a, auto * b) {
+        const auto * wa = get_weight(a->name);
+        const auto * wb = get_weight(b->name);
+        GGML_ASSERT(wa && wb);
+        return std::make_pair(wa->idx, wa->offs) < std::make_pair(wb->idx, wb->offs);
+    });
+
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    // One reader owns file positions, size_done, validation and callbacks. Its
+    // future is joined before returning/throwing, so no buffers can be freed
+    // while I/O is in flight. Only the following allocation overlaps the read.
+    std::future<bool> reader;
+    for (size_t first = 0; first < tensors.size();) {
+        size_t last = first;
+        size_t bytes = 0;
+        do {
+            const size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, tensors[last]), alignment);
+            if (last > first && (bytes >= batch_size || size > batch_size - bytes)) {
+                break;
+            }
+            bytes += size;
+            ++last;
+        } while (last < tensors.size());
+
+        // Cancellation may have arrived while the previous read ran.
+        if (reader.valid() && reader.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            if (!reader.get()) {
+                return false;
+            }
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer_n(
+                buft, tensors.data() + first, int(last - first)));
+        if (!buffer) {
+            throw std::runtime_error(format("unable to allocate %s weight batch", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        buffers.emplace_back(std::move(buffer));
+
+        if (reader.valid() && !reader.get()) {
+            return false;
+        }
+        reader = std::async(std::launch::async, [&, first, last] {
+            for (size_t i = first; i < last; ++i) {
+                if (progress_callback && !progress_callback(float(size_done) / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+                auto * t = tensors[i];
+                const size_t size = ggml_nbytes(t);
+                read_host_tensor(t);
+                size_done += size;
+            }
+            return true;
+        });
+        first = last;
+    }
+    if (reader.valid() && !reader.get()) {
+        return false;
+    }
+    size_t compact_read=0,compact_skipped=0;
+    for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+        if (expert_slices.count(t->name)) {
+            compact_read+=ggml_nbytes(t);
+            compact_skipped+=ggml_nbytes(require_weight(t->name).tensor)-ggml_nbytes(t);
+        }
+    }
+    if (compact_read || compact_skipped)
+        LLAMA_LOG_INFO("[dsv4f-pruning] resident expert load: read_bytes=%zu skipped_bytes=%zu\n",compact_read,compact_skipped);
+    return size_done < size_data || !progress_callback || progress_callback(1.0f, progress_callback_user_data);
 }
 
 std::string llama_model_loader::ftype_name() const {

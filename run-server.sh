@@ -9,6 +9,17 @@ export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
 case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
 export DSV4F_ADAPTIVE_ROUTING=${DSV4F_ADAPTIVE_ROUTING:-0}
 case "$DSV4F_ADAPTIVE_ROUTING" in 0|1) ;; *) echo 'DSV4F_ADAPTIVE_ROUTING must be 0 or 1.' >&2; exit 1;; esac
+export DSV4F_ADAPTIVE_PRUNING=${DSV4F_ADAPTIVE_PRUNING:-0}
+if [[ ! $DSV4F_ADAPTIVE_PRUNING =~ ^(0|[1-9]|[1-4][0-9]|50)$ ]]; then
+    echo 'DSV4F_ADAPTIVE_PRUNING must be an integer in 0..50.' >&2; exit 1
+fi
+if [[ $DSV4F_ADAPTIVE_ROUTING == 1 && $DSV4F_ADAPTIVE_PRUNING != 0 ]]; then
+    echo 'DSV4F_ADAPTIVE_ROUTING and DSV4F_ADAPTIVE_PRUNING cannot both be enabled; set DSV4F_ADAPTIVE_ROUTING=0.' >&2; exit 1
+fi
+export DSV4F_LOAD_PIPELINE_MIB=${DSV4F_LOAD_PIPELINE_MIB:-1024}
+if [[ ! $DSV4F_LOAD_PIPELINE_MIB =~ ^[0-9]{1,5}$ ]] || ((10#$DSV4F_LOAD_PIPELINE_MIB > 65536)); then
+    echo 'DSV4F_LOAD_PIPELINE_MIB must be an integer in 0..65536 (0 disables pipelining).' >&2; exit 1
+fi
 export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-0}
 case "$DSV4F_RAM_PRELOAD" in 0|1) ;; *) echo 'DSV4F_RAM_PRELOAD must be 0 or 1.' >&2; exit 1;; esac
 for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
@@ -269,6 +280,8 @@ if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
     echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
     echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
+    echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING%"
+    echo "Allocation/read pipeline: $DSV4F_LOAD_PIPELINE_MIB MiB (0: disabled)"
     echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'

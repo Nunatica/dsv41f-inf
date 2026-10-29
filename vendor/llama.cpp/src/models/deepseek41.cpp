@@ -7,6 +7,8 @@
 #include "engram.h"
 #include "ggml-dsv4f-timeline.h"
 #include "moe.h"
+#include "routing-table.h"
+#include "direct-weights.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <cmath>
@@ -74,6 +76,9 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     LLAMA_LOG_INFO("[dsv4f-v41] native llama.cpp graph: %u layers, %u experts, shared KV, Engram\n",hparams.n_layer(),hparams.n_expert);
 }
 ggml_tensor * llama_model_deepseek41::W(int l,const std::string & role) const {return weights.at(l<0?role:"blk."+std::to_string(l)+"."+role);}
+ggml_tensor * llama_model_deepseek41::routing_bias(int l) const {
+    return pruning_bias.empty()?W(l,"exp_probs_b.bias"):pruning_bias.at(l);
+}
 void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     const LLM_TN tn(arch);
     for(auto & entry:ml.weights_map) {
@@ -104,6 +109,50 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         std::set<int> formats(map.begin(),map.end());
         for(int format:formats){if(format!=GGML_TYPE_Q3_K&&format!=GGML_TYPE_Q2_0&&format!=GGML_TYPE_PTQ1_0)throw std::runtime_error("unsupported expert format");std::string suffix=ggml_type_name((ggml_type)format);for(char & ch:suffix)ch=std::tolower((unsigned char)ch);experts e{format,W(l,"ffn_gate_exps."+suffix+".weight"),W(l,"ffn_up_exps."+suffix+".weight"),W(l,"ffn_down_exps."+suffix+".weight"),{}};int index=0;for(int v:map)e.local.push_back(v==format?index++:-1);tiers[l].push_back(std::move(e));}
     }
+    // Model-owned selection constants apply before top-k in both fused decode
+    // and generic prefill. Original GGUF biases and probability scores stay intact.
+    size_t original_expert_bytes=0,active_expert_bytes=0;
+    const bool compact_resident=!ml.use_mmap && !dsv4f_direct_weights_enabled();
+    for(uint32_t l=0;l<hparams.n_layer();++l) {
+        std::vector<std::pair<std::string,std::vector<int32_t>>> groups;
+        for(const auto & e:tiers[l])groups.push_back({e.gate->name,e.local});
+        auto mask=dsv4f_pruning_mask(l,hparams.n_expert,hparams.n_expert_used(l),groups);
+        if(mask.empty())break;
+        if(compact_resident) {
+            for(auto & e:tiers[l]) {
+                std::vector<int32_t> keep;
+                for(size_t id=0;id<e.local.size();++id)if(e.local[id]>=0) {
+                    if(mask[id]<0)e.local[id]=-1;
+                    else {keep.push_back(e.local[id]);e.local[id]=int32_t(keep.size()-1);}
+                }
+                for(auto * tensor:{e.gate,e.up,e.down}) {
+                    original_expert_bytes+=ggml_nbytes(tensor);
+                    ml.compact_experts(tensor,keep);
+                    active_expert_bytes+=ggml_nbytes(tensor);
+                }
+            }
+            auto & layer=tiers[l];
+            layer.erase(std::remove_if(layer.begin(),layer.end(),[](const experts & e){return e.gate->ne[2]==0;}),layer.end());
+        }
+        const auto * w=ml.get_weight(W(l,"exp_probs_b.bias")->name);
+        if(!w || w->tensor->type!=GGML_TYPE_F32 || ggml_nelements(w->tensor)!=hparams.n_expert)
+            throw std::runtime_error("adaptive pruning requires F32 routing bias");
+        std::vector<float> bias(hparams.n_expert);
+        ml.files.at(w->idx)->seek(w->offs,SEEK_SET);ml.files.at(w->idx)->read_raw(bias.data(),bias.size()*sizeof(float));
+        for(size_t i=0;i<bias.size();++i)if(mask[i]!=0)bias[i]=mask[i];
+        ggml_context_ptr ctx{ggml_init({ggml_tensor_overhead(),nullptr,true})};
+        if(!ctx)throw std::runtime_error("cannot create adaptive pruning constants");
+        auto * tensor=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,hparams.n_expert);
+        ggml_format_name(tensor,"v41_pruning_bias_%u",l);
+        const auto buft=ggml_backend_dev_buffer_type(dev_layer(l));
+        ggml_backend_buffer_ptr buffer{hparams.no_alloc?ggml_backend_buft_alloc_buffer(buft,0):ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),buft)};
+        if(!buffer)throw std::runtime_error("cannot allocate adaptive pruning constants");
+        if(hparams.no_alloc)tensor->buffer=buffer.get();
+        else ggml_backend_tensor_set(tensor,bias.data(),0,ggml_nbytes(tensor));
+        pruning_bias.push_back(tensor);add_constant_buffer(std::move(ctx),std::move(buffer));
+    }
+    if(original_expert_bytes)std::fprintf(stderr,"[dsv4f-pruning] resident weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",
+        original_expert_bytes,active_expert_bytes,original_expert_bytes-active_expert_bytes);
     const char * static_maps=std::getenv("DSV4F_STATIC_EXPERT_MAPS");
     if(static_maps && std::strcmp(static_maps,"0") && std::strcmp(static_maps,"1"))throw std::runtime_error("DSV4F_STATIC_EXPERT_MAPS must be 0 or 1");
     if(static_maps && !std::strcmp(static_maps,"1")) {
@@ -429,7 +478,7 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
             ggml_tensor * predicted=nullptr;
             const char * score=std::getenv("DSV4F_EXPERT_LOOKAHEAD_SCORE");
             if(score && !std::strcmp(score,"native")) {
-                ggml_tensor * unused;dsv4f_router(ctx0,logits,m.W(l+1,"exp_probs_b.bias"),depth,false,1.f,&predicted,&unused);
+                ggml_tensor * unused;dsv4f_router(ctx0,logits,m.routing_bias(l+1),depth,false,1.f,&predicted,&unused);
             } else predicted=ggml_cont(ctx0,ggml_top_k(ctx0,logits,depth));
             for(auto & e:m.tiers[l+1]) {
                 auto * mapping=e.mapping;
@@ -443,9 +492,9 @@ llama_model_deepseek41::graph::graph(const llama_model_deepseek41 & m,const llm_
         if(N<=4 && hparams.n_expert<=512 && hparams.n_expert_used(l)<=32 && kv_dev &&
            !std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(kv_dev)),"ROCm") &&
            (!router_fused || std::strcmp(router_fused,"0"))) {
-            dsv4f_router(ctx0,router,m.W(l,"exp_probs_b.bias"),hparams.n_expert_used(l),m.norm_topk,m.scaling,&ids,&probs);
+            dsv4f_router(ctx0,router,m.routing_bias(l),hparams.n_expert_used(l),m.norm_topk,m.scaling,&ids,&probs);
         } else {
-            auto * scores=ggml_sqrt(ctx0,ggml_softplus(ctx0,router));ids=ggml_cont(ctx0,ggml_top_k(ctx0,ggml_add(ctx0,scores,m.W(l,"exp_probs_b.bias")),hparams.n_expert_used(l)));
+            auto * scores=ggml_sqrt(ctx0,ggml_softplus(ctx0,router));ids=ggml_cont(ctx0,ggml_top_k(ctx0,ggml_add(ctx0,scores,m.routing_bias(l)),hparams.n_expert_used(l)));
             probs=ggml_reshape_3d(ctx0,ggml_get_rows(ctx0,ggml_reshape_3d(ctx0,scores,1,hparams.n_expert,N),ids),1,hparams.n_expert_used(l),N);if(m.norm_topk){auto * pw=ggml_reshape_2d(ctx0,probs,hparams.n_expert_used(l),N);probs=ggml_reshape_3d(ctx0,ggml_div(ctx0,pw,ggml_scale_bias(ctx0,ggml_sum_rows(ctx0,pw),1.f,1e-20f)),1,hparams.n_expert_used(l),N);}probs=ggml_scale(ctx0,probs,m.scaling);
         }
         auto * gt=ggml_mul_mat(ctx0,m.W(l,"ffn_gate_shexp.weight"),fn);

@@ -124,6 +124,8 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    // Packed resident expert tensors retain only these original file-plane IDs.
+    std::map<std::string, std::vector<int32_t>> expert_slices;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -241,6 +243,7 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+    void compact_experts(ggml_tensor * tensor, const std::vector<int32_t> & keep);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
@@ -260,6 +263,13 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // One file reader overlaps a bounded host allocation with the prior read.
+    // Futures are drained before returning, including cancellation/errors.
+    bool load_host_data_pipelined(ggml_context * ctx, ggml_backend_buffer_type_t buft,
+            std::vector<ggml_backend_buffer_ptr> & buffers, size_t batch_size,
+            llama_progress_callback progress_callback, void * progress_callback_user_data);
+    void read_host_tensor(ggml_tensor * tensor);
 
     std::string ftype_name() const;
 
