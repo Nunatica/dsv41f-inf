@@ -3,8 +3,8 @@
 To use this feature, first collect representative decode history with `DSV4F_ADAPTIVE_ROUTING=1 DSV4F_ADAPTIVE_PRUNING=0`. Then restart with pruning enabled, for example:
 
 ```bash
-DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=30 DSV4F_RAM_BUDGET_MIB=0 MODEL=models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf ./run-server.sh
-DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=25 DSV4F_RAM_BUDGET_MIB=184320 MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ./run-server.sh
+DSV4F_ADAPTIVE_PRUNING=30 DSV4F_RAM_BUDGET_MIB=0 MODEL=models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf ./run-server.sh
+DSV4F_ADAPTIVE_PRUNING=25 DSV4F_RAM_BUDGET_MIB=184320 MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ./run-server.sh
 ```
 
 `DSV4F_ADAPTIVE_PRUNING=N` accepts integers from `0` to `50`; `0` disables pruning. **N is a target percentage of the main model's total routed expert weight bytes to remove**, rather than a fixed percentage of experts in every layer. For example, `25` targets a 25% reduction in the combined gate/up/down weights across all main-model layers and quantization tiers. Shared experts, attention, Engram, KV caches, compute buffers and MTP drafter weights are excluded from this target. This replaces the earlier uniform per-layer expert-count interpretation; the same setting can now select a different set of experts.
