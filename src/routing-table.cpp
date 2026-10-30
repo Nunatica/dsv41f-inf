@@ -81,7 +81,7 @@ void dsv4f_routing_init(const std::string & model_path) {
             throw std::runtime_error("DSV4F_ADAPTIVE_PRUNING must be an integer in 0..50");
         t.pruning=std::stoi(value);
     }
-    const bool routing=!env || !std::strcmp(env,"1");
+    const bool routing=env && !std::strcmp(env,"1");
     if(routing && t.pruning)throw std::runtime_error("DSV4F_ADAPTIVE_ROUTING and DSV4F_ADAPTIVE_PRUNING cannot both be enabled; set DSV4F_ADAPTIVE_ROUTING=0");
     if(!routing && !t.pruning)return;
     t.model=std::filesystem::path(model_path).stem().string();

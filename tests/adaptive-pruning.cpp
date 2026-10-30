@@ -100,7 +100,7 @@ int main(int argc,char ** argv) {
     setenv("DSV4F_ADAPTIVE_ROUTING","0",1);unsetenv("DSV4F_ADAPTIVE_PRUNING");init();require(mask().empty(),"default disabled");
     for(const char * v:{"-1","51","1.5","bad","","01","999999999999999999999"}){setenv("DSV4F_ADAPTIVE_PRUNING",v,1);rejects(init);}
     setenv("DSV4F_ADAPTIVE_PRUNING","25",1);setenv("DSV4F_ADAPTIVE_ROUTING","1",1);rejects(init);
-    unsetenv("DSV4F_ADAPTIVE_ROUTING");rejects(init);setenv("DSV4F_ADAPTIVE_ROUTING","0",1);rejects(init);
+    unsetenv("DSV4F_ADAPTIVE_ROUTING");rejects(init);
     {std::ofstream f(path);f<<"{bad";}rejects(init);
     json data={{"version",1},{"model","Pruning"},{"experts",{
         {"blk.0.ffn_exps.q3_k.weight",{{"0",1},{"1",100},{"2",2},{"3",200}}},

@@ -76,7 +76,7 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
 | `DSV4F_RAM_BUDGET_MIB` | `184320` | `0`: original resident loader (Engram excluded); positive: total process-tree RAM ceiling. |
-| `DSV4F_ADAPTIVE_ROUTING` | `0` (launcher) | `1`: persist decode expert counters and use history for RAM/VRAM preload and eviction. Mutually exclusive with pruning. The server binary defaults to `1` when unset. |
+| `DSV4F_ADAPTIVE_ROUTING` | `0` | `0`: off; `1`: persist decode expert counters and use history for RAM/VRAM preload and eviction. Mutually exclusive with pruning. |
 | `DSV4F_ADAPTIVE_PRUNING` | `0` | `0`: off; `1..50`: target percentage of routed expert weight bytes to exclude, with per-layer selections based on historical usage per byte. Mutually exclusive with routing. |
 | `DSV4F_RAM_PRELOAD` | `0` | `1`: preload experts at startup when the RAM budget is positive; `0`: disabled. |
 | `DSV4F_LOAD_PIPELINE_MIB` | `1024` | Overlap host allocation with disk reads for resident loading and RAM preload. `0`: sequential loading; range `0..65536` MiB. |

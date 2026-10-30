@@ -33,6 +33,7 @@ int main() {
     char directory[]="/tmp/dsv4f-routing-XXXXXX";
     require(mkdtemp(directory),"temporary directory");std::filesystem::current_path(directory);
     unsetenv("DSV4F_ADAPTIVE_ROUTING");
+    unsetenv("DSV4F_ADAPTIVE_PRUNING");
     const std::string model="Example-00001-of-00009.gguf",path="models/Example-00001-of-00009.routing.json";
     const std::string group="blk.2.ffn_exps.q3_k.weight";
     auto * ctx=ggml_init({1<<20,nullptr,true});require(ctx,"context");
@@ -41,7 +42,11 @@ int main() {
     ggml_set_name(gate,"blk.2.ffn_gate_exps.q3_k.weight");
     ggml_set_name(up,"blk.2.ffn_up_exps.q3_k.weight");
     ggml_set_name(down,"blk.2.ffn_down_exps.q3_k.weight");
-    dsv4f_routing_init(model);require(ggml_dsv4f_routing.bind,"enabled by default");
+    dsv4f_routing_init(model);dsv4f_routing_start();
+    require(!ggml_dsv4f_routing.bind && !ggml_dsv4f_routing.observe && !ggml_dsv4f_routing.count,"disabled by default");
+    require(dsv4f_routing_save() && !std::filesystem::exists(path),"default creates no routing file");
+    setenv("DSV4F_ADAPTIVE_ROUTING","1",1);
+    dsv4f_routing_init(model);require(ggml_dsv4f_routing.bind,"explicitly enabled");
     auto * row=ggml_dsv4f_routing_bind(gate);
     require(row && row==ggml_dsv4f_routing_bind(up) && row==ggml_dsv4f_routing_bind(down),"projection counters shared");
     const int32_t ids[]={63,0,1,511};const float weights[]={1,0,1,1};
