@@ -112,7 +112,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     // Model-owned selection constants apply before top-k in both fused decode
     // and generic prefill. Original GGUF biases and probability scores stay intact.
     size_t original_expert_bytes=0,active_expert_bytes=0;
-    const bool compact_resident=!ml.use_mmap && !dsv4f_direct_weights_enabled();
+    const bool compact_experts=!ml.use_mmap;
     std::vector<dsv4f_pruning_layer> pruning_layers;
     for(uint32_t l=0;l<hparams.n_layer();++l) {
         dsv4f_pruning_layer layer{int(l),int(hparams.n_expert),int(hparams.n_expert_used(l)),{}};
@@ -122,7 +122,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     const auto pruning_masks=dsv4f_pruning_masks(pruning_layers);
     for(uint32_t l=0;l<pruning_masks.size();++l) {
         const auto & mask=pruning_masks[l];
-        if(compact_resident) {
+        if(compact_experts) {
             for(auto & e:tiers[l]) {
                 std::vector<int32_t> keep;
                 for(size_t id=0;id<e.local.size();++id)if(e.local[id]>=0) {
@@ -155,7 +155,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         else ggml_backend_tensor_set(tensor,bias.data(),0,ggml_nbytes(tensor));
         pruning_bias.push_back(tensor);add_constant_buffer(std::move(ctx),std::move(buffer));
     }
-    if(original_expert_bytes)std::fprintf(stderr,"[dsv4f-pruning] resident weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",
+    if(original_expert_bytes)std::fprintf(stderr,"[dsv4f-pruning] %s weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",
+        dsv4f_direct_weights_enabled()?"tiered":"resident",
         original_expert_bytes,active_expert_bytes,original_expert_bytes-active_expert_bytes);
     const char * static_maps=std::getenv("DSV4F_STATIC_EXPERT_MAPS");
     if(static_maps && std::strcmp(static_maps,"0") && std::strcmp(static_maps,"1"))throw std::runtime_error("DSV4F_STATIC_EXPERT_MAPS must be 0 or 1");

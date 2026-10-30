@@ -86,7 +86,9 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stays on SSD
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```
-Resident loading (`DSV4F_RAM_BUDGET_MIB=0`) allocates host weights in batches and reads the previous batch while allocating the next. GPU uploads finish before this host pipeline starts. Each tensor remains contiguous; a tensor larger than the configured batch size is loaded as one batch. Pruned resident expert planes remain omitted.
+Resident loading (`DSV4F_RAM_BUDGET_MIB=0`) allocates host weights in batches and reads the previous batch with O_DIRECT while allocating the next, avoiding a second copy of the payload in the system page cache. Both resident and tiered launches use `--load-mode dio`; the RAM budget controls expert residency, independently of the disk I/O mode. GPU uploads finish before this host pipeline starts. Each tensor remains contiguous; a tensor larger than the configured batch size is loaded as one batch. Pruned resident expert planes remain omitted. `DSV4F_RAM_PRELOAD` has no effect with a zero RAM budget because retained weights are already loaded at startup.
+
+With a positive budget, pruning also removes excluded expert planes from the tiered weight descriptors. RAM preload fills only retained experts, stopping when they are all resident or the cache ceiling is reached. The budget is an upper limit, not a target allocation. Packed expert IDs retain their original GGUF offsets, so preload and inference read the same retained weights without modifying model files.
 
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 

@@ -260,8 +260,8 @@ BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 
 #--jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning off --reasoning-budget 0 --no-context-shift
 #--jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning on --reasoning-budget 4096 --no-context-shift
-load_mode=none
-if ((ram_budget_mib)); then load_mode=dio; fi
+# Resident weights also bypass the page cache while loading into host buffers.
+load_mode=dio
 # Chat parsing forces Off to budget 0; -1 lets requests enable unlimited thinking.
 args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v q8_0
       --load-mode "$load_mode" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
@@ -280,7 +280,7 @@ if [[ -n ${MMPROJ:-} ]]; then
 fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
-    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
+    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: O_DIRECT"
     echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
     echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING% routed expert memory target (differential per layer)"
     echo "Allocation/read pipeline: $DSV4F_LOAD_PIPELINE_MIB MiB (0: disabled)"

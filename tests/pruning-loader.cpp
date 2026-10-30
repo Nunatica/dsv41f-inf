@@ -1,4 +1,6 @@
 #include "routing-table.h"
+#include "direct-weights.h"
+#include "ggml-backend-moe-cache.h"
 #include "llama.h"
 #include "llama-model.h"
 #include "models/deepseek41.h"
@@ -26,18 +28,31 @@ static size_t expected_active=0,expected_skipped=0;
 static int top_k=0;
 static std::string model_path;
 static gguf_context * file_info;
-static llama_model * load(bool compact,bool gpu,bool no_alloc=false) {
+static llama_model * load(bool compact,bool gpu,bool no_alloc=false,bool tiered=false) {
+    setenv("DSV4F_RAM_BUDGET_MIB",tiered?"184320":"0",1);
+    setenv("DSV4F_RAM_CACHE_MIB","2",1);
     dsv4f_routing_init(model_path);
     auto p=llama_model_default_params();p.n_gpu_layers=gpu?999:0;p.no_alloc=no_alloc;
     p.no_host=!gpu;p.use_extra_bufts=false;
-    p.load_mode=compact?LLAMA_LOAD_MODE_NONE:LLAMA_LOAD_MODE_MMAP;
+    p.load_mode=compact?LLAMA_LOAD_MODE_DIRECT_IO:LLAMA_LOAD_MODE_MMAP;
     const llama_model_tensor_buft_override overrides[]={{"\\.ffn_(gate|up|down)_exps",ggml_backend_cpu_buffer_type()},{nullptr,nullptr}};
     p.tensor_buft_overrides=overrides;
     auto * m=llama_model_load_from_file(model_path.c_str(),p);require(m,"load model");return m;
 }
-static std::vector<float> run(bool compact,bool gpu) {
-    auto * base=load(compact,gpu);auto * m=dynamic_cast<llama_model_deepseek41*>(base);require(m,"V4.1 model");
-    size_t active=0;
+static std::vector<float> run(bool compact,bool gpu,bool tiered=false) {
+    auto * base=load(compact,gpu,false,tiered);auto * m=dynamic_cast<llama_model_deepseek41*>(base);require(m,"V4.1 model");
+    auto cp=llama_context_default_params();cp.n_ctx=128;cp.n_batch=64;cp.n_ubatch=32;cp.n_seq_max=1;
+    cp.n_threads=4;cp.n_threads_batch=4;cp.offload_kqv=gpu;
+    cp.type_k=cp.type_v=GGML_TYPE_Q8_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    auto * ctx=llama_init_from_model(base,cp);require(ctx,"context");
+    dsv4f_preload_result preload;
+    ggml_dsv4f_host_weights_stats loaded{};
+    if(tiered) {
+        setenv("DSV4F_RAM_PRELOAD","1",1);preload=dsv4f_preload_experts();
+        require(!preload.budget_limited,"retained experts fit the cache");
+        ggml_dsv4f_host_weights.statistics(&loaded);
+    }
+    size_t active=0,cache_bytes=0,planes=0;
     std::ifstream input(model_path,std::ios::binary);
     for(size_t l=0;l<m->tiers.size();++l) {
         for(const auto & source:original[l]) {
@@ -59,7 +74,9 @@ static std::vector<float> run(bool compact,bool gpu) {
                 for(size_t packed=0;packed<retained.size();++packed) {
                     const int global=retained[packed],old_local=source.local[global];
                     require(it->local[global]==int(packed),"global to packed expert IDs");
-                    input.seekg(gguf_get_data_offset(file_info)+gguf_get_tensor_offset(file_info,tid)+old_local*want.size());
+                    const size_t offset=gguf_get_data_offset(file_info)+gguf_get_tensor_offset(file_info,tid)+old_local*want.size();
+                    cache_bytes+=(offset%4096+want.size()+4095)/4096*4096;++planes;
+                    input.seekg(offset);
                     input.read(want.data(),want.size());require(bool(input),"read reference plane");
                     ggml_backend_tensor_get(t,got.data(),packed*got.size(),got.size());
                     require(got==want,"retained expert bytes match original file planes");
@@ -69,10 +86,8 @@ static std::vector<float> run(bool compact,bool gpu) {
         }
     }
     if(compact)require(active==expected_active,"exact compact expert byte count");
-    auto cp=llama_context_default_params();cp.n_ctx=128;cp.n_batch=64;cp.n_ubatch=32;cp.n_seq_max=1;
-    cp.n_threads=4;cp.n_threads_batch=4;cp.offload_kqv=gpu;
-    cp.type_k=cp.type_v=GGML_TYPE_Q8_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    auto * ctx=llama_init_from_model(base,cp);require(ctx,"context");
+    if(tiered)require(preload.planes==planes && preload.resident_bytes==cache_bytes && preload.read_bytes==cache_bytes,
+        "preload allocated/read discarded planes or missed retained planes");
     const int nv=llama_vocab_n_tokens(llama_model_get_vocab(base));std::vector<float> logits;
     for(int first=0;first<9;) {
         const int n=first==0?8:1;auto batch=llama_batch_init(n,0,1);batch.n_tokens=n;
@@ -80,6 +95,13 @@ static std::vector<float> run(bool compact,bool gpu) {
         require(llama_decode(ctx,batch)==0,"prefill/decode");
         for(int i=0;i<n;++i){const float * p=llama_get_logits_ith(ctx,i);logits.insert(logits.end(),p,p+nv);}
         llama_batch_free(batch);first+=n;
+    }
+    if(tiered) {
+        ggml_dsv4f_host_weights_stats inferred{};ggml_dsv4f_host_weights.statistics(&inferred);
+        require(inferred.reads==loaded.reads && inferred.read_bytes==loaded.read_bytes && inferred.evictions==loaded.evictions,
+            "first prefill/decode reread or evicted preloaded experts");
+        require(inferred.resident_bytes==cache_bytes && !inferred.transient_bytes,"inference changed fitting expert residency");
+        std::printf("tiered pruning preload: planes=%zu resident_bytes=%zu first_inference_read_bytes=0 PASS\n",planes,cache_bytes);
     }
     llama_free(ctx);llama_model_free(base);return logits;
 }
@@ -137,9 +159,12 @@ int main(int argc,char **argv) {
             for(const char * maps:{"0","1"})for(const char * pipeline:{"0","1"}) {
                 setenv("DSV4F_STATIC_EXPERT_MAPS",maps,1);
                 setenv("DSV4F_LOAD_PIPELINE_MIB",pipeline,1);
-                const auto reference=run(false,gpu),packed=run(true,gpu);require(reference.size()==packed.size(),"logit size");
-                double max_error=0;for(size_t i=0;i<packed.size();++i){require(std::isfinite(packed[i]),"finite logits");max_error=std::max(max_error,double(std::abs(reference[i]-packed[i])));require(std::abs(reference[i]-packed[i])<2e-4f,"packed vs original expert inference parity");}
-                std::printf("pruning loader pct=%d backend=%s static_maps=%s pipeline_mib=%s active_bytes=%zu skipped_bytes=%zu max_error=%g PASS\n",pct,gpu?"GPU":"CPU",maps,pipeline,expected_active,expected_skipped,max_error);
+                const auto reference=run(false,gpu);
+                for(bool tiered:{false,true}) {
+                    const auto packed=run(true,gpu,tiered);require(reference.size()==packed.size(),"logit size");
+                    double max_error=0;for(size_t i=0;i<packed.size();++i){require(std::isfinite(packed[i]),"finite logits");max_error=std::max(max_error,double(std::abs(reference[i]-packed[i])));require(std::abs(reference[i]-packed[i])<2e-4f,"packed vs original expert inference parity");}
+                    std::printf("pruning loader pct=%d backend=%s tiered=%d static_maps=%s pipeline_mib=%s active_bytes=%zu skipped_bytes=%zu max_error=%g PASS\n",pct,gpu?"GPU":"CPU",tiered,maps,pipeline,expected_active,expected_skipped,max_error);
+                }
             }
         }
     }
