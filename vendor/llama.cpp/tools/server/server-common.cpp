@@ -1417,9 +1417,8 @@ json oaicompat_chat_params_parse(
     }
 
     // Scope the forced-decode Off policy to the DeepSeek V4.1 template.
-    const bool dsv41_effort = opt.use_jinja && common_chat_templates_source(opt.tmpls.get()).find(
-        "Reasoning Effort: 75 (range 1-100") != std::string::npos &&
-        common_chat_templates_source(opt.tmpls.get()).find("dsml_token") != std::string::npos;
+    const bool dsv41_effort = opt.use_jinja &&
+        common_chat_template_is_deepseek_v41(common_chat_templates_source(opt.tmpls.get()));
     bool dsv41_none = false;
     if (dsv41_effort) {
         // DeepSeek also accepts "thinking"; the web UI sends both aliases.
@@ -1428,6 +1427,18 @@ json oaicompat_chat_params_parse(
             const auto value = json::parse(thinking->second);
             if (!value.is_boolean()) throw std::invalid_argument("thinking must be boolean");
             inputs.enable_thinking = value.get<bool>();
+        }
+        // The new template gives thinking_mode precedence over the boolean aliases.
+        json thinking_mode;
+        const auto mode = inputs.chat_template_kwargs.find("thinking_mode");
+        if (mode != inputs.chat_template_kwargs.end()) {
+            thinking_mode = json::parse(mode->second);
+            if (!thinking_mode.is_null()) {
+                if (thinking_mode != "chat" && thinking_mode != "thinking") {
+                    throw std::invalid_argument("thinking_mode must be chat or thinking");
+                }
+                inputs.enable_thinking = thinking_mode == "thinking";
+            }
         }
         json effort;
         if (body.contains("reasoning_effort")) {
@@ -1440,26 +1451,36 @@ json oaicompat_chat_params_parse(
         }
         if (!effort.is_null() && effort != "") {
             std::string level;
+            constexpr const char * effort_error = "reasoning_effort must be none, low, high, max or an integer within [1,100]";
             if (effort == false) level = "none";
-            else if (effort.is_string()) level = effort.get<std::string>();
-            else throw std::invalid_argument("reasoning_effort must be none, low, high or max");
+            else if (effort.is_number_integer() && effort.get<double>() >= 1 && effort.get<double>() <= 100) {
+                level = std::to_string(effort.get<int>());
+            } else if (effort.is_string()) level = effort.get<std::string>();
+            else throw std::invalid_argument(effort_error);
             const auto begin = level.find_first_not_of(" \t\r\n");
             level = begin == std::string::npos ? "" : level.substr(begin, level.find_last_not_of(" \t\r\n") - begin + 1);
             std::transform(level.begin(), level.end(), level.begin(), [](unsigned char c) { return std::tolower(c); });
             if (level == "off" || level == "minimal" || level == "disabled" || level == "false") level = "none";
             if (level == "medium") level = "high";
             if (level == "xhigh" || level == "maximum") level = "max";
-            if (level != "none" && level != "low" && level != "high" && level != "max") {
-                throw std::invalid_argument("reasoning_effort must be none, low, high or max");
+            const bool numeric = !level.empty() && level.size() <= 3 && level[0] != '0' &&
+                std::all_of(level.begin(), level.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }) &&
+                std::stoi(level) <= 100;
+            if (level != "none" && level != "low" && level != "high" && level != "max" && !numeric) {
+                throw std::invalid_argument(effort_error);
             }
             inputs.enable_thinking = level != "none";
-            inputs.chat_template_kwargs["reasoning_effort"] = json(level).dump();
+            // "none" is an API control value, not a native template effort.
+            inputs.chat_template_kwargs["reasoning_effort"] = json(level == "none" ? "low" : level).dump();
         }
         // An explicit template Off flag takes precedence, as in Maya.
         for (const char * key : {"enable_thinking", "thinking"}) {
             if (chat_template_kwargs_object.contains(key) && chat_template_kwargs_object.at(key) == false) {
                 inputs.enable_thinking = false;
             }
+        }
+        if (chat_template_kwargs_object.contains("thinking_mode") && !thinking_mode.is_null()) {
+            inputs.enable_thinking = thinking_mode == "thinking";
         }
         dsv41_none = !inputs.enable_thinking;
         if (dsv41_none) inputs.chat_template_kwargs["reasoning_effort"] = json("low").dump();
@@ -1468,6 +1489,9 @@ json oaicompat_chat_params_parse(
         inputs.enable_thinking = true;
         inputs.chat_template_kwargs["enable_thinking"] = "true";
         inputs.chat_template_kwargs["thinking"] = "true";
+        if (mode != inputs.chat_template_kwargs.end()) {
+            inputs.chat_template_kwargs["thinking_mode"] = json("thinking").dump();
+        }
     } else if (body.contains("reasoning_effort")) {
         // Other templates retain the existing Off behavior.
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));

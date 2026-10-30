@@ -79,9 +79,6 @@ The launcher defaults to `MODEL=models/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001
 | `DSV4F_ADAPTIVE_ROUTING` | `0` | `0`: off; `1`: persist decode expert counters and use history for RAM/VRAM preload and eviction. Mutually exclusive with pruning. |
 | `DSV4F_ADAPTIVE_PRUNING` | `0` | `0`: off; `1..50`: target percentage of routed expert weight bytes to exclude, with per-layer selections based on historical usage per byte. Mutually exclusive with routing. |
 | `DSV4F_RAM_PRELOAD` | `0` | `1`: preload experts at startup when the RAM budget is positive; `0`: disabled. |
-| `DSV4F_LOAD_PIPELINE_MIB` | `1024` | Overlap host allocation with disk reads for resident loading and RAM preload. `0`: sequential loading; range `0..65536` MiB. |
-| `DSV4F_RAM_RESERVE_MIB` | `1024` | Headroom left outside the expert cache for runtime growth. |
-| `DSV4F_RAM_CACHE_MIB` | automatic | Optional additional ceiling for the expert RAM cache. |
 | `DSV4F_EXPERT_CACHE_MIB` | `14336` | Existing aggregate VRAM expert-cache ceiling. |
 
 ```bash
@@ -90,8 +87,6 @@ DSV4F_RAM_BUDGET_MIB=0 ./run-server.sh     # Resident model weights; Engram stay
 DSV4F_RAM_BUDGET_MIB=131072 ./run-server.sh # Tiered mode, 128 GiB RAM ceiling
 ```
 Resident loading (`DSV4F_RAM_BUDGET_MIB=0`) allocates host weights in batches and reads the previous batch while allocating the next. GPU uploads finish before this host pipeline starts. Each tensor remains contiguous; a tensor larger than the configured batch size is loaded as one batch. Pruned resident expert planes remain omitted.
-
-With `DSV4F_RAM_PRELOAD=1`, the same batch setting controls a two-stage preload pipeline: allocate/populate the next cache batch while the previous batch reads with O_DIRECT. Both resident and pending batches count against the RAM cache budget. Preload preserves historical priority/physical tie order and stops at the first plane that does not fit, without evicting the loaded prefix. Setting `DSV4F_LOAD_PIPELINE_MIB=0` restores sequential behavior for both paths.
 
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 

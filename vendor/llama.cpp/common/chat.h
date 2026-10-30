@@ -347,6 +347,10 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
 bool        common_chat_templates_was_explicit(const struct common_chat_templates * tmpls);
 std::string common_chat_templates_source(const struct common_chat_templates * tmpls, const std::string & variant = "");
 
+// Recognize DeepSeek's wire format independently of Jinja variable names.
+bool common_chat_template_is_deepseek_dsml(const std::string & source);
+bool common_chat_template_is_deepseek_v41(const std::string & source);
+
 struct common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                       const struct common_chat_templates_inputs & inputs);
 

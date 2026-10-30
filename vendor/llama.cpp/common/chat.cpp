@@ -1074,6 +1074,19 @@ static common_chat_params common_chat_params_init_gemma4_legacy(const common_cha
     return common_chat_params_init_gemma4(tmpl, adjusted);
 }
 
+bool common_chat_template_is_deepseek_dsml(const std::string & src) {
+    return src.find("｜DSML｜") != std::string::npos &&
+           src.find("<think>") != std::string::npos && src.find("</think>") != std::string::npos &&
+           (src.find("function_calls") != std::string::npos ||
+            src.find("tool_calls") != std::string::npos || src.find(" calls>") != std::string::npos);
+}
+
+bool common_chat_template_is_deepseek_v41(const std::string & src) {
+    return common_chat_template_is_deepseek_dsml(src) &&
+           src.find("Reasoning Effort:") != std::string::npos &&
+           src.find("(range 1-100") != std::string::npos;
+}
+
 // Pick the dedicated handler for a template from its source, or null for the autoparser.
 // Order matters: the first match wins, and later checks assume the earlier ones did not match.
 static common_chat_params_init_fn common_chat_template_detect_params_init(const std::string & src) {
@@ -1179,13 +1192,8 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_minimax_m3;
     }
 
-    // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
-    // The template source contains the token as a variable assignment, not as a literal in markup.
-    // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".
-    if (src.find("dsml_token") != std::string::npos &&
-        src.find("DSML") != std::string::npos &&
-        (src.find("function_calls") != std::string::npos ||
-         src.find("tool_calls") != std::string::npos)) {
+    // V4.1 uses DSML rather than dsml_token as its Jinja variable name.
+    if (common_chat_template_is_deepseek_dsml(src)) {
         LOG_DBG("Using specialized template: DeepSeek V3.2/V4\n");
         return common_chat_params_init_deepseek_v3_2;
     }
