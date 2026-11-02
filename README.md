@@ -141,6 +141,8 @@ After installing the dependencies and placing the model files:
 | dsv41f-inf (unsloth Q4_K_XL, 180 GiB budget, preload on) | 120.79 | 7.34 |
 | llama.cpp | - | - |
 
+Data was measured at target system. test was done with same prompt with PROMPT_TEST.md
+
 ## Credits
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [Xolotl](https://github.com/Indras-Mirror/Xolotl)
