@@ -21,10 +21,13 @@ static std::vector<float> run(const char * path,bool direct,bool gpu) {
     auto * model=llama_model_load_from_file(path,mp);if(!model)throw std::runtime_error("model load failed");
     const bool phase_test=std::getenv("DSV4F_TEST_PHASE_WORKSPACE");
     const bool preloaded=phase_test && std::getenv("DSV4F_TEST_PREFILL_RAM");
-    auto cp=llama_context_default_params();cp.n_ctx=phase_test?2048:128;cp.n_batch=phase_test?2048:64;cp.n_ubatch=phase_test?2048:32;cp.n_threads=4;cp.n_threads_batch=4;
+    const char * prefill_limit=std::getenv("DSV4F_RAM_PREFILL_UBATCH");
+    const uint32_t reserve_batch=std::max(4096u,prefill_limit?uint32_t(std::atoi(prefill_limit)):10240u);
+    auto cp=llama_context_default_params();cp.n_ctx=phase_test?reserve_batch:128;cp.n_batch=phase_test?reserve_batch:64;cp.n_ubatch=phase_test?reserve_batch:32;cp.n_threads=4;cp.n_threads_batch=4;
     cp.n_seq_max=1;cp.offload_kqv=gpu;cp.type_k=GGML_TYPE_Q8_0;cp.type_v=GGML_TYPE_Q8_0;cp.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
     auto * context=llama_init_from_model(model,cp);if(!context)throw std::runtime_error("context failed");
-    if(phase_test && direct && (llama_n_batch(context)!=1024 || llama_n_ubatch(context)!=1024))throw std::runtime_error("RAM prefill workspace was not capped at 1024");
+    const uint32_t prefill_size=std::min(reserve_batch,prefill_limit?uint32_t(std::atoi(prefill_limit)):10240u);
+    if(phase_test && direct && (llama_n_batch(context)!=prefill_size || llama_n_ubatch(context)!=prefill_size))throw std::runtime_error("RAM prefill workspace cap mismatch");
     if(preloaded && direct) {
         setenv("DSV4F_RAM_PRELOAD","1",1);
         dsv4f_preload_experts();
@@ -39,7 +42,7 @@ static std::vector<float> run(const char * path,bool direct,bool gpu) {
         if(phase_test && direct) {
             const char * phase=std::getenv("DSV4F_PHASE_WORKSPACE");
             const bool switching=phase && std::atoi(phase)!=0;
-            const uint32_t expected=switching && count==1?32:1024;
+            const uint32_t expected=switching && count==1?32:prefill_size;
             const auto & actual=context->get_cparams();
             if(actual.n_batch!=expected || actual.n_ubatch!=expected)throw std::runtime_error("incorrect prefill/decode workspace size");
         }

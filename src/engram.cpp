@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <algorithm>
+#include <unordered_map>
 using json=nlohmann::json;
 namespace {
 uint64_t now_ns() {return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
@@ -50,8 +51,9 @@ dsv4f_engram::options dsv4f_engram::from_env() {
         if(!std::strcmp(v,"lut"))o.lut=true;
         else if(std::strcmp(v,"baseline"))throw std::runtime_error("DSV4F_ENGRAM_DECODE must be baseline or lut");
     }
-    auto flag=[](const char * name){const char * v=std::getenv(name);if(!v)return false;if(std::strcmp(v,"0") && std::strcmp(v,"1"))throw std::runtime_error(std::string(name)+" must be 0 or 1");return !std::strcmp(v,"1");};
+    auto flag=[](const char * name,bool fallback=false){const char * v=std::getenv(name);if(!v)return fallback;if(std::strcmp(v,"0") && std::strcmp(v,"1"))throw std::runtime_error(std::string(name)+" must be 0 or 1");return !std::strcmp(v,"1");};
     o.dedup=flag("DSV4F_ENGRAM_DEDUP");o.profile=flag("DSV4F_ENGRAM_PROFILE");
+    o.prefill_io=flag("DSV4F_ENGRAM_PREFILL_IO",true);
     if(const char * v=std::getenv("DSV4F_ENGRAM_BATCH_IO")) {
         if(std::strcmp(v,"0") && std::strcmp(v,"1"))throw std::runtime_error("DSV4F_ENGRAM_BATCH_IO must be 0 or 1");
         o.batch_io=!std::strcmp(v,"1");
@@ -105,7 +107,7 @@ dsv4f_engram::dsv4f_engram(const llama_model_deepseek41 & m,const std::string & 
         write_exact(impl->trace_fd,header,sizeof(header));
     }
     }catch(...){for(auto & t:tables){if(t.fdw>=0)close(t.fdw);if(t.fds>=0)close(t.fds);}throw;}
-    std::fprintf(stderr,"[dsv4f-engram] %zu layer tables; FP8 rows read from %s; decode=%s cache=%zu bytes (cap=%zu) dedup=%d batch_io=%d\n",tables.size(),dir.c_str(),opts.lut?"lut":"baseline",cache_bytes(),opts.cache_bytes,opts.dedup,opts.batch_io);
+    std::fprintf(stderr,"[dsv4f-engram] %zu layer tables; FP8 rows read from %s; decode=%s cache=%zu bytes (cap=%zu) dedup=%d batch_io=%d prefill_io=%d\n",tables.size(),dir.c_str(),opts.lut?"lut":"baseline",cache_bytes(),opts.cache_bytes,opts.dedup,opts.batch_io,opts.prefill_io);
 }
 dsv4f_engram::~dsv4f_engram(){for(auto & t:tables){close(t.fdw);close(t.fds);}}
 size_t dsv4f_engram::cache_bytes() const {
@@ -127,10 +129,20 @@ void dsv4f_engram::read(int slot,const std::vector<int32_t> & history,int nt,std
         const uint32_t rec[]={uint32_t(slot),uint32_t(nt)};
         write_exact(impl->trace_fd,rec,sizeof(rec));write_exact(impl->trace_fd,history.data(),history.size()*sizeof(int32_t));
     }
-    out.resize(size_t(nt)*C*D);std::vector<uint8_t>w(D),sc(D/32);
+    const size_t elements=size_t(nt)*C*D;
+    {
+        // Larger ubatches also grow the current/future Engram row buffers.
+        // Reclaim idle expert memory before touching these anonymous pages.
+        const uint64_t growth=elements>out.capacity()?uint64_t(elements-out.capacity())*sizeof(float):0;
+        dsv4f_ram_reservation allocation(growth);
+        if(!allocation)throw std::runtime_error("RAM budget has no room for Engram output rows");
+        out.resize(elements);
+    }
+    std::vector<uint8_t>w(D),sc(D/32);
     const bool batch_direct=opts.batch_io && nt==1 && dsv4f_direct_weights_enabled();
+    const bool prefill_direct=opts.prefill_io && opts.batch_io && nt>1 && dsv4f_direct_weights_enabled();
     struct batch_row {uint64_t row;size_t index;};std::vector<batch_row> batch_rows;
-    if(batch_direct)batch_rows.reserve(C);
+    if(batch_direct || prefill_direct)batch_rows.reserve(std::max(C,64));
     // Per-call dedup is bounded to 32768 rows / at most 1 MiB metadata,
     // independently of the persistent cache. It never survives this batch.
     struct seen {uint64_t row=UINT64_MAX,index=0;};
@@ -235,6 +247,77 @@ void dsv4f_engram::read(int slot,const std::vector<int32_t> & history,int nt,std
         }
         if(measure)st.copy_ns+=now_ns()-at;
     };
+    auto consume_prefill=[&] {
+        const size_t stride=D+D/32;
+        struct miss {uint64_t row;};struct output {size_t index,miss;};
+        std::vector<miss> misses;std::vector<output> outputs;
+        std::unordered_map<uint64_t,size_t> pending;pending.reserve(batch_rows.size());
+        misses.reserve(batch_rows.size());outputs.reserve(batch_rows.size());
+        for(const auto & row:batch_rows) {
+            if(count)++st.rows;
+            if(unique_limit) {
+                size_t p=mix(row.row)&(buckets-1);
+                while(duplicate[p].row!=UINT64_MAX && duplicate[p].row!=row.row)p=(p+1)&(buckets-1);
+                if(duplicate[p].row==row.row) {
+                    std::memcpy(out.data()+row.index*D,out.data()+duplicate[p].index*D,size_t(D)*sizeof(float));
+                    if(count)++st.duplicates;
+                    continue;
+                }
+            }
+            size_t hit=SIZE_MAX;
+            if(cache.sets) {
+                const size_t base=(mix(row.row)%cache.sets)*4;
+                for(size_t i=base;i<base+4;++i)if(cache.tags[i].row==row.row) {
+                    hit=i;cache.tags[i].stamp=++cache.clock;break;
+                }
+            }
+            if(hit!=SIZE_MAX) {
+                if(count)++st.hits;
+                const auto * data=cache.data.data()+hit*stride;float * dst=out.data()+row.index*D;
+                if(opts.lut)dsv4f_engram_fp8::lut(data,data+D,dst,D);
+                else dsv4f_engram_fp8::baseline(data,data+D,dst,D);
+                continue;
+            }
+            const auto found=pending.find(row.row);
+            if(found!=pending.end()) {outputs.push_back({row.index,found->second});if(count)++st.duplicates;}
+            else {const size_t index=misses.size();pending.emplace(row.row,index);misses.push_back({row.row});outputs.push_back({row.index,index});}
+        }
+        std::vector<uint8_t> raw(misses.size()*stride);std::vector<dsv4f_direct_request> requests;
+        requests.reserve(misses.size()*2);
+        for(size_t i=0;i<misses.size();++i) {
+            requests.push_back({tables[slot].fdw,raw.data()+i*stride,size_t(D),tables[slot].ow+misses[i].row*D});
+            requests.push_back({tables[slot].fds,raw.data()+i*stride+D,size_t(D/32),tables[slot].os+misses[i].row*(D/32)});
+        }
+        uint64_t at=measure?now_ns():0;
+        const auto io=dsv4f_direct_read_compact(requests.data(),requests.size());
+        if(count){st.reads+=requests.size();st.bytes+=raw.size();st.batch_requests+=io.requests;st.batch_bytes+=io.bytes;}
+        if(measure){st.io_ns+=now_ns()-at;at=now_ns();}
+        for(const auto & work:outputs) {
+            const auto * data=raw.data()+work.miss*stride;float * dst=out.data()+work.index*D;
+            if(opts.lut)dsv4f_engram_fp8::lut(data,data+D,dst,D);
+            else dsv4f_engram_fp8::baseline(data,data+D,dst,D);
+        }
+        if(measure){st.fp8_ns+=now_ns()-at;at=now_ns();}
+        // Publish only after every read succeeds; hits were decoded before
+        // admissions can overwrite their cache slots. No pending tag is visible.
+        if(cache.sets)for(size_t j=0;j<misses.size();++j) {
+            const size_t base=(mix(misses[j].row)%cache.sets)*4;size_t victim=base;
+            for(size_t i=base+1;i<base+4;++i)if(cache.tags[i].stamp<cache.tags[victim].stamp)victim=i;
+            std::memcpy(cache.data.data()+victim*stride,raw.data()+j*stride,stride);
+            cache.tags[victim]={misses[j].row,++cache.clock};
+        }
+        // Publish full-call dedup entries only after this chunk's outputs are
+        // complete. Duplicates within an unfinished chunk use pending instead.
+        if(unique_limit)for(const auto & row:batch_rows) {
+            size_t p=mix(row.row)&(buckets-1);
+            while(duplicate[p].row!=UINT64_MAX && duplicate[p].row!=row.row)p=(p+1)&(buckets-1);
+            if(duplicate[p].row==UINT64_MAX && n_unique<unique_limit) {
+                duplicate[p]={row.row,row.index};++n_unique;
+            }
+        }
+        if(measure)st.copy_ns+=now_ns()-at;
+        batch_rows.clear();
+    };
     uint64_t hash_start=measure?now_ns():0;
     for(int t=0;t<nt;++t) {
         if(cancel && cancel->load(std::memory_order_relaxed))throw std::runtime_error("Engram prefetch cancelled");
@@ -252,14 +335,18 @@ void dsv4f_engram::read(int slot,const std::vector<int32_t> & history,int nt,std
                 int64_t rem=int64_t(rolling)%int64_t(prime);if(rem<0)rem+=prime;
                 const uint64_t row=offset+rem;offset+=prime;
                 if(measure)st.hash_ns+=now_ns()-hash_start;
-                if(batch_direct)batch_rows.push_back({row,size_t(t)*C+c});else consume(row,size_t(t)*C+c);
+                if(prefill_direct) {
+                    batch_rows.push_back({row,size_t(t)*C+c});
+                    if(batch_rows.size()==64)consume_prefill();
+                } else if(batch_direct)batch_rows.push_back({row,size_t(t)*C+c});else consume(row,size_t(t)*C+c);
                 if(measure)hash_start=now_ns();
             }
         }
     }
     if(measure)st.hash_ns+=now_ns()-hash_start;
     if(batch_direct)consume_batch();
+    if(prefill_direct && !batch_rows.empty())consume_prefill();
     if(measure)st.total_ns=now_ns()-start;
     if(result)*result=st;
-    if(opts.profile)std::fprintf(stderr,"[dsv4f-engram-profile] slot=%d tokens=%d rows=%llu reads=%llu bytes=%llu hits=%llu dedup=%llu hash_us=%.3f io_us=%.3f fp8_us=%.3f copy_us=%.3f total_us=%.3f\n",slot,nt,(unsigned long long)st.rows,(unsigned long long)st.reads,(unsigned long long)st.bytes,(unsigned long long)st.hits,(unsigned long long)st.duplicates,st.hash_ns/1000.,st.io_ns/1000.,st.fp8_ns/1000.,st.copy_ns/1000.,st.total_ns/1000.);
+    if(opts.profile)std::fprintf(stderr,"[dsv4f-engram-profile] slot=%d tokens=%d rows=%llu reads=%llu bytes=%llu hits=%llu dedup=%llu hash_us=%.3f io_us=%.3f fp8_us=%.3f copy_us=%.3f total_us=%.3f batch_requests=%llu batch_bytes=%llu\n",slot,nt,(unsigned long long)st.rows,(unsigned long long)st.reads,(unsigned long long)st.bytes,(unsigned long long)st.hits,(unsigned long long)st.duplicates,st.hash_ns/1000.,st.io_ns/1000.,st.fp8_ns/1000.,st.copy_ns/1000.,st.total_ns/1000.,(unsigned long long)st.batch_requests,(unsigned long long)st.batch_bytes);
 }

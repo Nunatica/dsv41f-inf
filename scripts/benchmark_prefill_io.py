@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
 import statistics
 import subprocess
+import threading
 import time
 from urllib.request import urlopen
 
@@ -22,7 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--batch-io', choices=['0', '1'], required=True)
-    parser.add_argument('--runs', type=int, default=3)
+    parser.add_argument('--runs', type=int, default=1)
     parser.add_argument('--ram-budget-mib', type=int, default=163840)
     parser.add_argument('--scan-cache', choices=['0', '1'], default='0')
     parser.add_argument('--prompt-file', type=Path, default=ROOT/'PROMPT_TEST.md')
@@ -33,9 +35,13 @@ def main():
     parser.add_argument('--io-pipeline', choices=['0', '1'], default='0')
     parser.add_argument('--model', type=Path, default=ROOT/'models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf')
     parser.add_argument('--block-device', help='optional whole-device counters, e.g. nvme0n1')
+    parser.add_argument('--engram-prefill-io', choices=['0', '1'], default='0')
+    parser.add_argument('--prefill-ubatch', choices=['1024', '2048', '4096', '6144', '8192', '10240', '12288'], default='1024')
+    parser.add_argument('--engram-timers', action='store_true', help='lightweight per-batch read/wait timers')
+    parser.add_argument('--sample-vram', action='store_true', help='sample AMD VRAM usage every 100 ms')
     args = parser.parse_args()
-    if args.runs < 2:
-        parser.error('--runs must be at least 2 (cold and warm)')
+    if args.runs < 1:
+        parser.error('--runs must be positive')
     if args.ram_budget_mib <= 4096:
         parser.error('--ram-budget-mib must exceed the 4096-MiB runtime reserve')
     manifest = ROOT/'state/server.json'
@@ -51,6 +57,7 @@ def main():
                DSV4F_ADAPTIVE_ROUTING='0', DSV4F_ADAPTIVE_PRUNING='0',
                DSV4F_PREFILL_IO_SORT=args.io_sort, DSV4F_PREFILL_IO_PIPELINE=args.io_pipeline,
                DSV4F_PREFILL_GROUP='16',
+               DSV4F_ENGRAM_PREFILL_IO=args.engram_prefill_io, DSV4F_RAM_PREFILL_UBATCH=args.prefill_ubatch,
                DSV4F_RAM_BUDGET_MIB=str(args.ram_budget_mib), DSV4F_MTP='0', DSV4F_EXPERT_LOOKAHEAD='0',
                DSV4F_RAM_LOOKAHEAD='0', DSV4F_PREFILL_GROUP_LEASE='1',
                DSV4F_PREFILL_BATCH_IO=args.batch_io, DSV4F_CPU_EXPERT_LEASE='1',
@@ -63,6 +70,8 @@ def main():
         if key.startswith(('ROCPROF', 'ROCTRACER')) or key == 'LD_PRELOAD' or (
                 key.startswith('DSV4F_') and any(x in key for x in ('PROFILE', 'TIMELINE', 'TRACE'))):
             env.pop(key)
+    if args.engram_timers:
+        env.update(DSV4F_ENGRAM_ASYNC_PROFILE='1', DSV4F_INPUT_PROFILE='1')
     hashes = {name: hashlib.sha256((build/'bin'/name).read_bytes()).hexdigest()
               for name in ('dsv4f-server', 'libggml-hip.so', 'libllama.so')}
     report = dict(date_utc=datetime.now(timezone.utc).isoformat(), prompt_file=str(args.prompt_file),
@@ -71,6 +80,8 @@ def main():
                   preload=args.preload, io_sort=args.io_sort, io_pipeline=args.io_pipeline,
                   model=str(args.model.resolve()), model_bytes=args.model.stat().st_size,
                   block_device=args.block_device,
+                  engram_prefill_io=args.engram_prefill_io, prefill_ubatch=int(args.prefill_ubatch),
+                  engram_timers=args.engram_timers,
                   mtp=0, binary_sha256=hashes, runs=[])
     state = None
     with (out/'launcher.log').open('w') as log:
@@ -93,6 +104,8 @@ def main():
                                        ('DSV4F_ADAPTIVE_PRUNING', '0'),
                                        ('DSV4F_PREFILL_IO_SORT', args.io_sort),
                                        ('DSV4F_PREFILL_IO_PIPELINE', args.io_pipeline),
+                                       ('DSV4F_ENGRAM_PREFILL_IO', args.engram_prefill_io),
+                                       ('DSV4F_RAM_PREFILL_UBATCH', args.prefill_ubatch),
                                        ('DSV4F_PREFILL_GROUP_LEASE', '1'), ('DSV4F_PREFILL_BATCH_IO', args.batch_io)]:
                         assert options[key] == value
                     assert Path(f'/proc/{candidate["pid"]}/exe').resolve() == build/'bin/dsv4f-server'
@@ -146,7 +159,39 @@ def main():
                 assert weights['transient_bytes'] == 0
             for index in range(args.runs):
                 before = snapshot()
-                result = generate(state['url'], 1, prompt, cache_prompt=False)
+                log_offset = len(Path(state['log']).read_text())
+                samples = []; stop_sampling = threading.Event(); sampler = None
+                if args.sample_vram:
+                    devices = list(Path('/sys/class/drm').glob('card[0-9]*/device/mem_info_vram_total'))
+                    if not devices:
+                        raise RuntimeError('AMD VRAM counters unavailable')
+                    counter = max(devices, key=lambda p: int(p.read_text()))
+                    total = int(counter.read_text())
+                    def sample():
+                        while not stop_sampling.is_set():
+                            samples.append(dict(monotonic=time.monotonic(), used_bytes=int(counter.with_name('mem_info_vram_used').read_text()), total_bytes=total))
+                            stop_sampling.wait(.1)
+                    sampler = threading.Thread(target=sample, daemon=True); sampler.start()
+                try:
+                    try:
+                        result = generate(state['url'], 1, prompt, cache_prompt=False)
+                    finally:
+                        stop_sampling.set()
+                        if sampler: sampler.join()
+                except BaseException as error:
+                    report['error'] = str(error) or type(error).__name__
+                    report['failure_vram_samples'] = samples
+                    cgroot=Path(state['cgroup']['path'])
+                    try:
+                        report['failure_cgroup']={k:(cgroot/k).read_text() for k in ['memory.events','memory.peak','memory.current','memory.swap.current']}
+                    except OSError as cg_error:
+                        report['failure_cgroup_error']=str(cg_error)
+                    try:
+                        report['failure_snapshot'] = snapshot()
+                    except (OSError, AssertionError) as snapshot_error:
+                        report['failure_snapshot_error'] = str(snapshot_error)
+                    (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
+                    raise
                 after = snapshot()
                 assert result['timings']['cache_n'] == 0
                 record = dict(index=index+1, timings=result['timings'], wall_seconds=result['wall_seconds'],
@@ -157,6 +202,25 @@ def main():
                 record['io_requests'] = after['weights']['io_requests']-before['weights']['io_requests']
                 record['io_bytes'] = after['weights']['io_bytes']-before['weights']['io_bytes']
                 record['merged_planes'] = after['weights']['merged_planes']-before['weights']['merged_planes']
+                text = Path(state['log']).read_text()
+                batches = [int(n) for n in re.findall(r'\[dsv4f-ram-prefill\] layer=\S+ tokens=(\d+)', text) if int(n)]
+                assert batches and max(batches) == int(args.prefill_ubatch), 'requested ubatch was not used'
+                record['observed_prefill_ubatches'] = sorted(set(batches))
+                record['workspace_log'] = [line for line in text.splitlines() if '[dsv4f-workspace]' in line]
+                timers = dict(engram_read_ms=0.0, engram_wait_ms=0.0, input_ms=0.0)
+                for line in text[log_offset:].splitlines():
+                    values = {k: float(v) for k,v in re.findall(r'(\w+)=([\d.]+)', line)}
+                    if line.startswith('[dsv4f-engram-prefetch-read]'):
+                        timers['engram_read_ms'] += values.get('read_us', 0)/1000
+                    elif line.startswith('[dsv4f-engram-async]'):
+                        timers['engram_wait_ms'] += values.get('wait_us', 0)/1000
+                    elif line.startswith('[dsv4f-input]'):
+                        timers['input_ms'] += values.get('total_us', 0)/1000
+                record.update(timers)
+                if samples:
+                    record['vram_samples'] = samples
+                    record['vram_peak_bytes'] = max(x['used_bytes'] for x in samples)
+                    record['vram_min_free_bytes'] = min(x['total_bytes']-x['used_bytes'] for x in samples)
                 if args.block_device:
                     record['device_read_bytes'] = (after['device'][2]-before['device'][2])*512
                 report['runs'].append(record)
@@ -170,7 +234,7 @@ def main():
             values = [r['timings']['prompt_per_second'] for r in report['runs']]
             report['summary'] = dict(cold_prefill_tps=values[0],
                                      first_after_preload_tps=values[0] if args.preload == '1' else None,
-                                     warm_median_prefill_tps=statistics.median(values[1:]))
+                                     warm_median_prefill_tps=statistics.median(values[1:]) if len(values)>1 else None)
             (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
             print(report['summary'], flush=True)
             if args.validation_tokens:

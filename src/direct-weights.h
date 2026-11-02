@@ -52,3 +52,7 @@ struct dsv4f_direct_request { int fd; void * output; size_t bytes; uint64_t offs
 // Submit independent aligned O_DIRECT reads together. Falls back to the
 // synchronous reader when native Linux AIO is unavailable.
 void dsv4f_direct_read_many(const dsv4f_direct_request * requests, size_t count);
+struct dsv4f_direct_io_stats { uint64_t requests=0,bytes=0; };
+// At most 128 small requests: sort, share aligned blocks and merge adjacent
+// ranges, then scatter exact payload bytes back to caller order.
+dsv4f_direct_io_stats dsv4f_direct_read_compact(const dsv4f_direct_request * requests,size_t count);

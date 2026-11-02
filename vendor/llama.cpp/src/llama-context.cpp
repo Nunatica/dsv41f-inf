@@ -262,7 +262,14 @@ llama_context::llama_context(
         cparams.causal_attn && !model.hparams.no_alloc;
     const bool tiered_workspace=dsv4_workspace && dsv4f_ram_budget()!=0;
     if(tiered_workspace) {
-        cparams.n_batch=prefill_batch=std::min(prefill_batch,1024u);
+        uint32_t limit=10240;
+        if(const char * text=std::getenv("DSV4F_RAM_PREFILL_UBATCH")) {
+            char * end=nullptr;const auto value=std::strtoul(text,&end,10);
+            if(end==text || *end || *text=='-' || value<32 || value>16384)
+                throw std::runtime_error("DSV4F_RAM_PREFILL_UBATCH must be an integer in 32..16384");
+            limit=uint32_t(value);
+        }
+        cparams.n_batch=prefill_batch=std::min(prefill_batch,limit);
         cparams.n_ubatch=prefill_ubatch=std::min(prefill_ubatch,cparams.n_batch);
     }
     phase_workspace=dsv4_workspace && phase_env && std::atoi(phase_env)!=0;
@@ -659,6 +666,7 @@ void llama_context::select_workspace(bool decode) {
     for(auto & result:gf_res_prev)result.reset();
     gf_res_prev_active=nullptr;gf_res_reserve.reset();
     sched.reset();
+    host_workspace_reservations.clear();host_workspace_reserved=0;
     for(auto backend:backend_ptrs)ggml_dsv4f_experts.gpu_trim_workspace(backend);
     cparams.n_batch=decode?decode_batch:prefill_batch;
     cparams.n_ubatch=decode?decode_ubatch:prefill_ubatch;
@@ -702,6 +710,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    sched.reset();host_workspace_reservations.clear();host_workspace_reserved=0;
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -732,6 +741,21 @@ void llama_context::sched_reserve() {
     int n_input_tensors_tg = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    if(dsv4f_ram_budget() && !model.hparams.no_alloc) {
+        // Measure on a disposable graph; the scheduler rewrites cross-backend
+        // sources while splitting it. graph_reserve below rebuilds a fresh one.
+        std::vector<size_t> planned(backend_ptrs.size());
+        if(!graph_reserve(n_tokens,n_seqs,n_outputs_pp,mctx.get(),true,planned.data()))
+            throw std::runtime_error("failed to measure compute buffers");
+        uint64_t host_bytes=0;
+        for(size_t i=0;i<planned.size();++i)if(ggml_backend_buft_is_host(backend_buft[i]))host_bytes+=planned[i];
+        if(host_bytes) {
+            auto allocation=std::make_unique<dsv4f_ram_reservation>(host_bytes);
+            if(!*allocation)throw std::runtime_error("RAM budget has no room for CPU compute buffers");
+            host_workspace_reservations.push_back(std::move(allocation));host_workspace_reserved=host_bytes;
+        }
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {

@@ -1,4 +1,5 @@
 #include "engram.h"
+#include "direct-weights.h"
 #include "ggml-backend-moe-cache.h"
 #include "ggml-dsv4f-timeline.h"
 #include <cfenv>
@@ -99,7 +100,10 @@ ggml_tensor * dsv4f_engram_async::tensor(ggml_context * ctx,ggml_tensor * anchor
     auto buft=ggml_backend_dev_host_buffer_type(device);
     if(!buft && ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_CPU)buft=ggml_backend_dev_buffer_type(device);
     if(!buft)throw std::runtime_error("Engram overlap requires pinned host buffers");
-    p->buffer=ggml_backend_buft_alloc_buffer(buft,size_t(s.nt)*s.width*sizeof(float));
+    const size_t bytes=size_t(s.nt)*s.width*sizeof(float);
+    dsv4f_ram_reservation allocation(bytes);
+    if(!allocation)throw std::runtime_error("RAM budget has no room for Engram pinned rows");
+    p->buffer=ggml_backend_buft_alloc_buffer(buft,bytes);
     if(!p->buffer)throw std::runtime_error("Engram overlap host allocation failed");
     p->transfer={state::wait_callback,p.get(),ggml_backend_buffer_get_base(p->buffer),device};
     // Anchor consumption to this layer's incoming hidden state. This avoids

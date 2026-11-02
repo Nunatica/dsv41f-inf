@@ -90,6 +90,15 @@ Resident loading (`DSV4F_RAM_BUDGET_MIB=0`) allocates host weights in batches an
 
 With a positive budget, pruning also removes excluded expert planes from the tiered weight descriptors. RAM preload fills only retained experts, stopping when they are all resident or the cache ceiling is reached. The budget is an upper limit, not a target allocation. Packed expert IDs retain their original GGUF offsets, so preload and inference read the same retained weights without modifying model files.
 
+`DSV4F_RAM_PREFILL_UBATCH` controls the tiered prefill batch/ubatch ceiling
+(default `10240`, accepted range `32..16384`). Bounded Engram row/block batching
+is enabled by default (`DSV4F_ENGRAM_PREFILL_IO=1`); set it to `0` to disable it.
+Explicit ubatch overrides remain supported.
+The first-prefill test at 128 GiB measured **133.58 → 180.48 tok/s** on
+`PROMPT_TEST.md` when increasing ubatch from 4096 to 10240. 12288 exceeded
+the tested 24-GB GPU's available VRAM. Engram batching did not materially
+improve throughput. See [the first-prefill results and RAM accounting fix](docs/ENGRAM_UBATCH_FIRST_128G_TEST.md).
+
 Optionally, you can get MTP drafter from [here](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/tree/main/dspark). Place `dspark-xs2.bin` and `dspark-xs2.json` in `models/`, then run:
 
 ```bash
@@ -128,7 +137,7 @@ After installing the dependencies and placing the model files:
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
 | --- | ---: | ---: |
 | dsv41f-inf (2.6bpw, full weights on ram) | 226.65 | 20.87 |
-| dsv41f-inf (2.6bpw, 128 GiB budget, cold test) | 74.03 | 14.39 |
+| dsv41f-inf (2.6bpw, 128 GiB budget, preload on) | 172.03 | 13.99 |
 | llama.cpp | - | - |
 
 ## Credits

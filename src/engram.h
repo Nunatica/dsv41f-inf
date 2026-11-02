@@ -14,13 +14,14 @@ class dsv4f_engram {
     std::unique_ptr<state> impl;
 public:
     struct options {
-        bool lut=false, dedup=false, profile=false, batch_io=true;
+        bool lut=false, dedup=false, profile=false, batch_io=true, prefill_io=true;
         size_t cache_bytes=0;
         std::string trace;
     };
     struct stats {
         uint64_t rows=0, reads=0, bytes=0, hits=0, duplicates=0;
         uint64_t hash_ns=0, io_ns=0, fp8_ns=0, copy_ns=0, total_ns=0;
+        uint64_t batch_requests=0,batch_bytes=0;
     };
     static options from_env();
     explicit dsv4f_engram(const llama_model_deepseek41 & m,const std::string & dir);

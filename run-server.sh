@@ -45,6 +45,8 @@ export DSV4F_ENGRAM_DECODE=${DSV4F_ENGRAM_DECODE:-lut}
 export DSV4F_ENGRAM_CACHE_MIB=${DSV4F_ENGRAM_CACHE_MIB:-32}
 export DSV4F_ENGRAM_DEDUP=${DSV4F_ENGRAM_DEDUP:-0}
 export DSV4F_ENGRAM_BATCH_IO=${DSV4F_ENGRAM_BATCH_IO:-1}
+export DSV4F_ENGRAM_PREFILL_IO=${DSV4F_ENGRAM_PREFILL_IO:-1}
+case "$DSV4F_ENGRAM_PREFILL_IO" in 0|1) ;; *) echo 'DSV4F_ENGRAM_PREFILL_IO must be 0 or 1.' >&2; exit 1;; esac
 case "$DSV4F_ENGRAM_DECODE" in baseline|lut) ;; *) echo 'DSV4F_ENGRAM_DECODE must be baseline or lut.' >&2; exit 1;; esac
 case "$DSV4F_ENGRAM_DEDUP" in 0|1) ;; *) echo 'DSV4F_ENGRAM_DEDUP must be 0 or 1.' >&2; exit 1;; esac
 case "$DSV4F_ENGRAM_BATCH_IO" in 0|1) ;; *) echo 'DSV4F_ENGRAM_BATCH_IO must be 0 or 1.' >&2; exit 1;; esac
@@ -205,12 +207,16 @@ fi
 export DSV4F_PHASE_WORKSPACE=${DSV4F_PHASE_WORKSPACE:-1}
 export DSV4F_DECODE_BATCH=${DSV4F_DECODE_BATCH:-512}
 export DSV4F_DECODE_UBATCH=${DSV4F_DECODE_UBATCH:-256}
+export DSV4F_RAM_PREFILL_UBATCH=${DSV4F_RAM_PREFILL_UBATCH:-10240}
+if [[ ! $DSV4F_RAM_PREFILL_UBATCH =~ ^[0-9]{1,5}$ ]] || ((10#$DSV4F_RAM_PREFILL_UBATCH < 32 || 10#$DSV4F_RAM_PREFILL_UBATCH > 16384)); then
+    echo 'DSV4F_RAM_PREFILL_UBATCH must be an integer in 32..16384.' >&2; exit 1
+fi
 if ((ram_budget_mib)); then
     if [[ ! $DSV4F_DECODE_UBATCH =~ ^[0-9]{1,10}$ ]] || ((10#$DSV4F_DECODE_UBATCH < 4 || 10#$DSV4F_DECODE_UBATCH > 4294967295)); then
         echo 'DSV4F_DECODE_UBATCH must be an integer in 4..4294967295.' >&2; exit 1
     fi
     export DSV4F_DECODE_BATCH=$DSV4F_DECODE_UBATCH
-    export BATCH_SIZE=1024 UBATCH_SIZE=1024
+    export BATCH_SIZE=$DSV4F_RAM_PREFILL_UBATCH UBATCH_SIZE=$DSV4F_RAM_PREFILL_UBATCH
     export DSV4F_PHASE_WORKSPACE=1
 fi
 # Expert lookahead: 0 off, 1/2 temporal, 3/4 early-router shadow/copy, 5 cache protection.

@@ -20,6 +20,7 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+class dsv4f_ram_reservation;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -353,6 +354,10 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    // CPU compute buffers can remain unfaulted until input upload. Keep their
+    // allowance until the scheduler is freed so the RAM cache cannot refill it.
+    std::vector<std::unique_ptr<dsv4f_ram_reservation>> host_workspace_reservations;
+    uint64_t host_workspace_reserved = 0;
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;

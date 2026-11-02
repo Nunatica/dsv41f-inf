@@ -139,6 +139,39 @@ int main(int argc,char ** argv) {
          for(int slot=0;slot<2;++slot){std::vector<float>a,b;dsv4f_engram::stats sa,sb;reference.read(slot,one,1,a,&sa);batched.read(slot,one,1,b,&sb);
              require(a.size()==b.size()&&!std::memcmp(a.data(),b.data(),a.size()*4),"batched O_DIRECT row bit parity");
              require(sa.reads==sb.reads&&sa.bytes==sb.bytes,"batched O_DIRECT accounting");}}
+        {
+            const char * old=std::getenv("DSV4F_RAM_BUDGET_MIB");const bool had_budget=old;
+            const std::string prior=old?old:"";setenv("DSV4F_RAM_BUDGET_MIB","131072",1);
+            std::vector<int32_t> h;
+            for(int t=0;t<257;++t)for(int n=0;n<4;++n)h.push_back(t%4==0?-1:t%4==1?10:(t*7-n+32)%32);
+            for(size_t cap:{size_t(0),size_t(1024),size_t(1<<20)}) {
+                auto o=base;o.lut=true;o.batch_io=true;o.prefill_io=true;o.cache_bytes=cap;
+                dsv4f_engram reader(*m,dir.string(),o);
+                for(int rounding:{FE_TONEAREST,FE_DOWNWARD,FE_UPWARD,FE_TOWARDZERO}) {
+                    std::fesetround(rounding);reader.clear_cache();
+                    for(int pass=0;pass<2;++pass)for(int slot=0;slot<2;++slot) {
+                        std::vector<float>a,b;dsv4f_engram::stats st;
+                        reference.read(slot,h,257,a);reader.read(slot,h,257,b,&st);
+                        require(a.size()==b.size()&&!std::memcmp(a.data(),b.data(),a.size()*4),"prefill batch/fenv/collision parity");
+                        require(st.reads==2*(st.rows-st.hits-st.duplicates),"prefill batch accounting");
+                        if(st.reads)require(st.batch_requests && st.batch_requests<st.reads && st.batch_bytes<st.reads*4096,"prefill aligned block reuse");
+                        if(cap==1<<20 && pass)require(!st.reads,"prefill warm row cache");
+                    }
+                }
+                std::fesetround(FE_TONEAREST);
+                std::atomic<bool> cancelled{true};std::vector<float> out;bool rejected=false;
+                try{reader.read(0,h,257,out,nullptr,&cancelled);}catch(const std::runtime_error &){rejected=true;}
+                require(rejected,"prefill batch cancellation");
+                prefetch_test(reader);
+            }
+            const auto sub=dir/"prefill-errors";std::filesystem::create_directory(sub);shard(sub/"fixture.safetensors",*m);
+            auto o=base;o.batch_io=true;o.prefill_io=true;o.cache_bytes=1024;dsv4f_engram reader(*m,sub.string(),o);
+            std::filesystem::resize_file(sub/"fixture.safetensors",1);bool rejected=false;std::vector<float> out;
+            try{reader.read(0,h,257,out);}catch(const std::runtime_error &){rejected=true;}
+            require(rejected,"prefill batch truncated source");shard(sub/"fixture.safetensors",*m);
+            reader.read(0,history,64,out);require(!std::memcmp(out.data(),expected[0].data(),out.size()*4),"prefill error cache recovery");
+            if(had_budget)setenv("DSV4F_RAM_BUDGET_MIB",prior.c_str(),1);else unsetenv("DSV4F_RAM_BUDGET_MIB");
+        }
         prefetch_test(reference);
         for(int mode=0;mode<5;++mode) {
             auto opt=base;opt.lut=mode!=0;opt.dedup=mode==2||mode==4;opt.cache_bytes=mode==3?4096:mode==4?1<<20:0;
@@ -159,7 +192,7 @@ int main(int argc,char ** argv) {
         if(argc>1 && !std::strcmp(argv[1],"async-gpu")) {
             ggml_backend_load_all();auto * gpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);
             if(!gpu)return 77;
-            dsv4f_engram::options o;o.lut=true;o.cache_bytes=4096;
+            dsv4f_engram::options o;o.lut=true;o.cache_bytes=4096;o.prefill_io=true;
             dsv4f_engram reader(*m,dir.string(),o);async_test(reader,gpu);ggml_backend_free(gpu);
         } else {
             ggml_backend_load_all();auto * cpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr);

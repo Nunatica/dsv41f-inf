@@ -826,8 +826,10 @@ dsv4f_ram_reservation::dsv4f_ram_reservation(uint64_t requested) {
         reclaimed+=freed;
     }
     c.runtime_reserved+=requested;bytes=requested;acquired=true;
+    /*
     std::fprintf(stderr,"[dsv4f-ram-reserve] request=%.2f MiB reclaimed=%.2f MiB reserve=%.2f MiB\n",
         requested/double(MiB),reclaimed/double(MiB),reserve/double(MiB));
+    */
 }
 dsv4f_ram_reservation::~dsv4f_ram_reservation() {
     if(!bytes)return;
@@ -927,7 +929,8 @@ void dsv4f_direct_read_many(const dsv4f_direct_request * requests,size_t count) 
     struct aio_state {
         aio_context_t context=0;
         aio_state(){if(syscall(__NR_io_setup,128,&context)<0)context=0;}
-        ~aio_state(){if(context)syscall(__NR_io_destroy,context);}
+        void drain(){if(context){syscall(__NR_io_destroy,context);context=0;}}
+        ~aio_state(){drain();}
     };
     thread_local aio_state aio;
     if(aio.context && count<=128) {
@@ -959,7 +962,8 @@ void dsv4f_direct_read_many(const dsv4f_direct_request * requests,size_t count) 
                 const long n=syscall(__NR_io_getevents,aio.context,1,submitted-completed,events.data()+completed,nullptr);
                 if(n>0){completed+=size_t(n);continue;}
                 if(n<0 && errno==EINTR)continue;
-                throw std::runtime_error(std::string("O_DIRECT batch completion failed: ")+std::strerror(errno));
+                const int error=errno;aio.drain();
+                throw std::runtime_error(std::string("O_DIRECT batch completion failed: ")+std::strerror(error));
             }
             for(const auto & event:events) {
                 const size_t i=event.data;
@@ -976,6 +980,49 @@ void dsv4f_direct_read_many(const dsv4f_direct_request * requests,size_t count) 
 #endif
     static std::once_flag fallback_log;std::call_once(fallback_log,[]{std::fprintf(stderr,"[dsv4f-ram] O_DIRECT batch reader unavailable; using sequential pread\n");});
     for(size_t i=0;i<count;++i)dsv4f_direct_read(requests[i].fd,requests[i].output,requests[i].bytes,requests[i].offset);
+}
+dsv4f_direct_io_stats dsv4f_direct_read_compact(const dsv4f_direct_request * requests,size_t count) {
+    if(count>128)throw std::runtime_error("compact direct I/O is limited to 128 requests");
+    struct range {int fd;uint64_t offset,end,required;size_t position=0;};
+    std::vector<range> pending;pending.reserve(count);
+    for(size_t i=0;i<count;++i) {
+        const auto & r=requests[i];if(!r.bytes)continue;
+        if(r.offset>UINT64_MAX-r.bytes || r.bytes>SIZE_MAX-alignment)
+            throw std::runtime_error("compact direct I/O extent overflow");
+        const uint64_t off=r.offset-r.offset%alignment;
+        const size_t n=rounded(r.offset%alignment+r.bytes);
+        if(off>UINT64_MAX-n)throw std::runtime_error("compact direct I/O aligned extent overflow");
+        pending.push_back({r.fd,off,off+n,r.offset+r.bytes});
+    }
+    std::sort(pending.begin(),pending.end(),[](const range & a,const range & b) {
+        return std::tie(a.fd,a.offset)<std::tie(b.fd,b.offset);
+    });
+    std::vector<range> ranges;ranges.reserve(pending.size());
+    for(const auto & r:pending) {
+        if(!ranges.empty() && ranges.back().fd==r.fd && r.offset<=ranges.back().end) {
+            ranges.back().end=std::max(ranges.back().end,r.end);
+            ranges.back().required=std::max(ranges.back().required,r.required);
+        } else ranges.push_back(r);
+    }
+    size_t total=0;
+    for(auto & r:ranges) {
+        const uint64_t bytes=r.end-r.offset;
+        if(bytes>SIZE_MAX-total)throw std::runtime_error("compact direct I/O buffer overflow");
+        r.position=total;total+=size_t(bytes);
+    }
+    if(!total)return {};
+    region storage(total);std::vector<dsv4f_direct_request> reads;reads.reserve(ranges.size());
+    for(const auto & r:ranges)reads.push_back({r.fd,(char*)storage.data+r.position,size_t(r.required-r.offset),r.offset});
+    dsv4f_direct_read_many(reads.data(),reads.size());
+    for(size_t i=0;i<count;++i) {
+        const auto & r=requests[i];if(!r.bytes)continue;
+        auto it=std::upper_bound(ranges.begin(),ranges.end(),std::pair<int,uint64_t>{r.fd,r.offset},
+            [](const auto & key,const range & span){return key < std::pair<int,uint64_t>{span.fd,span.offset};});
+        GGML_ASSERT(it!=ranges.begin());--it;
+        GGML_ASSERT(it->fd==r.fd && r.offset+r.bytes<=it->required);
+        std::memcpy(r.output,(char*)storage.data+it->position+size_t(r.offset-it->offset),r.bytes);
+    }
+    return {uint64_t(ranges.size()),uint64_t(total)};
 }
 ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct_tensor> & tensors) {
     auto owner=std::make_unique<source>();size_t bytes=0;
