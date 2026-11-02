@@ -136,8 +136,9 @@ After installing the dependencies and placing the model files:
 
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
 | --- | ---: | ---: |
-| dsv41f-inf (2.6bpw, full weights on ram) | 254.19 | 21.09 |
-| dsv41f-inf (2.6bpw, 128 GiB budget, preload on) | 172.03 | 13.99 |
+| dsv41f-inf (dsx 2.6bpw, full weights on ram) | 254.19 | 21.09 |
+| dsv41f-inf (dsx 2.6bpw, 128 GiB budget, preload on) | 172.03 | 13.99 |
+| dsv41f-inf (unsloth Q4_K_XL, 180 GiB budget, preload on) | 120.79 | 7.34 |
 | llama.cpp | - | - |
 
 ## Credits
