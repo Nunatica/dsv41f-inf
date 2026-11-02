@@ -152,6 +152,7 @@ GGML_BACKEND_API struct ggml_dsv4f_routing_api ggml_dsv4f_routing;
 struct ggml_dsv4f_host_weights_stats {
     uint64_t resident_bytes, transient_bytes, reads, read_bytes, evictions;
     uint64_t transient_reads, transient_read_bytes;
+    uint64_t prefill_io_requests, prefill_io_bytes, prefill_merged_planes;
 };
 struct ggml_dsv4f_host_weights_api {
     const void * (*acquire)(const void *, size_t);

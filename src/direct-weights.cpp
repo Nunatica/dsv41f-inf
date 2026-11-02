@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <linux/aio_abi.h>
@@ -80,6 +81,13 @@ uint64_t env_mib(const char * name,uint64_t fallback) {
         n=n*10+(*p-'0');
     }
     return n*MiB;
+}
+bool prefill_io_enabled(const char * name) {
+    const char * value=std::getenv(name);
+    if(!value)return dsv4f_ram_budget()!=0;
+    if(!std::strcmp(value,"1"))return true;
+    if(!std::strcmp(value,"0"))return false;
+    throw std::runtime_error(std::string(name)+" must be 0 or 1");
 }
 bool unlocked_io() {
     static const bool value=[] {
@@ -181,6 +189,7 @@ struct cache {
     std::vector<std::thread> prefetch_workers;
     uint64_t used=0,reserved=0,hits=0,reads=0,bytes=0,evictions=0;
     uint64_t transient_used=0,transient_reserved=0,transient_reads=0,transient_bytes=0;
+    uint64_t prefill_io_requests=0,prefill_io_bytes=0,prefill_merged_planes=0;
     uint64_t prefetch_queued=0,prefetch_completed=0,prefetch_dropped=0,prefetch_failed=0;
     uint64_t next_source=0;
     uint64_t runtime_reserved=0;
@@ -361,8 +370,10 @@ struct batch_read {
     uint64_t offset;
     size_t delta,bytes,required;
 };
-void read_batch(const batch_read * reads,size_t count) {
-    if(!count)return;
+struct read_metrics {uint64_t requests=0,bytes=0,merged=0;};
+read_metrics read_batch(const batch_read * reads,size_t count,bool ordered=false) {
+    read_metrics metrics;
+    if(!count)return metrics;
 #if defined(__linux__) && defined(__NR_io_setup) && defined(__NR_io_submit) && defined(__NR_io_getevents) && defined(__NR_io_destroy)
     struct aio_state {
         aio_context_t context=0;
@@ -372,16 +383,49 @@ void read_batch(const batch_read * reads,size_t count) {
     };
     thread_local aio_state aio;
     if(aio.context && count>1 && count<=128) {
-        std::vector<iocb> blocks(count);std::vector<iocb*> pointers(count);
-        std::vector<io_event> events(count);
-        for(size_t i=0;i<count;++i) {
-            auto & b=blocks[i];b.aio_data=i;b.aio_lio_opcode=IOCB_CMD_PREAD;b.aio_fildes=reads[i].fd;
-            b.aio_buf=(uintptr_t)reads[i].request->storage->data;b.aio_nbytes=reads[i].bytes;
-            b.aio_offset=reads[i].offset;pointers[i]=&b;
+        std::vector<size_t> order(count);for(size_t i=0;i<count;++i)order[i]=i;
+        if(ordered)std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b) {
+            return std::tie(reads[a].fd,reads[a].offset)<std::tie(reads[b].fd,reads[b].offset);
+        });
+        struct operation {
+            std::vector<size_t> indices;
+            std::vector<iovec> vectors;
+            uint64_t offset=0;size_t bytes=0,required=0;
+        };
+        std::vector<operation> operations;operations.reserve(count);
+        for(size_t i:order) {
+            const auto & r=reads[i];size_t overlap=0;
+            bool merge=false;
+            if(ordered && !operations.empty()) {
+                const auto & op=operations.back();const auto & last=reads[op.indices.back()];
+                const uint64_t end=op.offset+op.bytes;
+                merge=r.fd==last.fd && r.offset>=last.offset && r.offset<=end &&
+                    r.offset+r.bytes>end && end-r.offset<=alignment &&
+                    r.offset+r.bytes-op.offset<=64*MiB;
+                if(merge)overlap=size_t(end-r.offset);
+            }
+            if(!merge){operations.emplace_back();operations.back().offset=r.offset;}
+            auto & op=operations.back();op.indices.push_back(i);
+            op.vectors.push_back({(char*)r.request->storage->data+overlap,r.bytes-overlap});
+            op.bytes+=r.bytes-overlap;
+            op.required=std::max<uint64_t>(op.required,r.offset+r.required-op.offset);
+        }
+        const size_t jobs=operations.size();
+        std::vector<iocb> blocks(jobs);std::vector<iocb*> pointers(jobs);
+        std::vector<io_event> events(jobs);
+        for(size_t i=0;i<jobs;++i) {
+            const auto & op=operations[i];const auto & r=reads[op.indices.front()];auto & b=blocks[i];
+            b.aio_data=i;b.aio_fildes=r.fd;b.aio_offset=op.offset;
+            if(op.indices.size()>1) {
+                b.aio_lio_opcode=IOCB_CMD_PREADV;b.aio_buf=(uintptr_t)op.vectors.data();b.aio_nbytes=op.vectors.size();
+            } else {
+                b.aio_lio_opcode=IOCB_CMD_PREAD;b.aio_buf=(uintptr_t)r.request->storage->data;b.aio_nbytes=r.bytes;
+            }
+            pointers[i]=&b;
         }
         size_t submitted=0;
-        while(submitted<count) {
-            const long n=syscall(__NR_io_submit,aio.context,count-submitted,pointers.data()+submitted);
+        while(submitted<jobs) {
+            const long n=syscall(__NR_io_submit,aio.context,jobs-submitted,pointers.data()+submitted);
             if(n>0){submitted+=size_t(n);continue;}
             if(n<0 && errno==EINTR)continue;
             break; // Drain submitted work, then pread any unsubmitted requests.
@@ -397,21 +441,37 @@ void read_batch(const batch_read * reads,size_t count) {
         }
         for(size_t k=0;k<submitted;++k) {
             const auto & event=events[k];const size_t i=event.data;
-            if(i>=count || event.res<0 || uint64_t(event.res)<reads[i].required)
+            if(i>=jobs || event.res<0 || uint64_t(event.res)<operations[i].required)
                 throw std::runtime_error(event.res<0?std::string("expert batch O_DIRECT read failed: ")+std::strerror(int(-event.res)):"truncated expert batch payload");
         }
         if(submitted) {
             static std::once_flag announced;std::call_once(announced,[&]{
                 std::fprintf(stderr,"[dsv4f-ram-batch] reader=linux-aio depth=%zu destination=cache\n",submitted);
             });
-            for(size_t i=submitted;i<count;++i)
-                read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
-            return;
+            for(size_t i=0;i<submitted;++i) {
+                const auto & op=operations[i];++metrics.requests;metrics.bytes+=op.bytes;metrics.merged+=op.indices.size()-1;
+                // Adjacent unaligned planes share an aligned sector. Read it
+                // once into the preceding allocation, then copy that prefix.
+                for(size_t j=1;j<op.indices.size();++j) {
+                    const auto & a=reads[op.indices[j-1]], & b=reads[op.indices[j]];
+                    const size_t overlap=a.offset+a.bytes-b.offset;
+                    if(overlap)std::memcpy(b.request->storage->data,
+                        (char*)a.request->storage->data+b.offset-a.offset,overlap);
+                }
+            }
+            for(size_t i=submitted;i<jobs;++i)for(size_t k:operations[i].indices) {
+                const auto & r=reads[k];read_aligned(r.fd,r.request->storage->data,r.bytes,r.offset,r.required);
+                ++metrics.requests;metrics.bytes+=r.bytes;
+            }
+            return metrics;
         }
     }
 #endif
-    for(size_t i=0;i<count;++i)
+    for(size_t i=0;i<count;++i) {
         read_aligned(reads[i].fd,reads[i].request->storage->data,reads[i].bytes,reads[i].offset,reads[i].required);
+        ++metrics.requests;metrics.bytes+=reads[i].bytes;
+    }
+    return metrics;
 }
 
 struct preload_plane {uintptr_t pointer;size_t bytes;intptr_t count;};
@@ -544,7 +604,8 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
         }
         // Keep a bounded streaming window INSIDE the expert cache allowance.
         // Two groups cover the staging ring; ordinary group=16 needs <1 GiB.
-        stream_room=std::min(cap,std::max(2*batch_bytes,std::min<uint64_t>(1024*MiB,cap/4)));
+        const uint64_t windows=prefill_io_enabled("DSV4F_PREFILL_IO_PIPELINE")?4:2;
+        stream_room=std::min(cap,std::max(windows*batch_bytes,std::min<uint64_t>(1024*MiB,cap/4)));
         resident_cap=cap-stream_room;
         // Reclaim only when existing residency exceeds the new allowance
         // (e.g. first prefill after decode, a smaller budget, larger group/KV).
@@ -633,10 +694,16 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
         rollback();throw;
     }
     std::exception_ptr error;
+    read_metrics io;
+    const bool ordered=scan && prefill_io_enabled("DSV4F_PREFILL_IO_SORT");
     lock.unlock();
-    try {for(size_t i=0;i<reads.size();i+=128)read_batch(reads.data()+i,std::min<size_t>(128,reads.size()-i));}
+    try {for(size_t i=0;i<reads.size();i+=128) {
+        const auto m=read_batch(reads.data()+i,std::min<size_t>(128,reads.size()-i),ordered);
+        io.requests+=m.requests;io.bytes+=m.bytes;io.merged+=m.merged;
+    }}
     catch(...){error=std::current_exception();}
     lock.lock();
+    if(scan){c.prefill_io_requests+=io.requests;c.prefill_io_bytes+=io.bytes;c.prefill_merged_planes+=io.merged;}
     for(const auto & r:reads) {
         if(error){fail(r,error);continue;}
         const void * p=(char*)r.request->storage->data+r.delta;c.ages.push_back(r.key);
@@ -664,7 +731,8 @@ void acquire_prefill(const void * const * p,const size_t * n,const void ** out,s
 }
 void statistics(ggml_dsv4f_host_weights_stats * out) {
     auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
-    *out={c.used-c.transient_used,c.transient_used,c.reads,c.bytes,c.evictions,c.transient_reads,c.transient_bytes};
+    *out={c.used-c.transient_used,c.transient_used,c.reads,c.bytes,c.evictions,c.transient_reads,c.transient_bytes,
+        c.prefill_io_requests,c.prefill_io_bytes,c.prefill_merged_planes};
 }
 void resident_many(const void * const * pointers,const size_t * sizes,bool * output,size_t count) {
     auto & c=pool();std::lock_guard<std::mutex> lock(c.mutex);
@@ -832,6 +900,14 @@ dsv4f_preload_result dsv4f_preload_experts() {
             (unsigned long long)result.planes,result.read_bytes/double(1ull<<30),result.resident_bytes/double(1ull<<30),
             c.limit()/double(1ull<<30),result.budget_limited?"budget":"all-experts",
             std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+        const char * stats_env=std::getenv("DSV4F_PREFILL_RAM_STATS");
+        if(stats_env && !std::strcmp(stats_env,"1"))
+            std::fprintf(stderr,"[dsv4f-ram-prefill] layer=preload tokens=0 reads=%llu read_bytes=%llu evictions=%llu transient_reads=%llu transient_read_bytes=%llu resident_bytes=%llu transient_bytes=%llu io_requests=%llu io_bytes=%llu merged_planes=%llu ceiling_bytes=%llu\n",
+                (unsigned long long)c.reads,(unsigned long long)c.bytes,(unsigned long long)c.evictions,
+                (unsigned long long)c.transient_reads,(unsigned long long)c.transient_bytes,
+                (unsigned long long)(c.used-c.transient_used),(unsigned long long)c.transient_used,
+                (unsigned long long)c.prefill_io_requests,(unsigned long long)c.prefill_io_bytes,
+                (unsigned long long)c.prefill_merged_planes,(unsigned long long)c.limit());
     }
     return result;
 }

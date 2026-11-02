@@ -201,6 +201,29 @@ int main() {
     ggml_dsv4f_host_weights_stats after_decode{};ggml_dsv4f_host_weights.statistics(&after_decode);
     require(after_decode.evictions>previous.evictions,"decode did not restore ordinary LRU");
     ggml_backend_buffer_free(b);ggml_free(ctx);
+    // Reverse/nonconsecutive caller order, a duplicate lease and unaligned
+    // shared sectors, ending at a short final file sector. The reader must
+    // coalesce adjacent physical ranges while preserving caller output order.
+    {
+        setenv("DSV4F_PREFILL_IO_SORT","1",1);
+        auto * sorted_ctx=ggml_init({1<<20,nullptr,true});
+        auto * sorted=ggml_new_tensor_3d(sorted_ctx,GGML_TYPE_F32,128,128,count);
+        auto * sorted_buffer=dsv4f_direct_weights_buffer({{sorted,fd,offset}});
+        const int ids[]={63,60,62,61,60};const void * pointers[5],*outputs[5]{};size_t sizes[5];
+        for(int i=0;i<5;++i){pointers[i]=(char*)sorted->data+ids[i]*plane;sizes[i]=plane;}
+        ggml_dsv4f_host_weights_stats before{},after{};ggml_dsv4f_host_weights.statistics(&before);
+        ggml_dsv4f_host_weights.acquire_prefill(pointers,sizes,outputs,5);
+        for(int i=0;i<5;++i) {
+            require(!std::memcmp(outputs[i],expected.data()+offset+ids[i]*plane,plane),"sorted vectored bytes/output order");
+            ggml_dsv4f_host_weights.release(outputs[i]);
+        }
+        ggml_dsv4f_host_weights.statistics(&after);
+        require(after.reads-before.reads==4,"sorted duplicate caused extra read");
+        require(after.prefill_io_requests-before.prefill_io_requests==1 &&
+            after.prefill_merged_planes-before.prefill_merged_planes==3,"adjacent planes not merged");
+        ggml_backend_buffer_free(sorted_buffer);ggml_free(sorted_ctx);
+        setenv("DSV4F_PREFILL_IO_SORT","0",1);
+    }
     // Packed pruning IDs address nonconsecutive original file planes in all
     // demand paths, including cold batches and background prefetch.
     {

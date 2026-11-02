@@ -181,6 +181,13 @@ export DSV4F_PREFILL_GROUP=${DSV4F_PREFILL_GROUP:-16}
 # Retain host weights through each prefill group's H2D completion.
 export DSV4F_PREFILL_GROUP_LEASE=${DSV4F_PREFILL_GROUP_LEASE:-1}
 export DSV4F_PREFILL_BATCH_IO=${DSV4F_PREFILL_BATCH_IO:-1}
+prefill_io_default=0
+if ((ram_budget_mib)); then prefill_io_default=1; fi
+export DSV4F_PREFILL_IO_SORT=${DSV4F_PREFILL_IO_SORT:-$prefill_io_default}
+export DSV4F_PREFILL_IO_PIPELINE=${DSV4F_PREFILL_IO_PIPELINE:-$prefill_io_default}
+for name in DSV4F_PREFILL_IO_SORT DSV4F_PREFILL_IO_PIPELINE; do
+    case "${!name}" in 0|1) ;; *) echo "$name must be 0 or 1." >&2; exit 1;; esac
+done
 export DSV4F_PREFILL_SCAN_CACHE=${DSV4F_PREFILL_SCAN_CACHE:-0}
 export DSV4F_PREFILL_CACHE=${DSV4F_PREFILL_CACHE:-0}
 export DSV4F_PREFILL_CACHE_MIN_TOKENS=${DSV4F_PREFILL_CACHE_MIN_TOKENS:-4096}

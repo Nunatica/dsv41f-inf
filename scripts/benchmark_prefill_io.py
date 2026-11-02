@@ -28,6 +28,11 @@ def main():
     parser.add_argument('--prompt-file', type=Path, default=ROOT/'PROMPT_TEST.md')
     parser.add_argument('--validation-tokens', type=int, default=0,
                         help='generate a short-prompt sample after all timed runs')
+    parser.add_argument('--preload', choices=['0', '1'], default='0')
+    parser.add_argument('--io-sort', choices=['0', '1'], default='0')
+    parser.add_argument('--io-pipeline', choices=['0', '1'], default='0')
+    parser.add_argument('--model', type=Path, default=ROOT/'models/DeepSeek-V4.1-Flash-1017-dsx-2.6bit.gguf')
+    parser.add_argument('--block-device', help='optional whole-device counters, e.g. nvme0n1')
     args = parser.parse_args()
     if args.runs < 2:
         parser.error('--runs must be at least 2 (cold and warm)')
@@ -41,6 +46,11 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     build = ROOT/'build'
     env = dict(os.environ, HOST='127.0.0.1', PORT='18094', BUILD_DIR=str(build),
+               MODEL=str(args.model.resolve()), DSV4F_RAM_PRELOAD=args.preload,
+               DSV4F_RAM_RESERVE_MIB='1024', DSV4F_LOAD_PIPELINE_MIB='1024',
+               DSV4F_ADAPTIVE_ROUTING='0', DSV4F_ADAPTIVE_PRUNING='0',
+               DSV4F_PREFILL_IO_SORT=args.io_sort, DSV4F_PREFILL_IO_PIPELINE=args.io_pipeline,
+               DSV4F_PREFILL_GROUP='16',
                DSV4F_RAM_BUDGET_MIB=str(args.ram_budget_mib), DSV4F_MTP='0', DSV4F_EXPERT_LOOKAHEAD='0',
                DSV4F_RAM_LOOKAHEAD='0', DSV4F_PREFILL_GROUP_LEASE='1',
                DSV4F_PREFILL_BATCH_IO=args.batch_io, DSV4F_CPU_EXPERT_LEASE='1',
@@ -48,6 +58,7 @@ def main():
                DSV4F_RAM_UNLOCK_IO='1', DSV4F_ENGRAM_BATCH_IO='1',
                LD_LIBRARY_PATH=str(build/'bin')+':'+os.environ.get('LD_LIBRARY_PATH', ''),
                GGML_BACKEND_PATH=str(build/'bin'))
+    env.pop('DSV4F_RAM_CACHE_MIB', None)
     for key in list(env):
         if key.startswith(('ROCPROF', 'ROCTRACER')) or key == 'LD_PRELOAD' or (
                 key.startswith('DSV4F_') and any(x in key for x in ('PROFILE', 'TIMELINE', 'TRACE'))):
@@ -57,6 +68,9 @@ def main():
     report = dict(date_utc=datetime.now(timezone.utc).isoformat(), prompt_file=str(args.prompt_file),
                   prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), batch_io=args.batch_io,
                   ram_budget_mib=args.ram_budget_mib, scan_cache=args.scan_cache,
+                  preload=args.preload, io_sort=args.io_sort, io_pipeline=args.io_pipeline,
+                  model=str(args.model.resolve()), model_bytes=args.model.stat().st_size,
+                  block_device=args.block_device,
                   mtp=0, binary_sha256=hashes, runs=[])
     state = None
     with (out/'launcher.log').open('w') as log:
@@ -75,6 +89,10 @@ def main():
                     options = candidate['engine_options']
                     for key, value in [('DSV4F_RAM_BUDGET_MIB', str(args.ram_budget_mib)), ('DSV4F_MTP', '0'),
                                        ('DSV4F_PREFILL_SCAN_CACHE', args.scan_cache),
+                                       ('DSV4F_RAM_PRELOAD', args.preload), ('DSV4F_ADAPTIVE_ROUTING', '0'),
+                                       ('DSV4F_ADAPTIVE_PRUNING', '0'),
+                                       ('DSV4F_PREFILL_IO_SORT', args.io_sort),
+                                       ('DSV4F_PREFILL_IO_PIPELINE', args.io_pipeline),
                                        ('DSV4F_PREFILL_GROUP_LEASE', '1'), ('DSV4F_PREFILL_BATCH_IO', args.batch_io)]:
                         assert options[key] == value
                     assert Path(f'/proc/{candidate["pid"]}/exe').resolve() == build/'bin/dsv4f-server'
@@ -87,6 +105,13 @@ def main():
             else:
                 raise RuntimeError('Server load timeout')
             report['state'] = {k: v for k, v in state.items() if k != 'command'}
+            assert state['format'] == 'dsx-2.6bit' if 'dsx-2.6bit' in str(args.model) else True
+            if args.preload == '1':
+                log_text = Path(state['log']).read_text()
+                assert 'order=shard,offset O_DIRECT' in log_text
+                completed = [line for line in log_text.splitlines() if line.startswith('[dsv4f-ram-preload] complete:')]
+                assert len(completed) == 1 and 'stop=budget' in completed[0], 'preload did not fill cache budget'
+                report['preload_log'] = completed[0]
 
             def snapshot():
                 memory = {line.split(':')[0]: int(line.split()[1])*1024
@@ -103,13 +128,22 @@ def main():
                 assert cgroup['memory.peak'] <= cgroup['memory.max']
                 assert cgroup['memory.swap.current'] == 0
                 assert int(cgroup['events']['oom_kill']) == 0
-                weights = dict(reads=0, read_bytes=0, evictions=0, transient_reads=0, transient_read_bytes=0)
+                weights = dict(reads=0, read_bytes=0, evictions=0, transient_reads=0, transient_read_bytes=0,
+                               io_requests=0, io_bytes=0, merged_planes=0)
                 for line in reversed(Path(state['log']).read_text().splitlines()):
                     if line.startswith('[dsv4f-ram-prefill]'):
                         weights = {k: int(v) for k, v in (field.split('=', 1) for field in line.split()[1:]) if k != 'layer'}
                         break
-                return {'memory': memory, 'io': io, 'cgroup': cgroup, 'weights': weights}
+                device = ([int(n) for n in Path('/sys/block', args.block_device, 'stat').read_text().split()]
+                          if args.block_device else None)
+                return {'memory': memory, 'io': io, 'cgroup': cgroup, 'weights': weights, 'device': device}
 
+            if args.preload == '1':
+                report['preload_snapshot'] = snapshot()
+                weights = report['preload_snapshot']['weights']
+                assert weights['resident_bytes'] > 100*2**30
+                assert 0 <= weights['ceiling_bytes']-weights['resident_bytes'] < 16*2**20
+                assert weights['transient_bytes'] == 0
             for index in range(args.runs):
                 before = snapshot()
                 result = generate(state['url'], 1, prompt, cache_prompt=False)
@@ -120,15 +154,22 @@ def main():
                               read_bytes=after['io']['read_bytes']-before['io']['read_bytes'])
                 record['expert_read_bytes'] = after['weights']['read_bytes']-before['weights']['read_bytes']
                 record['expert_evictions'] = after['weights']['evictions']-before['weights']['evictions']
+                record['io_requests'] = after['weights']['io_requests']-before['weights']['io_requests']
+                record['io_bytes'] = after['weights']['io_bytes']-before['weights']['io_bytes']
+                record['merged_planes'] = after['weights']['merged_planes']-before['weights']['merged_planes']
+                if args.block_device:
+                    record['device_read_bytes'] = (after['device'][2]-before['device'][2])*512
                 report['runs'].append(record)
                 (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
                 print('run', index+1, 'tokens', result['timings']['prompt_n'],
                       'prefill_tps', round(result['timings']['prompt_per_second'], 3),
                       'expert_read_gib', round(record['expert_read_bytes']/2**30, 3),
                       'evictions', record['expert_evictions'],
+                      'io_requests', record['io_requests'], 'merged', record['merged_planes'],
                       'rss_gib', round(after['memory']['VmRSS']/2**30, 3), flush=True)
             values = [r['timings']['prompt_per_second'] for r in report['runs']]
             report['summary'] = dict(cold_prefill_tps=values[0],
+                                     first_after_preload_tps=values[0] if args.preload == '1' else None,
                                      warm_median_prefill_tps=statistics.median(values[1:]))
             (out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
             print(report['summary'], flush=True)

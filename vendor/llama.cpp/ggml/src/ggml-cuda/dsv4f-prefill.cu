@@ -10,9 +10,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -44,6 +49,59 @@ bool scan_host_reads() {
     }();
     return value;
 }
+bool pipelined_host_reads() {
+    static const int mode=[] {
+        const char * v=std::getenv("DSV4F_PREFILL_IO_PIPELINE");
+        if(!v)return -1;
+        if(!std::strcmp(v,"0"))return 0;
+        if(!std::strcmp(v,"1"))return 1;
+        throw std::runtime_error("DSV4F_PREFILL_IO_PIPELINE must be 0 or 1");
+    }();
+    return mode<0?ggml_dsv4f_host_weights.resident_many!=nullptr:mode!=0;
+}
+
+// Unconsumed jobs own only RAM leases. Their cleanup never calls HIP/CUDA,
+// including when a worker exception or graph teardown abandons a future.
+struct prepared_host_reads {
+    void (*release)(const void *);
+    std::vector<const void *> pointers,held;
+    explicit prepared_host_reads(void (*r)(const void *)):release(r){}
+    ~prepared_host_reads(){for(const void * p:held)release(p);}
+};
+class prefill_io_worker {
+    using task=std::packaged_task<std::unique_ptr<prepared_host_reads>()>;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<task> queue;
+    bool stopping=false;
+    std::thread worker;
+public:
+    prefill_io_worker():worker([this] {
+        for(;;) {
+            task work;
+            {std::unique_lock<std::mutex> lock(mutex);ready.wait(lock,[&]{return stopping || !queue.empty();});
+                if(queue.empty())return;work=std::move(queue.front());queue.pop_front();}
+            work();
+        }
+    }){}
+    ~prefill_io_worker(){
+        {std::lock_guard<std::mutex> lock(mutex);stopping=true;}ready.notify_all();worker.join();
+    }
+    auto submit(std::vector<const void *> pointers,std::vector<size_t> sizes) {
+        const auto acquire=scan_host_reads() && ggml_dsv4f_host_weights.acquire_prefill?
+            ggml_dsv4f_host_weights.acquire_prefill:ggml_dsv4f_host_weights.acquire_many;
+        const auto release=ggml_dsv4f_host_weights.release;
+        task work([p=std::move(pointers),n=std::move(sizes),acquire,release]() mutable {
+            auto result=std::make_unique<prepared_host_reads>(release);
+            result->pointers=std::move(p);result->held.resize(result->pointers.size());
+            try{acquire(result->pointers.data(),n.data(),result->held.data(),result->pointers.size());}
+            catch(...){result->held.clear();throw;}
+            return result;
+        });
+        auto future=work.get_future();
+        {std::lock_guard<std::mutex> lock(mutex);queue.push_back(std::move(work));}ready.notify_one();return future;
+    }
+};
 
 // Keep direct-RAM entries alive until every H2D in a prefill group has consumed
 // them. The legacy path synchronizes and releases after each expert/plane. The
@@ -86,6 +144,11 @@ public:
         try{acquire(pointers.data(),sizes.data(),held.data(),pointers.size());}
         catch(...){held.clear();prepared.clear();throw;}
     }
+    void adopt(std::unique_ptr<prepared_host_reads> reads) {
+        GGML_ASSERT(grouped && held.empty() && release_fn==reads->release);
+        prepared=std::move(reads->pointers);held=std::move(reads->held);
+        reads->held.clear();
+    }
     const void * acquire(const void * p,size_t n) {
         if(!prepared.empty()) {
             const auto it=std::find(prepared.begin(),prepared.end(),p);
@@ -118,6 +181,7 @@ struct prefill_state {
     int32_t * host = nullptr;
     size_t capacity = 0;
     bool announced = false;
+    std::unique_ptr<prefill_io_worker> reader;
     explicit prefill_state(int dev) : device(dev) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
@@ -127,6 +191,7 @@ struct prefill_state {
         }
     }
     ~prefill_state() {
+        reader.reset();
         ggml_cuda_set_device(device);
         if (pending) CUDA_CHECK(cudaEventSynchronize(done));
         CUDA_CHECK(cudaStreamSynchronize(copy));
@@ -281,20 +346,40 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     std::memcpy(&limit, &node->op_params[8], sizeof(limit));
     const int groups = (active.size()+group-1)/group;
     uint64_t copied = 0;
+    const bool pipeline=pipelined_host_reads() && batched_host_reads() && grouped_host_leases() &&
+        ggml_dsv4f_host_weights.acquire_many;
+    if(pipeline && !state.reader)state.reader=std::make_unique<prefill_io_worker>();
+    using prepared_future=std::future<std::unique_ptr<prepared_host_reads>>;
+    std::vector<prepared_future> prepared(groups);
+    struct pending_reads_guard {
+        std::vector<prepared_future> & jobs;
+        ~pending_reads_guard(){for(auto & job:jobs)if(job.valid())job.wait();}
+    } pending_reads{prepared};
+    auto requests=[&](int gi,std::vector<const void *> & pointers,std::vector<size_t> & sizes) {
+        const int first=gi*group,count=std::min(group,int(active.size())-first);
+        pointers.reserve(3*size_t(count));sizes.reserve(3*size_t(count));
+        for(const auto * tensor:{g,u,d})for(int j=0;j<count;++j) {
+            if(cached && cache_plan.resident[first+j])continue;
+            pointers.push_back((const char*)tensor->data+size_t(active[first+j])*tensor->nb[2]);
+            sizes.push_back(tensor->nb[2]);
+        }
+    };
+    auto submit=[&](int gi) {
+        std::vector<const void *> pointers;std::vector<size_t> sizes;requests(gi,pointers,sizes);
+        prepared[gi]=state.reader->submit(std::move(pointers),std::move(sizes));
+    };
+    if(pipeline)for(int gi=0;gi<std::min(2,groups);++gi)submit(gi);
     auto upload = [&](int gi) {
         const int slot = gi%2, first = gi*group, count = std::min(group, int(active.size())-first);
         char * stage = scratch+layout.stage+slot*layout.stage_stride;
         if (gi >= 2) CUDA_CHECK(cudaStreamWaitEvent(state.copy, state.used[slot], 0));
         prefill_host_leases leases(grouped_host_leases(),state.copy,3*size_t(count));
         if(batched_host_reads() && grouped_host_leases() && ggml_dsv4f_host_weights.acquire_many) {
-            std::vector<const void *> pointers;std::vector<size_t> sizes;
-            pointers.reserve(3*size_t(count));sizes.reserve(3*size_t(count));
-            for(const auto * tensor:{g,u,d})for(int j=0;j<count;++j) {
-                if(cached && cache_plan.resident[first+j])continue;
-                pointers.push_back((const char*)tensor->data+size_t(active[first+j])*tensor->nb[2]);
-                sizes.push_back(tensor->nb[2]);
+            if(pipeline)leases.adopt(prepared[gi].get());
+            else {
+                std::vector<const void *> pointers;std::vector<size_t> sizes;requests(gi,pointers,sizes);
+                leases.prepare(pointers,sizes);
             }
-            leases.prepare(pointers,sizes);
         }
         if (cached) {
             for (int j = 0; j < count; ++j) {
@@ -368,7 +453,10 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     };
     // Queue a complete ring before launching consumers. A slot is only reused
     // after its previous consumer has recorded used, avoiding a future-event wait.
-    for (int gi = 0; gi < std::min(2, groups); ++gi) upload(gi);
+    // The worker stays one group ahead of uploads. It never touches GPU APIs.
+    // Start consumers after the first group, letting group 1's disk read run
+    // concurrently with group 0's compute rather than delaying both consumers.
+    for (int gi = 0; gi < std::min(pipeline?1:2, groups); ++gi) upload(gi);
     for (int gi = 0; gi < groups; ++gi) {
         const int slot = gi%2, first = gi*group, count = std::min(group, int(active.size())-first);
         const int r0 = hbounds[first], rows = hbounds[first+count]-r0;
@@ -387,7 +475,10 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         product(ctx, stage+group*(layout.gbytes+layout.ubytes), hq, down, identity, bounds+first,
                 count, max_rows, nr, nf, ne, layout.dbytes, d->type==GGML_TYPE_PTQ1_0?GGML_TYPE_Q2_0:d->type, direct_cache ? expert_ptrs+first : nullptr, cache_plan.down_offset);
         CUDA_CHECK(cudaEventRecord(state.used[slot], ctx.stream()));
-        if (gi+2 < groups) upload(gi+2);
+        if(pipeline) {
+            if(gi+2<groups)submit(gi+2);
+            if(gi+1<groups)upload(gi+1);
+        } else if (gi+2 < groups) upload(gi+2);
     }
     combine<<<(int64_t(ne)*nt+255)/256, 256, 0, ctx.stream()>>>(down, inverse, (const float *) weights->data,
         (float *) node->data, ne, nk, nt, weights->nb[1]/sizeof(float), weights->nb[2]/sizeof(float));
@@ -398,10 +489,12 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     static const bool ram_stats=[] {const char * v=std::getenv("DSV4F_PREFILL_RAM_STATS");return v && !std::strcmp(v,"1");}();
     if(ram_stats && ggml_dsv4f_host_weights.statistics) {
         ggml_dsv4f_host_weights_stats s{};ggml_dsv4f_host_weights.statistics(&s);
-        std::fprintf(stderr,"[dsv4f-ram-prefill] layer=%s tokens=%d reads=%llu read_bytes=%llu evictions=%llu transient_reads=%llu transient_read_bytes=%llu resident_bytes=%llu transient_bytes=%llu scan=%d\n",
+        std::fprintf(stderr,"[dsv4f-ram-prefill] layer=%s tokens=%d reads=%llu read_bytes=%llu evictions=%llu transient_reads=%llu transient_read_bytes=%llu resident_bytes=%llu transient_bytes=%llu scan=%d io_requests=%llu io_bytes=%llu merged_planes=%llu pipeline=%d\n",
             g->name,nt,(unsigned long long)s.reads,(unsigned long long)s.read_bytes,(unsigned long long)s.evictions,
             (unsigned long long)s.transient_reads,(unsigned long long)s.transient_read_bytes,
-            (unsigned long long)s.resident_bytes,(unsigned long long)s.transient_bytes,int(scan_host_reads()));
+            (unsigned long long)s.resident_bytes,(unsigned long long)s.transient_bytes,int(scan_host_reads()),
+            (unsigned long long)s.prefill_io_requests,(unsigned long long)s.prefill_io_bytes,
+            (unsigned long long)s.prefill_merged_planes,int(pipeline));
     }
     if (std::getenv("DSV4F_PREFILL_PROFILE")) {
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));

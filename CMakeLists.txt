@@ -124,6 +124,12 @@ foreach(mode IN ITEMS cache zero-cache threshold tiered tiered-q3 tiered-q2)
     set_tests_properties(gpu-prefill-${mode}-parity PROPERTIES
         ENVIRONMENT "DSV4F_PREFILL_PROFILE=1" TIMEOUT 240)
 endforeach()
+foreach(mode IN ITEMS tiered tiered-q3 tiered-q2)
+    add_test(NAME gpu-prefill-pipeline-${mode}-parity COMMAND dsv4f-prefill-test ${mode})
+    set_tests_properties(gpu-prefill-pipeline-${mode}-parity PROPERTIES
+        ENVIRONMENT "DSV4F_MTP=0;DSV4F_PREFILL_GROUP_LEASE=1;DSV4F_PREFILL_BATCH_IO=1;DSV4F_PREFILL_IO_SORT=1;DSV4F_PREFILL_IO_PIPELINE=1"
+        TIMEOUT 240)
+endforeach()
 add_executable(dsv4f-budget-test tests/budget.cpp)
 target_include_directories(dsv4f-budget-test PRIVATE vendor/llama.cpp/ggml/src)
 add_test(NAME vram-cache-budget COMMAND dsv4f-budget-test)
