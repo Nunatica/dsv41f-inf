@@ -279,7 +279,7 @@ load_mode=dio
 args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v q8_0
       --load-mode "$load_mode" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
-      --batch-size "${BATCH_SIZE:-4096}" --ubatch-size "${UBATCH_SIZE:-4096}"
+      --batch-size "${BATCH_SIZE:-10240}" --ubatch-size "${UBATCH_SIZE:-10240}"
       --flash-attn on --parallel 1 --cache-ram 0 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
       --jinja --chat-template-file "$ROOT/models/dsv41f.jinja" --reasoning off --reasoning-budget -1 --no-context-shift
       --alias dsv4f --ui --path "$ROOT/web")
