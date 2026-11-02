@@ -4060,35 +4060,18 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
-
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
-                            }
+                        // Keep the latest user message boundary for edits and retries.
+                        // Historical messages share a batch; checkpoint at the natural
+                        // batch boundaries instead of splitting at each user message.
+                        if (do_checkpoint && slot.prompt.n_tokens() == last_user_pos) {
+                            break;
                         }
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
-                                break;
-                            }
+                        // Keep a checkpoint before the final four prompt tokens.
+                        // Earlier checkpoints use natural batch boundaries instead
+                        // of splitting a batch to leave an entire ubatch at the end.
+                        if (do_checkpoint && slot.task->n_tokens() == slot.prompt.n_tokens() + std::min(n_batch, 4)) {
+                            break;
                         }
                     }
 
@@ -4099,7 +4082,6 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
@@ -4115,12 +4097,6 @@ private:
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
-                    } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
-                            do_checkpoint = false;
-                        }
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -4135,7 +4111,8 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // Save checkpoints at natural batch boundaries, subject to the
+                    // minimum spacing. Preserve the latest user and prompt-tail checkpoints.
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
@@ -4243,8 +4220,18 @@ private:
         }
 
         bool has_output = false;
+        uint32_t n_prompt_remaining = 0;
         for (int i = off; i < off + batch.view.size(); ++i) {
-            has_output |= batch.tokens[i].output;
+            const auto & token = batch.tokens[i];
+            has_output |= token.output;
+            if (token.is_prompt) {
+                const auto & slot = slots[token.id_slot];
+                const auto n_done = slot.stats.n_prompt_cached + slot.stats.n_prompt_processed;
+                const auto n_total = uint64_t(slot.task->n_tokens());
+                if (n_done < n_total) {
+                    n_prompt_remaining = std::max(n_prompt_remaining, uint32_t(n_total - n_done));
+                }
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -4258,6 +4245,7 @@ private:
                 const auto & tokens=slots[0].task->tokens.get_tokens();
                 llama_dsv41_engram_prefetch_hint(ctx_tgt,tokens.data(),tokens.size(),slots[0].id);
             }else llama_dsv41_engram_prefetch_hint(ctx_tgt,nullptr,0,0);
+            llama_set_prefill_remaining(ctx_tgt, n_prompt_remaining);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

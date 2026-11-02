@@ -12,6 +12,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-workspace.h"
 #include "llama.h"
 #include "llama-kv-cache-dsv41.h"
 #include "models/deepseek41.h"
@@ -651,8 +652,9 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
-void llama_context::select_workspace(bool decode) {
-    if(!phase_workspace || cparams.training || decode==decode_workspace ||
+void llama_context::select_workspace(bool decode, size_t n_tokens, size_t n_remaining) {
+    const uint32_t n_ubatch = decode ? decode_ubatch : llama_prefill_workspace_tokens(n_tokens, prefill_ubatch, n_remaining);
+    if(!phase_workspace || cparams.training || (decode==decode_workspace && cparams.n_ubatch==n_ubatch) ||
        !ggml_dsv4f_experts.gpu_resize || !ggml_dsv4f_experts.gpu_trim_workspace)return;
     const int64_t start=ggml_time_us();
     synchronize();
@@ -669,13 +671,13 @@ void llama_context::select_workspace(bool decode) {
     host_workspace_reservations.clear();host_workspace_reserved=0;
     for(auto backend:backend_ptrs)ggml_dsv4f_experts.gpu_trim_workspace(backend);
     cparams.n_batch=decode?decode_batch:prefill_batch;
-    cparams.n_ubatch=decode?decode_ubatch:prefill_ubatch;
+    cparams.n_ubatch=n_ubatch;
     decode_workspace=decode;
     sched_need_reserve=true;sched_reserve();
     ggml_dsv4f_experts.gpu_resize(decode || reclaimable);
-    std::fprintf(stderr,"[dsv4f-workspace] phase=%s context=%s batch=%u ubatch=%u reserve_tokens=%u cache=%.2f MiB transition_ms=%.2f\n",
+    std::fprintf(stderr,"[dsv4f-workspace] phase=%s context=%s batch=%u ubatch=%u reserve_tokens=%u input_tokens=%zu remaining_tokens=%zu cache=%.2f MiB transition_ms=%.2f\n",
         decode?"decode":"prefill",cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP?"mtp":"target",cparams.n_batch,cparams.n_ubatch,
-        decode?std::min(4u,cparams.n_ubatch):cparams.n_ubatch,
+        decode?std::min(4u,cparams.n_ubatch):cparams.n_ubatch,n_tokens,n_remaining,
         ggml_dsv4f_experts.cache_bytes?ggml_dsv4f_experts.cache_bytes()/1048576.:0.,(ggml_time_us()-start)/1000.);
     for(auto backend:backend_ptrs)std::fprintf(stderr,"[dsv4f-workspace] %s compute=%.2f MiB\n",
         ggml_backend_name(backend),ggml_backend_sched_get_buffer_size(sched.get(),backend)/1048576.);
@@ -1803,6 +1805,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    const uint32_t n_remaining = prefill_remaining;
+    prefill_remaining = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1814,9 +1818,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // The service supports up to four verification/decode tokens. Larger
-    // inputs retain the caller's full prompt batch and physical microbatch.
+    // inputs reserve the smallest 1024-token bucket for the remaining prompt,
+    // capped at the configured microbatch. Without a hint, use the input size.
+    // The public batch limits stay unchanged.
     select_workspace(batch_inp.tokens.size()<=4 &&
-        (batch_inp.n_embd==0 || cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP));
+        (batch_inp.n_embd==0 || cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP), batch_inp.tokens.size(), n_remaining);
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -4587,6 +4593,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 //
 // ext
 //
+
+void llama_set_prefill_remaining(llama_context * ctx, uint32_t n_tokens) {
+    ctx->set_prefill_remaining(n_tokens);
+}
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();

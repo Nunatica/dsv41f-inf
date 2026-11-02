@@ -42,9 +42,10 @@ static std::vector<float> run(const char * path,bool direct,bool gpu) {
         if(phase_test && direct) {
             const char * phase=std::getenv("DSV4F_PHASE_WORKSPACE");
             const bool switching=phase && std::atoi(phase)!=0;
-            const uint32_t expected=switching && count==1?32:prefill_size;
+            const uint32_t expected_batch=switching && count==1?32:prefill_size;
+            const uint32_t expected_ubatch=switching?(count==1?32:std::min(prefill_size,1024u)):prefill_size;
             const auto & actual=context->get_cparams();
-            if(actual.n_batch!=expected || actual.n_ubatch!=expected)throw std::runtime_error("incorrect prefill/decode workspace size");
+            if(actual.n_batch!=expected_batch || actual.n_ubatch!=expected_ubatch)throw std::runtime_error("incorrect prefill/decode workspace size");
         }
         for(int i=0;i<count;++i){auto * row=llama_get_logits_ith(context,i);logits.insert(logits.end(),row,row+nv);}
         if(phase_test && direct && gpu && count==32) {

@@ -56,7 +56,8 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
-    void select_workspace(bool decode);
+    void select_workspace(bool decode, size_t n_tokens, size_t n_remaining);
+    void set_prefill_remaining(uint32_t n_tokens) { prefill_remaining = n_tokens; }
 
     void synchronize();
 
@@ -364,6 +365,7 @@ private:
     bool phase_workspace = false;
     bool decode_workspace = false;
     uint32_t prefill_batch = 0, prefill_ubatch = 0;
+    uint32_t prefill_remaining = 0;
     uint32_t decode_batch = 512, decode_ubatch = 256;
 
     ggml_backend_t backend_cpu = nullptr;

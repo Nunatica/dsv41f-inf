@@ -9,6 +9,11 @@
 #include <cstdint>
 #include <map>
 
+// Hint for sizing the next decode's prefill workspace. Include the next batch
+// in the uncached prompt tokens still to process. Consumed by that decode;
+// does not change the public batch limits or enable phase workspaces.
+LLAMA_API void llama_set_prefill_remaining(struct llama_context * ctx, uint32_t n_tokens);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
